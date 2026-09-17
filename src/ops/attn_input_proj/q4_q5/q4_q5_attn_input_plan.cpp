@@ -4,6 +4,7 @@
 
 #include "core/layout.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -27,10 +28,13 @@ struct RouteSpec {
     Q4Q5AttnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 3> kA16Routes{{
-    {{1, 16}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
-    {{17, 20}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3},
-    {{21, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4},
+// The small-T tensor-core route covers every decode width, T=1 included: it beat the
+// parent-split gemv pair there (33 vs 40 us warm, 74 vs 78 us cold). Above 32 columns the
+// r32 grouped schedule is the faster of the two grouped schedules at every width (the r16
+// schedule measured 248 vs 155 us at T=33..40), so it takes the whole prefill interval.
+constexpr std::array<RouteSpec, 2> kA16Routes{{
+    {{1, 32}, Q4Q5AttnInputScheduleId::SmallTMma},
+    {{33, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4},
 }};
 
 // AllowA8 replaces the widest interval with the INT8 prefill route. The BF16
@@ -86,6 +90,19 @@ std::size_t int8_workspace_bytes(std::int32_t k, std::int32_t cols) {
     return layout.peak_bytes(1);
 }
 
+template <class Allocator>
+SmallTMmaWorkspace allocate_small_t_workspace(Allocator& allocator, std::int32_t cols) {
+    constexpr std::int32_t kTiles = 2 * 7168 / SmallTMmaShape::kRows;
+    return allocate_small_t_mma_workspace(allocator, small_t_mma_tile_cols(cols), kTiles,
+                                          q4_q5_attn_input_small_t_split_k().splits);
+}
+
+std::size_t small_t_workspace_bytes(std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_small_t_workspace(layout, cols);
+    return layout.peak_bytes(1);
+}
+
 bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
     return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
            problem.padded_k == 5120;
@@ -95,10 +112,8 @@ bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
 
 const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept {
     switch (schedule) {
-    case Q4Q5AttnInputScheduleId::ParentSplitFixed:
-        return "attn_input_proj.q4_q5.parent_split_fixed";
-    case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
-        return "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r16.c64.s3";
+    case Q4Q5AttnInputScheduleId::SmallTMma:
+        return "attn_input_proj.q4_q5.small_t.mma.r64.store";
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
         return "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4";
     case Q4Q5AttnInputScheduleId::Int8Pairs:
@@ -124,6 +139,9 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             if (route.schedule == Q4Q5AttnInputScheduleId::Int8Pairs) {
                 return {route.schedule, int8_workspace_bytes(problem.input_rows, problem.cols)};
             }
+            if (route.schedule == Q4Q5AttnInputScheduleId::SmallTMma) {
+                return {route.schedule, small_t_workspace_bytes(problem.cols)};
+            }
             return {route.schedule, 0};
         }
         throw std::logic_error("Q4/Q5 attention input: admitted problem has no covering route");
@@ -136,13 +154,18 @@ std::size_t q4_q5_attn_input_capacity_workspace_bytes(std::int32_t min_tokens,
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("Q4/Q5 attention input: invalid token interval");
     }
-    const Q4Q5AttnInputProblem lo{5120, 6144, 1024, 5120, min_tokens};
-    const Q4Q5AttnInputProblem hi{5120, 6144, 1024, 5120, max_tokens};
-    (void)q4_q5_attn_input_resolve_plan(lo, policy);
-    // The INT8 staging grows with the token count up to the tile cap, so the
-    // interval's high-water mark is at max_tokens; every other route is
-    // workspace-free.
-    return q4_q5_attn_input_resolve_plan(hi, policy).workspace_bytes;
+    // Every route's workspace grows with the token count inside its interval, so the
+    // interval's high-water mark is at the last column of each intersecting route.
+    std::size_t bytes = 0;
+    visit_routes(policy, [&](const auto& routes) {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.last < min_tokens || route.cols.first > max_tokens) { continue; }
+            const std::int32_t cols = std::min(route.cols.last, max_tokens);
+            const Q4Q5AttnInputProblem problem{5120, 6144, 1024, 5120, cols};
+            bytes = std::max(bytes, q4_q5_attn_input_resolve_plan(problem, policy).workspace_bytes);
+        }
+    });
+    return bytes;
 }
 
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
@@ -168,14 +191,22 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
                                      stream);
         return;
     }
-    case Q4Q5AttnInputScheduleId::ParentSplitFixed:
-        q4_q5_attn_input_small_t_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                        stream);
+    case Q4Q5AttnInputScheduleId::SmallTMma: {
+        if (plan.workspace_bytes == 0) {
+            q4_q5_attn_input_small_t_mma_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                                v, {}, stream);
+            return;
+        }
+        if (ws == nullptr) {
+            throw std::invalid_argument(
+                "Q4/Q5 attention input: small-T route requires a workspace");
+        }
+        auto scratch_scope               = ws->scope();
+        const SmallTMmaWorkspace scratch = allocate_small_t_workspace(*ws, problem.cols);
+        q4_q5_attn_input_small_t_mma_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                            scratch, stream);
         return;
-    case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
-        q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(x, query_key_weight, gate_value_weight, q,
-                                                       gate, k, v, stream);
-        return;
+    }
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);

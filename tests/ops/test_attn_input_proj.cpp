@@ -152,11 +152,13 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = verify_call_invariance(query_key, gate_value);
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    // A16: the small-T tensor-core route over T <= 32 (every n-tile width and a masked
+    // column in each), then the grouped r32 schedule.
+    for (const std::int32_t tokens : {1, 2, 3, 8, 12, 16, 17, 24, 25, 32, 33, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
-    // AllowA8 shares the T <= 16 route with A16 and takes the INT8 jobs above
-    // it; both the exact (64-row/64-column) and masked tile shapes are covered.
+    // AllowA8 is one INT8 route over every T; both the exact (64-row/64-column) and
+    // masked tile shapes are covered.
     for (const std::int32_t tokens : {1, 16, 17, 21, 48, 64, 128, 257}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens, ops::LinearPolicy::AllowA8);
     }

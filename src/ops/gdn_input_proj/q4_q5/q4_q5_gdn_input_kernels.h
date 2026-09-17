@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 
 #include "ops/common/int8_proj_launch.h"
+#include "ops/common/small_t_rowsplit_mma.h"
 
 #include <cuda_runtime.h>
 
@@ -12,27 +13,19 @@ void q4_q5_gdn_input_int8_launch(const Tensor& x, const Weight& qk_weight,
                                  const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                  const Int8ProjWorkspace& scratch, cudaStream_t stream);
 
-void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
+// K = 5120 is 80 groups: 256 tiles of 40 stages fill one wave at two CTAs per SM, so the
+// route streams each parent once without split-K.
+constexpr SmallTMmaSplitK q4_q5_gdn_input_small_t_split_k() noexcept {
+    return small_t_mma_split_k(5120, 1);
+}
+
+void q4_q5_gdn_input_small_t_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
-                                        Tensor& z, cudaStream_t stream);
+                                        Tensor& z, const SmallTMmaWorkspace& scratch,
+                                        cudaStream_t stream);
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                                        cudaStream_t stream);
-
-void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weight,
-                                          const Weight& value_z_weight, const Tensor& conv_weight,
-                                          Tensor& conv_states, const Tensor& valid_columns,
-                                          const Tensor& initial_slot,
-                                          const Tensor& snapshot_base_slot, Tensor& query,
-                                          Tensor& key, Tensor& value, Tensor& z,
-                                          cudaStream_t stream);
-
-void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight,
-                                        const Weight& value_z_weight, const Tensor& conv_weight,
-                                        const Tensor& conv_states, const Tensor& valid_columns,
-                                        const Tensor& initial_slot, Tensor& conv_record,
-                                        Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                         cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

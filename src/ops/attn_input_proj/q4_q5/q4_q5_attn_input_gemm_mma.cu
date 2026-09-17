@@ -82,17 +82,9 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
     });
 }
 
-using MmaR16C64S3 = GemmCfg<16, 64, 64, 16, 16, 3, 1, false, true, true>;
 using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 
 } // namespace
-
-void q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(const Tensor& x, const Weight& query_key_weight,
-                                                    const Weight& gate_value_weight, Tensor& q,
-                                                    Tensor& gate, Tensor& k, Tensor& v,
-                                                    cudaStream_t stream) {
-    launch<MmaR16C64S3>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
-}
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,

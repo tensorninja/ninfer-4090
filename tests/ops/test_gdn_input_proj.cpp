@@ -93,10 +93,12 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    // A16: the small-T tensor-core route over T <= 32 (every n-tile width and a masked
+    // column in each), then the grouped mixed schedule.
+    for (const std::int32_t tokens : {1, 2, 3, 8, 12, 16, 17, 24, 25, 32, 33}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
-    // AllowA8 shares the T <= 16 route with A16 and takes the INT8 jobs above it.
+    // AllowA8 is one INT8 route over every T.
     for (const std::int32_t tokens : {1, 16, 17, 48, 64, 128, 257}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, ops::LinearPolicy::AllowA8);
     }

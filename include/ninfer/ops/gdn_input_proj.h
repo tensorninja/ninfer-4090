@@ -92,9 +92,10 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
- * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
- * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
- * profile or unsupported B/W domain.
+ * interval. B=1 Q4/Q5 always composes the projection with the shared conv kernel through one BF16
+ * [C,W] projected plane; B=1 W8 fuses the projection epilogue up to W=16 and composes above.
+ * B=2..8 uses aggregate projection plus one BF16 [C,B*W] projected plane. The query throws for an
+ * unregistered row profile or unsupported B/W domain.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,

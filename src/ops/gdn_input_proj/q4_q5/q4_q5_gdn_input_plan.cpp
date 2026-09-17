@@ -4,6 +4,7 @@
 
 #include "core/layout.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -27,9 +28,11 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
+// The small-T tensor-core route covers every decode width, T=1 included: it beat the
+// independent gemv pair there (33 vs 42 us warm, 87 vs 88 us cold).
 constexpr std::array<RouteSpec, 2> kA16Routes{{
-    {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+    {{1, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
+    {{33, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
 
 // AllowA8 replaces the prefill interval with the INT8 route. This is the largest
@@ -80,6 +83,19 @@ std::size_t int8_workspace_bytes(std::int32_t k, std::int32_t cols) {
     return layout.peak_bytes(1);
 }
 
+template <class Allocator>
+SmallTMmaWorkspace allocate_small_t_workspace(Allocator& allocator, std::int32_t cols) {
+    constexpr std::int32_t kTiles = (4096 + 12288) / SmallTMmaShape::kRows;
+    return allocate_small_t_mma_workspace(allocator, small_t_mma_tile_cols(cols), kTiles,
+                                          q4_q5_gdn_input_small_t_split_k().splits);
+}
+
+std::size_t small_t_workspace_bytes(std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_small_t_workspace(layout, cols);
+    return layout.peak_bytes(1);
+}
+
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
     return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
            problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
@@ -89,24 +105,14 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept {
     switch (schedule) {
-    case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
-        return "gdn_input_proj.q4_q5.independent_direct_fixed";
+    case Q4Q5GdnInputScheduleId::SmallTMma:
+        return "gdn_input_proj.q4_q5.small_t.mma.r64.store";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
     case Q4Q5GdnInputScheduleId::Int8Jobs:
         return "gdn_input_proj.q4_q5.int8.jobs";
     }
     return "gdn_input_proj.q4_q5.unknown";
-}
-
-const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused:
-        return "gdn_input_proj_conv.q4_q5.projection_epilogue_fused";
-    case Q4Q5GdnInputConvScheduleId::Materialized:
-        return "gdn_input_proj_conv.q4_q5.materialized";
-    }
-    return "gdn_input_proj_conv.q4_q5.unknown";
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
@@ -126,6 +132,9 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             if (route.schedule == Q4Q5GdnInputScheduleId::Int8Jobs) {
                 return {route.schedule, int8_workspace_bytes(problem.input_rows, problem.cols)};
             }
+            if (route.schedule == Q4Q5GdnInputScheduleId::SmallTMma) {
+                return {route.schedule, small_t_workspace_bytes(problem.cols)};
+            }
             return {route.schedule, 0};
         }
         throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
@@ -137,29 +146,18 @@ std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t min_tokens,
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("Q4/Q5 GDN input: invalid token interval");
     }
-    const Q4Q5GdnInputProblem lo{5120, 4096, 12288, 10240, 6144, 5120, min_tokens};
-    const Q4Q5GdnInputProblem hi{5120, 4096, 12288, 10240, 6144, 5120, max_tokens};
-    (void)q4_q5_gdn_input_resolve_plan(lo, policy);
-    return q4_q5_gdn_input_resolve_plan(hi, policy).workspace_bytes;
-}
-
-Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
-                                                       std::int32_t batch_size) {
-    if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
-        throw std::invalid_argument(
-            "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
-    }
-    if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
-    switch (problem.cols) {
-    case 1:
-    case 2:
-    case 3:
-    case 5:
-    case 6:
-        return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused};
-    default:
-        return {Q4Q5GdnInputConvScheduleId::Materialized};
-    }
+    // Every route's workspace grows with the token count inside its interval, so the
+    // interval's high-water mark is at the last column of each intersecting route.
+    std::size_t bytes = 0;
+    visit_routes(policy, [&](const auto& routes) {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.last < min_tokens || route.cols.first > max_tokens) { continue; }
+            const std::int32_t cols = std::min(route.cols.last, max_tokens);
+            const Q4Q5GdnInputProblem problem{5120, 4096, 12288, 10240, 6144, 5120, cols};
+            bytes = std::max(bytes, q4_q5_gdn_input_resolve_plan(problem, policy).workspace_bytes);
+        }
+    });
+    return bytes;
 }
 
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
@@ -185,10 +183,21 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_int8_launch(x, qk_weight, value_z_weight, qkv, z, scratch, stream);
         return;
     }
-    case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
+    case Q4Q5GdnInputScheduleId::SmallTMma: {
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
-        q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        if (plan.workspace_bytes == 0) {
+            q4_q5_gdn_input_small_t_mma_launch(x, qk_weight, value_z_weight, qk, value, z, {},
+                                               stream);
+            return;
+        }
+        if (ws == nullptr) {
+            throw std::invalid_argument("Q4/Q5 GDN input: small-T route requires a workspace");
+        }
+        auto scratch_scope               = ws->scope();
+        const SmallTMmaWorkspace scratch = allocate_small_t_workspace(*ws, problem.cols);
+        q4_q5_gdn_input_small_t_mma_launch(x, qk_weight, value_z_weight, qk, value, z, scratch,
+                                           stream);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
