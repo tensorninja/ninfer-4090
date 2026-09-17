@@ -657,33 +657,48 @@ stalls, which landed between requests. Export cost is now visible as
 ### Batched decode: the small-T linear routes
 
 With MTP K=3 every decode round verifies four positions per lane, so the projections run at
-T = 4·B: 4, 8 and 12 for one to three lanes. Aggregate decode measured through the request log
-(`tools/bench/run_decode_scaling.py`, 8k-token prompts, `--continuation-cache off
---no-prefix-reuse`) is 98 → 151 → 172 tok/s for B = 1, 2, 3, with the round growing from 24.0 ms
-to 31.5 ms to 43.9 ms; a weight-streaming-bound round would stay near 24 ms. The Op benchmarks
-(`bench/ops`, cold L2, medians) locate the growth in the T=2..16 SIMT routes:
+T = 4·B: 4, 8 and 12 for one to three lanes. Before this work, aggregate decode measured through
+the request log (`tools/bench/run_decode_scaling.py`, 8k-token prompts, `--continuation-cache
+off --no-prefix-reuse`) was 98 → 151 → 172 tok/s for B = 1, 2, 3, with the round growing from
+24.0 ms to 31.5 ms to 43.9 ms against a weight-streaming floor near 24 ms. The Op benchmarks
+(`bench/ops`, warm L2, medians) located the growth in the T=2..16 SIMT routes, which above T=8
+were bound by SIMT instruction issue (activation loads and dequantization per FMA, 11–14
+TFLOP/s), not by DRAM: summed over 48 GDN and 16 attention layers the four decoder projections
+took 21.7 ms of the B=1 round and 38.9 ms of the B=3 round.
 
-| Op (route at T≤16) | T=1 | T=4 | T=8 | T=12 | T=16 |
+The four projections now share one tensor-core small-T mechanism
+(`src/ops/common/small_t_rowsplit_mma.cuh`): a CTA owns 64 weight rows and streams them in
+two-group stages with the `cp.async ... .L2::256B` prefetch hint (without it the 64-byte row
+runs of the RowSplit layout are DRAM activate-rate bound at about 250 GB/s), decodes the Q4/Q5
+codes to exact BF16 integers for the `mma.sync` fragments, accumulates each group in FP32 and
+applies the FP16 scale in FP32, and stages the activation tile once per CTA. Split-K over
+`gridDim.y` with FP32 partials and a fixed-order last-arriver fold keeps the 5120-row weights
+(K = 17408 and 6144) on a full wave; the K = 5120 projections need no split. Each Op keeps its
+own epilogue (residual add, fused SiLU·up, or the two-output store of the split parents) and the
+route is registered over the whole T ≤ 32 interval under `A16Only`, so a token's result does not
+depend on the width of the call. The same shapes now measure:
+
+| Op (route at T≤32) | T=1 | T=4 | T=8 | T=12 | T=16 |
 |---|---:|---:|---:|---:|---:|
-| Q4 gate/up + SwiGLU 34816×5120 (`SmallTExact`) | 144 µs | 147 (1.02×) | 155 (1.07×) | 179 (1.24×) | 198 (1.37×) |
-| Q5 down + residual 5120×17408 (`simt.split2.exact`) | 94 | 102 (1.09×) | 132 (1.40×) | 194 (2.05×) | 250 (2.65×) |
-| Q5 out + residual 5120×6144 (`simt.split2.exact`) | 40 | 42 (1.05×) | 55 (1.38×) | 72 (1.80×) | 96 (2.4×, mma) |
-| attention input projection Q4/Q5 (`ParentSplitFixed`) | 40 | 46 (1.15×) | 82 (2.05×) | 125 (3.1×) | 152 (3.8×) |
-| GDN input projection Q4/Q5 | 42 | 49 (1.17×) | 104 (2.5×) | 176 (4.2×) | 202 (4.8×) |
+| Q4 gate/up + SwiGLU 34816×5120 (`small_t.mma.r32x2.swiglu`) | 144 µs | 151 (1.05×) | 155 (1.07×) | 158 (1.10×) | 159 (1.10×) |
+| Q5 down + residual 5120×17408 (`small_t.mma.r64.splitk.residual`) | 94 | 98 (1.04×) | 98 (1.04×) | 99 (1.05×) | 100 (1.06×) |
+| Q5 out + residual 5120×6144 (`small_t.mma.r64.splitk.residual`) | 40 | 39 (0.98×) | 39 (0.98×) | 40 (1.00×) | 41 (1.03×) |
+| attention input projection Q4/Q5 (`small_t.mma.r64.store`) | 29 | 28 (0.97×) | 28 (0.97×) | 35 (1.21×) | 35 (1.21×) |
+| GDN input projection Q4/Q5 (`small_t.mma.r64.store`) | 33 | 33 (1.00×) | 33 (1.00×) | 39 (1.18×) | 39 (1.18×) |
 
-Summed over 48 GDN and 16 attention layers the projections account for 21.7 ms of the B=1 round
-and 38.9 ms of the 43.9 ms B=3 round against a 20.5 ms weight-streaming floor; the routes above
-T=8 are bound by SIMT instruction issue (activation loads and dequantization per FMA, 11–14
-TFLOP/s), not by DRAM. The draft head already has a tensor-core small-T route
-(`q4_small_t_mma_kernel`, 131072×5120): 1.03× its T=1 time at T=8, and 1.21×/1.44× at T=12/16
-when its catalog is extended past T=8, where its cost is L2 traffic for the activations each
-16-row CTA re-reads. The next step for aggregate decode is therefore a tensor-core small-T route
-for the four decoder projections above - wider row tiles with split-K for the 5120-row weights
-so the activation tile is amortized, dequant-to-fragment for Q4 and Q5, T padded to 16 - under
-`A16Only`, qualified against the FP64 oracle with the A16 criterion and registered over the
-whole T interval so B=1 (T=4, already at the floor) and prefix reuse are unaffected. Reaching
-1.2× the floor at T=12 would take the B=3 round from 43.9 ms to about 30 ms, or roughly
-250 tok/s aggregate.
+(Ratios are against the previous T=1 route; the two input projections now beat their old T=1
+gemv pairs, so T=1 was moved onto the new route as well. The Q4/Q5 GDN conv snapshot at B=1
+likewise composes the projection with the shared conv kernel at every width, 36 µs against
+42–80 µs for the fused projection-epilogue schedule it replaces.) On the same request-log
+protocol aggregate decode is now 94 → 200 → 299 tok/s for B = 1, 2, 3 with rounds of 24.6, 26.5
+and 28.8 ms: the B=3 round is 1.17× the B=1 round instead of 1.83×, and the three-lane aggregate
+is 1.74× what it was.
+
+Two variants were measured and rejected on the way. A stream-K persistent grid (256 resident
+CTAs walking tile-major stage ranges with a deferred fold) was 5–12% slower than split-K at
+every configuration tried, and two-way split-K on the K = 5120 projections was slower than a
+single full wave (39 vs 33 µs at T=2). The remaining growth from T=8 to T=16 is tensor-pipe
+overlap, not bandwidth.
 
 Two related settings were measured on the same protocol and left as they are. MTP K=4 loses to
 K=3 at every batch (B=1/2/3: 88/130/163 tok/s against 98/151/172): the extra verify position adds
