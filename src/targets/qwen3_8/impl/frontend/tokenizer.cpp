@@ -633,23 +633,38 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
 
-std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
-    if (text.empty()) { return {}; }
-    if (!options.parse_added_tokens) {
-        std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
-        return ids;
+void Tokenizer::encode_added_token_segments(
+    std::string_view text, std::vector<int>& ids,
+    std::vector<SegmentedEncoding::Segment>* segments) const {
+    const auto emit = [&](std::size_t byte_begin, std::size_t byte_end, std::size_t token_begin) {
+        if (segments != nullptr) {
+            segments->push_back({.byte_begin  = byte_begin,
+                                 .byte_end    = byte_end,
+                                 .token_begin = token_begin,
+                                 .token_end   = ids.size()});
+        }
+    };
+    // The next occurrence of each added token at or past the scan position. An occurrence found
+    // from an earlier position stays the next one until the scan passes it, and a token absent
+    // from one suffix is absent from every later suffix, so each token is searched once per
+    // occurrence rather than once per segment.
+    std::vector<std::size_t> next_occurrence(added_tokens_.size(), std::string_view::npos);
+    for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
+        if (!added_tokens_[index].content.empty()) {
+            next_occurrence[index] = text.find(added_tokens_[index].content);
+        }
     }
-
-    std::vector<int> ids;
     std::size_t pos = 0;
     while (pos < text.size()) {
         std::size_t match_pos         = std::string_view::npos;
         const AddedToken* match_token = nullptr;
-        for (const AddedToken& token : added_tokens_) {
-            if (token.content.empty()) { continue; }
-            const std::size_t found = text.find(token.content, pos);
+        for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
+            std::size_t& found = next_occurrence[index];
+            if (found != std::string_view::npos && found < pos) {
+                found = text.find(added_tokens_[index].content, pos);
+            }
             if (found == std::string_view::npos) { continue; }
+            const AddedToken& token = added_tokens_[index];
             if (match_token == nullptr || found < match_pos) {
                 match_pos   = found;
                 match_token = &token;
@@ -657,19 +672,67 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         }
 
         if (match_token == nullptr) {
+            const std::size_t token_begin = ids.size();
             append_bpe_ids(ids, text.substr(pos), has_bpe_merges_, bpe_merge_ranks_,
                            vocab_token_to_id_);
+            emit(pos, text.size(), token_begin);
             break;
         }
         if (match_pos > pos) {
+            const std::size_t token_begin = ids.size();
             append_bpe_ids(ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
                            bpe_merge_ranks_, vocab_token_to_id_);
+            emit(pos, match_pos, token_begin);
         }
 
+        const std::size_t token_begin = ids.size();
         ids.push_back(match_token->id);
         pos = match_pos + match_token->content.size();
+        emit(match_pos, pos, token_begin);
     }
+}
+
+std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
+    if (text.empty()) { return {}; }
+    std::vector<int> ids;
+    if (!options.parse_added_tokens) {
+        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
+        return ids;
+    }
+    encode_added_token_segments(text, ids, nullptr);
     return ids;
+}
+
+SegmentedEncoding Tokenizer::encode_segmented(std::string_view text) const {
+    SegmentedEncoding encoding;
+    encoding.tokenizer_ = this;
+    encoding.text_      = text;
+    encode_added_token_segments(text, encoding.ids_, &encoding.segments_);
+    return encoding;
+}
+
+SegmentedEncoding::PrefixRelation SegmentedEncoding::prefix(std::size_t cut) const {
+    if (cut > text_.size()) { throw std::out_of_range("prefix cut exceeds the encoded text"); }
+    if (cut == 0) { return {.common_tokens = 0, .exact = true}; }
+    // Segments partition the text in order; the cut belongs to the first one ending at or past it.
+    const auto segment = std::lower_bound(
+        segments_.begin(), segments_.end(), cut,
+        [](const Segment& candidate, std::size_t value) { return candidate.byte_end < value; });
+    if (segment == segments_.end()) {
+        throw std::logic_error("segmented encoding does not cover the cut");
+    }
+    if (cut == segment->byte_end) { return {.common_tokens = segment->token_end, .exact = true}; }
+    // Every earlier segment is shared, so encode(text[0, cut)) is their tokens followed by the
+    // added-token parse of the partial segment, which is what a scan of the shorter text would
+    // have produced from the same position.
+    const std::vector<int> partial =
+        tokenizer_->encode(text_.substr(segment->byte_begin, cut - segment->byte_begin));
+    const auto divergence = std::mismatch(partial.begin(), partial.end(),
+                                          ids_.begin() + static_cast<std::ptrdiff_t>(
+                                                             segment->token_begin),
+                                          ids_.end());
+    const std::size_t common = static_cast<std::size_t>(divergence.first - partial.begin());
+    return {.common_tokens = segment->token_begin + common, .exact = common == partial.size()};
 }
 
 std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) const {

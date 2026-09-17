@@ -533,29 +533,29 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
-    encoded.input_ids = tokenizer.encode(rendered.text);
+    SegmentedEncoding encoding      = tokenizer.encode_segmented(rendered.text);
+    const std::size_t prompt_tokens = encoding.ids().size();
     const auto encode_boundary = [&](std::size_t byte_offset, bool allow_full_prompt,
                                      std::string_view name) {
         if (byte_offset > rendered.text.size()) {
             throw std::logic_error(std::string(name) + " byte offset exceeds rendered chat");
         }
-        // Tokenizers can merge across a byte cut. Re-tokenizing each prefix and comparing it
-        // against the complete encoding is what makes a byte frontier safe as model-state identity.
-        std::vector<int> prefix;
+        // Tokenizers can merge across a byte cut. Relating the prefix's own encoding to the
+        // complete encoding is what makes a byte frontier safe as model-state identity.
+        SegmentedEncoding::PrefixRelation prefix;
         try {
-            prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, byte_offset));
-        } catch (const std::exception&) {
+            prefix = encoding.prefix(byte_offset);
+        } catch (const std::invalid_argument&) {
             throw std::logic_error(std::string(name) + " cannot be tokenized independently");
         }
-        if (prefix.empty() || (!allow_full_prompt && prefix.size() >= encoded.input_ids.size()) ||
-            prefix.size() > encoded.input_ids.size() ||
-            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+        if (!prefix.exact || prefix.common_tokens == 0 ||
+            (!allow_full_prompt && prefix.common_tokens >= prompt_tokens)) {
             throw std::logic_error(std::string(name) + " is not an exact token prefix");
         }
-        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+        if (prefix.common_tokens > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error(std::string(name) + " token boundary exceeds uint32");
         }
-        return static_cast<std::uint32_t>(prefix.size());
+        return static_cast<std::uint32_t>(prefix.common_tokens);
     };
     // A client byte cut has no token-alignment guarantee. The longest common prefix of its own
     // encoding with the complete encoding is the deepest exact token prefix at or before the
@@ -564,13 +564,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         if (byte_offset > rendered.text.size()) {
             throw std::logic_error("explicit boundary byte offset exceeds rendered chat");
         }
-        std::vector<int> prefix;
+        std::size_t common = 0;
         try {
-            prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, byte_offset));
-        } catch (const std::exception&) { return 0; }
-        const auto divergence = std::mismatch(prefix.begin(), prefix.end(),
-                                              encoded.input_ids.begin(), encoded.input_ids.end());
-        const std::size_t common = static_cast<std::size_t>(divergence.first - prefix.begin());
+            common = encoding.prefix(byte_offset).common_tokens;
+        } catch (const std::invalid_argument&) { return 0; }
         if (common > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("explicit token boundary exceeds uint32");
         }
@@ -609,6 +606,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         }
         encoded.boundaries.push_back({.depth = depth, .kind = hint.kind, .publish = hint.publish});
     }
+    encoded.input_ids = encoding.release_ids();
     return encoded;
 }
 
