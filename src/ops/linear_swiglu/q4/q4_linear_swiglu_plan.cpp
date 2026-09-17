@@ -33,7 +33,7 @@ constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
 constexpr std::array<RouteSpec, 10> kA16Routes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTMma},
     {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
@@ -57,7 +57,7 @@ constexpr std::array<RouteSpec, 10> kA16Routes{{
 // AllowA8, exactly as NVFP4's W4A4 routes are reachable only through AllowA4.
 constexpr std::array<RouteSpec, 7> kA8Routes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
+    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTMma},
     {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
     {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
     {{49, 128}, Q4LinearSwiGluScheduleId::Materialized},
@@ -126,14 +126,29 @@ std::size_t int8_workspace_bytes(std::int32_t k, std::int32_t cols) {
     return layout.peak_bytes(1);
 }
 
+// Stream-K partials of the small-T tensor-core route; a tile is 32 output rows.
+template <class Allocator>
+SmallTMmaWorkspace allocate_small_t_workspace(Allocator& allocator, std::int32_t output_rows,
+                                              std::int32_t k, std::int32_t cols) {
+    return allocate_small_t_mma_workspace(allocator, small_t_mma_tile_cols(cols),
+                                          output_rows / (SmallTMmaShape::kRows / 2),
+                                          q4_linear_swiglu_small_t_split_k(k).splits);
+}
+
+std::size_t small_t_workspace_bytes(std::int32_t output_rows, std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_small_t_workspace(layout, output_rows, k, cols);
+    return layout.peak_bytes(1);
+}
+
 } // namespace
 
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
     switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         return "linear_swiglu.q4.gemv.paired_rows";
-    case Q4LinearSwiGluScheduleId::SmallTExact:
-        return "linear_swiglu.q4.mma.small_t.exact";
+    case Q4LinearSwiGluScheduleId::SmallTMma:
+        return "linear_swiglu.q4.small_t.mma.r32x2.swiglu";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         return "linear_swiglu.q4.mma.split_half_pair.r32.c40";
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
@@ -168,9 +183,12 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             };
             switch (route.schedule) {
             case Q4LinearSwiGluScheduleId::GemvPair:
-            case Q4LinearSwiGluScheduleId::SmallTExact:
             case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
             case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48:
+                return plan;
+            case Q4LinearSwiGluScheduleId::SmallTMma:
+                plan.workspace_bytes =
+                    small_t_workspace_bytes(problem.output_rows, problem.k, problem.cols);
                 return plan;
             case Q4LinearSwiGluScheduleId::Materialized:
                 plan.workspace_bytes =
@@ -225,9 +243,13 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);
         return;
-    case Q4LinearSwiGluScheduleId::SmallTExact:
-        q4_linear_swiglu_small_t_exact_launch(x, w, out, stream);
+    case Q4LinearSwiGluScheduleId::SmallTMma: {
+        auto scratch_scope               = ws.scope();
+        const SmallTMmaWorkspace scratch = allocate_small_t_workspace(ws, problem.output_rows,
+                                                                      problem.k, problem.cols);
+        q4_linear_swiglu_small_t_mma_launch(x, w, out, scratch, stream);
         return;
+    }
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40:
         q4_linear_swiglu_mma_split_half_pair_r32_c40_launch(x, w, out, stream);
         return;

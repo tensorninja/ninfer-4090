@@ -200,6 +200,7 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/q4/q4_linear_swiglu_int8.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
+  ops/linear_swiglu/q4/q4_linear_swiglu_small_t_mma.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu

@@ -105,12 +105,11 @@ __device__ __forceinline__ unsigned q5_pair(unsigned word, unsigned hi2, int lid
 
 } // namespace small_t_mma
 
-template <int TileCols, SmallTMmaEpilogue Epi, bool Q5>
+template <int TileCols, int kStages, SmallTMmaEpilogue Epi, bool Q5>
 __device__ __forceinline__ void small_t_mma_run(const SmallTMmaParams& p, const SmallTMmaJob& job,
                                                 int tile, int tile_global, std::uint8_t* smem) {
     using Shape          = SmallTMmaShape;
     constexpr int kNt    = TileCols / 8;
-    constexpr int kStages = Shape::stages_for(TileCols);
     constexpr int kStageBytes = Shape::stage_bytes(TileCols);
     constexpr int kGroupK = Shape::kGroupK;
     static_assert(TileCols % 8 == 0 && TileCols >= 8 && TileCols <= 32);
@@ -352,17 +351,21 @@ __device__ __forceinline__ void small_t_mma_run(const SmallTMmaParams& p, const 
     }
 
     if constexpr (Epi == SmallTMmaEpilogue::SwiGlu) {
-        // Warps 0/1 hold gate rows, 2/3 the matching up rows; only warps 0/1 store. A SwiGlu
-        // job runs without split-K (the launcher rejects it), so `up` is complete here.
+        // Warps 0/1 hold gate rows, 2/3 the matching up rows. The folded up sums travel
+        // through the phase-1 scratch of warps 2/3 (free since the reduction); only warps 0/1
+        // store.
+        if (rg >= 2) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) { *red_at(rg + 4, nt) = sum[nt]; }
+        }
+        asm volatile("bar.sync 1, 128;");
         if (rg >= 2) { return; }
         const std::int32_t out_row_a = tile * 32 + rg * 16 + gid;
         const std::int32_t out_row_b = out_row_a + 8;
 #pragma unroll
         for (int nt = 0; nt < kNt; ++nt) {
-            const float4 ga = *red_at(rg + 2, nt);
-            const float4 gb = *red_at(rg + 6, nt);
-            const float4 up = make_float4(ga.x + gb.x, ga.y + gb.y, ga.z + gb.z, ga.w + gb.w);
-            const int col0 = nt * 8 + 2 * lid;
+            const float4 up = *red_at(rg + 6, nt);
+            const int col0  = nt * 8 + 2 * lid;
             if (col0 < p.cols) {
                 job.out0[static_cast<std::int64_t>(col0) * job.ld0 + out_row_a] =
                     __float2bfloat16_rn(silu(sum[nt].x) * up.x);
@@ -415,21 +418,22 @@ __device__ __forceinline__ void small_t_mma_run(const SmallTMmaParams& p, const 
     }
 }
 
-template <int TileCols, SmallTMmaEpilogue Epi, SmallTMmaCodec Codec>
-__global__ void __launch_bounds__(SmallTMmaShape::kThreads, 2)
+template <int TileCols, int Stages, int MinBlocks, SmallTMmaEpilogue Epi, SmallTMmaCodec Codec>
+__global__ void __launch_bounds__(SmallTMmaShape::kThreads, MinBlocks)
     small_t_rowsplit_mma_kernel(SmallTMmaParams p) {
-    __shared__ __align__(128) std::uint8_t smem[SmallTMmaShape::smem_bytes(TileCols)];
+    __shared__ __align__(128) std::uint8_t smem[SmallTMmaShape::smem_bytes(TileCols, Stages)];
     const int tile_global = static_cast<int>(blockIdx.x);
     if constexpr (Codec == SmallTMmaCodec::Q4) {
-        small_t_mma_run<TileCols, Epi, false>(p, p.job0, tile_global, tile_global, smem);
+        small_t_mma_run<TileCols, Stages, Epi, false>(p, p.job0, tile_global, tile_global, smem);
     } else if constexpr (Codec == SmallTMmaCodec::Q5) {
-        small_t_mma_run<TileCols, Epi, true>(p, p.job0, tile_global, tile_global, smem);
+        small_t_mma_run<TileCols, Stages, Epi, true>(p, p.job0, tile_global, tile_global, smem);
     } else {
         if (tile_global < p.tiles0) {
-            small_t_mma_run<TileCols, Epi, false>(p, p.job0, tile_global, tile_global, smem);
+            small_t_mma_run<TileCols, Stages, Epi, false>(p, p.job0, tile_global, tile_global,
+                                                          smem);
         } else {
-            small_t_mma_run<TileCols, Epi, true>(p, p.job1, tile_global - p.tiles0, tile_global,
-                                                 smem);
+            small_t_mma_run<TileCols, Stages, Epi, true>(p, p.job1, tile_global - p.tiles0,
+                                                         tile_global, smem);
         }
     }
 }

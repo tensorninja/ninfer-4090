@@ -10,7 +10,7 @@
 namespace ninfer::ops::detail {
 
 // Split-K of the small-T tensor-core route: 5120 rows give 80 64-row tiles, so K is split
-// until the grid fills the machine at two CTAs per SM.
+// three ways to fill the machine at two CTAs per SM in one wave.
 constexpr SmallTMmaSplitK q5_linear_add_small_t_split_k(std::int32_t k) noexcept {
     return small_t_mma_split_k(k, 3);
 }

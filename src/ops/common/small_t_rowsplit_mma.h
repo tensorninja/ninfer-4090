@@ -50,11 +50,11 @@ struct SmallTMmaShape {
     NINFER_SMALL_T_MMA_HD static constexpr int stage_bytes(int tile_cols) noexcept {
         return kActOffset + kPhases * tile_cols * kGroupK * 2;
     }
-    // Three stages (two in flight while one is contracted) keep the weight stream saturated
-    // at two CTAs per SM; a fourth stage measured slower at every tile width.
-    NINFER_SMALL_T_MMA_HD static constexpr int stages_for(int) noexcept { return 3; }
-    NINFER_SMALL_T_MMA_HD static constexpr int smem_bytes(int tile_cols) noexcept {
-        return stages_for(tile_cols) * stage_bytes(tile_cols);
+    // Pipeline depth and residency are chosen per Op: long split-K ranges saturate the
+    // weight stream with three stages at two CTAs per SM, short tiles want a fourth stage
+    // and, at eight columns, a third resident CTA.
+    NINFER_SMALL_T_MMA_HD static constexpr int smem_bytes(int tile_cols, int stages) noexcept {
+        return stages * stage_bytes(tile_cols);
     }
 };
 
