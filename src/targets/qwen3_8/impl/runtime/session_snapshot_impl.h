@@ -304,6 +304,14 @@ std::uint32_t ProgramImplCore::retained_lane_depth(std::uint32_t lane) const noe
     return static_cast<std::uint32_t>(sequences[lane].ledger.size());
 }
 
+std::uint32_t ProgramImplCore::retained_lane_boundary_tokens(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency || !sequences[lane].retained ||
+        !sequences[lane].turn_checkpoint.valid) {
+        return 0;
+    }
+    return sequences[lane].turn_checkpoint.frontier;
+}
+
 std::string ProgramImplCore::retained_lane_digest(std::uint32_t lane) const {
     if (lane >= max_concurrency || !sequences[lane].retained) { return {}; }
     return ledger_digest(sequences[lane].ledger);

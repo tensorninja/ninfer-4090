@@ -769,7 +769,10 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 | `throughput` | interval token deltas and rates, board energy, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `queue`, `restore`, `publish`,
-`prefill`, `decode`, and `total` as full-precision JSON numbers. Its `speculative` object contains
+`prefill`, `decode`, and `total` as full-precision JSON numbers. `publish` is only the completion
+path's hand-off of the retained lane to the publication worker; the export itself runs there and is
+reported through the throughput record's `continuation_cache.latency_microseconds` `export_*`
+fields and the `continuation_export_*` metrics. Its `speculative` object contains
 `backend`, `draft_window`, `rounds`, `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and
 `accepted_per_position`. Rates can be derived downstream from raw token counts and seconds instead
 of rounded stderr strings.

@@ -1,4 +1,7 @@
+#include "core/device.h"
 #include "core/layout.h"
+#include "core/linear_attention_state.h"
+#include "core/pinned_transfer.h"
 #include <ninfer/targets/qwen3_8/decoder_state.h>
 #include <ninfer/targets/qwen3_8/hybrid_topology.h>
 #include <ninfer/targets/qwen3_8/mtp_alignment.h>
@@ -8,8 +11,11 @@
 #include "targets/qwen3_8/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_8/impl/runtime/continuation_image.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -611,6 +617,66 @@ void test_multiple_checkpoint_planning() {
            "user turn anchor is planned without a capture boundary");
 }
 
+// The direct linear-state segment export is what the continuation image persists, so it must be
+// byte-identical to serializing the per-layer state image, which is what `decode_linear` and
+// every image already in L2/L3 assume.
+void test_linear_segment_export() {
+    int devices                 = 0;
+    const cudaError_t count_err = cudaGetDeviceCount(&devices);
+    if (count_err != cudaSuccess || devices == 0) {
+        (void)cudaGetLastError();
+        std::cout << "note: linear segment export check skipped without a CUDA device\n";
+        return;
+    }
+    namespace image = q36::detail::continuation;
+    ninfer::DeviceContext ctx(0);
+    ninfer::LayoutBuilder builder;
+    const auto layout = ninfer::plan_linear_attention_state_pool(
+        builder, ninfer::LinearAttentionStatePoolSpec{.layers         = 3,
+                                                      .conv_channels  = 10,
+                                                      .conv_width     = 3,
+                                                      .value_heads    = 4,
+                                                      .value_head_dim = 5,
+                                                      .key_head_dim   = 6,
+                                                      .slot_count     = 2,
+                                                      .conv_dtype     = ninfer::DType::BF16});
+    ninfer::DeviceArena arena(builder.finish(256));
+    ninfer::LinearAttentionStatePool pool({arena.base(), arena.capacity()}, layout);
+    for (std::uint32_t layer = 0; layer < pool.layer_count(); ++layer) {
+        for (std::int32_t slot = 0; slot < pool.slot_count(); ++slot) {
+            const ninfer::Tensor conv      = pool.conv_slot(layer, slot);
+            const ninfer::Tensor recurrent = pool.recurrent_slot(layer, slot);
+            std::vector<std::uint8_t> conv_bytes(conv.bytes());
+            std::vector<std::uint8_t> recurrent_bytes(recurrent.bytes());
+            for (std::size_t i = 0; i < conv_bytes.size(); ++i) {
+                conv_bytes[i] = static_cast<std::uint8_t>(17 * layer + 5 * slot + i);
+            }
+            for (std::size_t i = 0; i < recurrent_bytes.size(); ++i) {
+                recurrent_bytes[i] = static_cast<std::uint8_t>(31 * layer + 7 * slot + 3 * i);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(conv.data, conv_bytes.data(), conv_bytes.size(),
+                                       cudaMemcpyHostToDevice, ctx.stream));
+            CUDA_CHECK(cudaMemcpyAsync(recurrent.data, recurrent_bytes.data(),
+                                       recurrent_bytes.size(), cudaMemcpyHostToDevice,
+                                       ctx.stream));
+        }
+    }
+    ctx.synchronize();
+    // A ring far smaller than one layer forces the segment through many slot rotations.
+    ninfer::PinnedTransferBuffer transfer(64);
+    for (std::int32_t slot = 0; slot < pool.slot_count(); ++slot) {
+        const auto reference = image::encode_linear(
+            ninfer::export_linear_attention_state(pool, slot, transfer, ctx.stream));
+        const auto direct = image::export_linear_segment(pool, slot, transfer, ctx.stream);
+        expect(direct == reference, "direct linear-state segment matches the serialized image");
+        const auto decoded = image::decode_linear(direct, pool);
+        expect(decoded.layers == pool.layer_count() &&
+                   decoded.conv.size() == pool.layer_count() &&
+                   decoded.recurrent.size() == pool.layer_count(),
+               "direct linear-state segment decodes");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -626,6 +692,7 @@ int main() {
     test_continuation_prefix_filter_digest();
     test_stable_alias_identity();
     test_multiple_checkpoint_planning();
+    test_linear_segment_export();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.8 runtime mechanism checks failed\n";
         return 1;

@@ -336,6 +336,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId)), continuation_transfer(16U * 1024U * 1024U),
+      export_transfer(16U * 1024U * 1024U),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_8::OrdinaryDecodeIngress) +
@@ -426,6 +427,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
     }
 
+    CUDA_CHECK(cudaStreamCreateWithFlags(&export_stream, cudaStreamNonBlocking));
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&export_fence_events[lane], cudaEventDisableTiming));
+    }
+
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
@@ -473,7 +479,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (export_stream != nullptr) {
+        (void)cudaStreamSynchronize(export_stream);
+        (void)cudaStreamDestroy(export_stream);
+        export_stream = nullptr;
+    }
     for (cudaEvent_t& event : checkpoint_staging_events) {
+        if (event != nullptr) {
+            (void)cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
+    for (cudaEvent_t& event : export_fence_events) {
         if (event != nullptr) {
             (void)cudaEventDestroy(event);
             event = nullptr;
@@ -1506,10 +1523,10 @@ cache::ContinuationImage ProgramImplCore::export_stable_continuation(
                                               device.stream));
     out.segments.emplace(
         "main.gdn",
-        image::encode_linear(export_linear_attention_state(
+        image::export_linear_segment(
             decoder->linear_attention,
             LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
-            continuation_transfer, device.stream)));
+            continuation_transfer, device.stream));
     out.segments.emplace(
         "main.tail_hidden",
         image::encode_tensor(copy_tensor_to_host(sequence.turn_checkpoint_hidden,
@@ -1536,6 +1553,24 @@ cache::ContinuationImage ProgramImplCore::export_stable_continuation(
 }
 
 cache::ContinuationImage ProgramImplCore::export_continuation_lane(std::uint32_t lane) const {
+    return export_lane_image(lane, continuation_transfer, device.stream);
+}
+
+void ProgramImplCore::fence_lane_for_export(std::uint32_t lane) {
+    if (lane >= max_concurrency) { throw std::out_of_range("continuation lane is out of range"); }
+    CUDA_CHECK(cudaEventRecord(export_fence_events[lane], device.stream));
+}
+
+cache::ContinuationImage
+ProgramImplCore::export_continuation_lane_background(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { throw std::out_of_range("continuation lane is out of range"); }
+    CUDA_CHECK(cudaStreamWaitEvent(export_stream, export_fence_events[lane], 0));
+    return export_lane_image(lane, export_transfer, export_stream);
+}
+
+cache::ContinuationImage ProgramImplCore::export_lane_image(std::uint32_t lane,
+                                                            PinnedTransferBuffer& transfer,
+                                                            cudaStream_t stream) const {
     if (lane >= max_concurrency) { throw std::out_of_range("continuation lane is out of range"); }
     const SequenceState& sequence = sequences[lane];
     const RequestControl& request = requests[lane];
@@ -1597,51 +1632,50 @@ cache::ContinuationImage ProgramImplCore::export_continuation_lane(std::uint32_t
     });
 
     image::emit_paged(out.segments, "main.text_kv",
-                      export_paged_kv_logical(sequence.kv->text, sequence.text_kv_valid,
-                                              continuation_transfer, device.stream));
+                      export_paged_kv_logical(sequence.kv->text, sequence.text_kv_valid, transfer,
+                                              stream));
     out.segments.emplace(
         "main.gdn",
-        image::encode_linear(export_linear_attention_state(
+        image::export_linear_segment(
             decoder->linear_attention,
-            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            continuation_transfer, device.stream)));
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), transfer,
+            stream));
     out.segments.emplace("main.tail_hidden",
-                          image::encode_tensor(copy_tensor_to_host(
-                              sequence.tail_hidden, continuation_transfer, device.stream)));
+                          image::encode_tensor(
+                              copy_tensor_to_host(sequence.tail_hidden, transfer, stream)));
     if (sequence.turn_checkpoint.valid) {
         out.segments.emplace(
             "checkpoint.gdn",
-            image::encode_linear(export_linear_attention_state(
+            image::export_linear_segment(
                 decoder->linear_attention,
                 LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
-                continuation_transfer, device.stream)));
+                transfer, stream));
         out.segments.emplace(
             "checkpoint.hidden",
-            image::encode_tensor(copy_tensor_to_host(
-                sequence.turn_checkpoint_hidden, continuation_transfer, device.stream)));
+            image::encode_tensor(
+                copy_tensor_to_host(sequence.turn_checkpoint_hidden, transfer, stream)));
     }
     if (mtp_backend) {
         image::emit_paged(out.segments, "mtp.kv",
                           export_paged_kv_logical(*sequence.kv->backend, sequence.mtp_kv_valid,
-                                                  continuation_transfer, device.stream));
+                                                  transfer, stream));
     }
     if (dflash_backend) {
         if (!dflash) { throw std::logic_error("DFlash continuation has no persistent state"); }
         image::emit_paged(out.segments, "dflash.full_kv",
                           export_paged_kv_logical(*sequence.kv->backend,
-                                                  sequence.dflash_context_frontier,
-                                                  continuation_transfer, device.stream));
+                                                  sequence.dflash_context_frontier, transfer,
+                                                  stream));
         out.segments.emplace(
             "dflash.local",
-            image::encode_cyclic(export_cyclic_kv_lane(dflash->local,
-                                                        static_cast<std::int32_t>(sequence.lane),
-                                                        continuation_transfer, device.stream)));
+            image::encode_cyclic(export_cyclic_kv_lane(
+                dflash->local, static_cast<std::int32_t>(sequence.lane), transfer, stream)));
         if (sequence.turn_checkpoint.valid) {
             out.segments.emplace(
                 "dflash.checkpoint_local",
                 image::encode_cyclic(export_cyclic_kv_lane(
                     dflash->turn_checkpoint_local, static_cast<std::int32_t>(sequence.lane),
-                    continuation_transfer, device.stream)));
+                    transfer, stream)));
         }
     }
     return out;

@@ -505,9 +505,9 @@ struct GenerationTimings {
     // Wall time spent importing a continuation image into the admitted lane. Charged to the
     // request that consumed it; an L1 hit needs no import and reports zero.
     double restore_seconds     = 0.0;
-    // Synchronous continuation export performed on the completion path while the lane is still
-    // held. It is charged to the request that triggered it because it delays that request's
-    // result and, being inside the shared decode round, every other lane's next round too.
+    // Completion-path cost of handing the retained lane to the publication worker: fencing the
+    // lane and queueing the export job. The export itself runs on the worker and is reported
+    // through the continuation export counters, not here.
     double publish_seconds     = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
@@ -817,6 +817,11 @@ struct RuntimeStats {
     std::uint64_t continuation_l3_restore_operations  = 0;
     std::uint64_t continuation_l2_admission_microseconds = 0;
     std::uint64_t continuation_l2_admission_operations = 0;
+    // Device-to-host export of a retained lane into a continuation image, performed by the
+    // publication worker after the request completed; it holds the lane but not the execution
+    // thread.
+    std::uint64_t continuation_export_microseconds     = 0;
+    std::uint64_t continuation_export_operations       = 0;
     std::uint64_t continuation_l3_persistence_microseconds = 0;
     std::uint64_t continuation_l3_persistence_operations = 0;
     std::uint64_t continuation_persistence_queued    = 0;

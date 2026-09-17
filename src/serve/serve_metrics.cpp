@@ -228,6 +228,10 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency, const ninfer::Ru
                    live.continuation_l2_admission_microseconds);
     append_counter(out, "ninfer:continuation_l2_admission_operations_total",
                    live.continuation_l2_admission_operations);
+    append_counter(out, "ninfer:continuation_export_microseconds_total",
+                   live.continuation_export_microseconds);
+    append_counter(out, "ninfer:continuation_export_operations_total",
+                   live.continuation_export_operations);
     append_counter(out, "ninfer:continuation_l3_persistence_microseconds_total",
                    live.continuation_l3_persistence_microseconds);
     append_counter(out, "ninfer:continuation_l3_persistence_operations_total",

@@ -351,6 +351,10 @@ public:
             continuation_stats_.l2_lookup_microseconds.load(std::memory_order_relaxed);
         snapshot.continuation_l2_lookup_operations =
             continuation_stats_.l2_lookup_operations.load(std::memory_order_relaxed);
+        snapshot.continuation_export_microseconds =
+            continuation_stats_.export_microseconds.load(std::memory_order_relaxed);
+        snapshot.continuation_export_operations =
+            continuation_stats_.export_operations.load(std::memory_order_relaxed);
         snapshot.continuation_l3_lookup_microseconds =
             continuation_stats_.l3_lookup_microseconds.load(std::memory_order_relaxed);
         snapshot.continuation_l3_lookup_operations =
@@ -416,6 +420,7 @@ public:
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
         require_session_digest(lane, expected_digest);
+        wait_lane_export(lane);
         auto snapshot = instance_.program->save_retained_lane(lane, model_binding);
         if (!session_path.empty()) { lane_session_path_[lane] = session_path; }
         return snapshot;
@@ -426,6 +431,7 @@ public:
                           std::string_view model_binding, std::string_view session_path = {}) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
+        wait_lane_export(lane);
         if (instance_.program->has_retained_lane(lane)) {
             // Involuntary for whatever session held the lane: the client asked for a restore,
             // not for that session's destruction.
@@ -453,6 +459,7 @@ public:
         // Explicit erase is a deletion request: never auto-save, and drop the binding.
         lane_session_path_[lane].clear();
         if (instance_.program->has_retained_lane(lane)) {
+            wait_lane_export(lane);
             instance_.program->evict_retained_lane(lane);
             invalidate_lane_plans(lane);
             publish_runtime_stats();
@@ -601,6 +608,12 @@ private:
     enum class PublicationStatus : std::uint8_t { Pending, Success, Failed, Superseded };
     using PublicationTicket = std::shared_ptr<std::atomic<PublicationStatus>>;
 
+    // One unit of publication work. A plain item carries a complete image for one alias:
+    // `session` names it and `immutable` selects the write-once stable-prefix path. An export
+    // job (`export_lane` set) carries no image yet: the worker exports the retained lane first,
+    // then publishes the image under `boundary_alias` (stable prefix, when non-empty) and under
+    // `session` (session alias, when non-empty). The session part of an export job can be
+    // superseded by a newer snapshot of the same session while queued; the boundary part cannot.
     struct Publication {
         cache::ContinuationImage image;
         std::string session;
@@ -610,6 +623,9 @@ private:
         std::uint64_t sequence = 0;
         bool immutable         = false;
         std::optional<std::pair<std::string, std::uint64_t>> stable_flight;
+        std::optional<std::uint32_t> export_lane;
+        std::string boundary_alias;
+        std::uint32_t boundary_depth = 0;
     };
 
     struct PendingSessionPublication {
@@ -663,6 +679,8 @@ private:
         std::atomic<std::uint64_t> l2_lookup_operations{0};
         std::atomic<std::uint64_t> l3_lookup_microseconds{0};
         std::atomic<std::uint64_t> l3_lookup_operations{0};
+        std::atomic<std::uint64_t> export_microseconds{0};
+        std::atomic<std::uint64_t> export_operations{0};
         // Restore-failure attribution; these sum to restore_failures.
         std::atomic<std::uint64_t> restore_failed_kv_reservation{0};
         std::atomic<std::uint64_t> restore_failed_verify_depth{0};
@@ -836,6 +854,19 @@ private:
                                          bool immutable = false,
                                         std::optional<std::pair<std::string, std::uint64_t>>
                                             stable_flight = std::nullopt) noexcept {
+        Publication item{.image               = std::move(image),
+                         .session             = session,
+                         .expected_head       = std::move(expected_head),
+                         .expected_generation = expected_generation,
+                         .immutable           = immutable,
+                         .stable_flight       = std::move(stable_flight)};
+        return enqueue_publication(std::move(item));
+    }
+
+    // Queues one publication item and returns the ticket its session part reports through (an
+    // export job without a session part still returns a ticket for its boundary part). Empty
+    // when the worker is stopping or the queue could not take the item.
+    PublicationTicket enqueue_publication(Publication item) noexcept {
         try {
             auto ticket =
                 std::make_shared<std::atomic<PublicationStatus>>(PublicationStatus::Pending);
@@ -849,44 +880,156 @@ private:
             // publication for the same session is already dead: its CAS expects a head the newer
             // one is about to replace. Executing it costs a full multi-hundred-megabyte admission
             // and then records a failure. Fold it into the newer one instead, which inherits the
-            // head the dropped publication was chaining from so the alias still advances.
-            if (!immutable) {
+            // head the dropped publication was chaining from so the alias still advances. An
+            // export job loses only its session part: its boundary alias is write-once and still
+            // wants the image, so the job stays queued unless nothing is left to publish.
+            if (!item.immutable && !item.session.empty()) {
                 for (auto queued = publications_.begin(); queued != publications_.end();) {
-                    if (queued->session != session || queued->immutable) {
+                    if (queued->session != item.session || queued->immutable) {
                         ++queued;
                         continue;
                     }
-                    expected_head       = queued->expected_head;
-                    expected_generation = queued->expected_generation;
-                    image.parent_id     = expected_head;
+                    item.expected_head       = queued->expected_head;
+                    item.expected_generation = queued->expected_generation;
+                    item.image.parent_id     = item.expected_head;
                     queued->ticket->store(PublicationStatus::Superseded,
                                           std::memory_order_release);
                     if (queued->stable_flight) {
                         std::lock_guard flight_lock(stable_flight_mutex_);
                         (void)stable_flights_.release(queued->stable_flight->first,
                                                       queued->stable_flight->second);
+                        queued->stable_flight.reset();
                     }
                     continuation_stats_.publication_coalesced.fetch_add(
                         1, std::memory_order_relaxed);
+                    if (queued->export_lane && !queued->boundary_alias.empty()) {
+                        queued->session.clear();
+                        queued->expected_head.reset();
+                        queued->expected_generation.reset();
+                        ++queued;
+                        continue;
+                    }
+                    if (queued->export_lane) {
+                        lane_export_pending_[*queued->export_lane] = false;
+                    }
                     queued = publications_.erase(queued);
                 }
             }
-            publications_.push_back(Publication{.image         = std::move(image),
-                                                 .session       = session,
-                                                 .expected_head = std::move(expected_head),
-                                                 .expected_generation = expected_generation,
-                                                .ticket        = ticket,
-                                                .sequence      = sequence,
-                                                .immutable     = immutable,
-                                                .stable_flight = std::move(stable_flight)});
-            auto& pending = session_publications_[session];
-            pending.sequence = sequence;
-            publication_cv_.notify_one();
+            if (item.export_lane) { lane_export_pending_[*item.export_lane] = true; }
+            item.ticket   = ticket;
+            item.sequence = sequence;
+            if (!item.session.empty()) { session_publications_[item.session].sequence = sequence; }
+            if (!item.boundary_alias.empty()) {
+                session_publications_[item.boundary_alias].sequence = sequence;
+            }
+            publications_.push_back(std::move(item));
+            publication_cv_.notify_all();
             return ticket;
         } catch (...) {
             continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
             continuation_stats_.publication_failed_error.fetch_add(1, std::memory_order_relaxed);
             return {};
+        }
+    }
+
+    // Runs one alias publication and returns its status. `outcome`/`threw` carry the
+    // attribution the failure counters need.
+    PublicationStatus run_publication(cache::ContinuationImage image, const std::string& alias,
+                                      bool immutable,
+                                      const std::optional<cache::ContentId>& expected_head,
+                                      std::optional<std::uint64_t> expected_generation,
+                                      std::optional<cache::SessionPublishOutcome>& outcome,
+                                      bool& threw) noexcept {
+        PublicationStatus status = PublicationStatus::Failed;
+        outcome.reset();
+        threw = false;
+        try {
+            const cache::StoreOptions options{
+                .recompute_cost = static_cast<double>(image.frontier_tokens),
+                .l2_idle_ttl    = publication_l2_ttl_,
+                .l3_idle_ttl    = publication_l3_ttl_,
+            };
+            const auto frontier_tokens = image.frontier_tokens;
+            if (immutable) {
+                const auto result =
+                    continuation_cache_->publish_stable_alias(std::move(image), alias, options);
+                outcome = result.outcome;
+                if (result.alias_advanced) {
+                    status = PublicationStatus::Success;
+                    (void)continuation_cache_->queue_persistence(alias, result.id, frontier_tokens,
+                                                                 cache::AliasKind::StablePrefix);
+                } else if (result.outcome == cache::SessionPublishOutcome::AliasAlreadyOwned) {
+                    // Another lane already owns this write-once stable prefix. The alias it
+                    // holds serves this prompt just as well, so the contest is not a failure.
+                    status = PublicationStatus::Superseded;
+                }
+            } else {
+                const auto result = continuation_cache_->publish_session_l2(
+                    std::move(image), alias, expected_head, options, expected_generation);
+                if (result.alias_advanced) {
+                    (void)continuation_cache_->queue_persistence(alias, result.id, frontier_tokens,
+                                                                 cache::AliasKind::Session);
+                }
+                status  = result.alias_advanced ? PublicationStatus::Success
+                                                : (result.stored ? PublicationStatus::Superseded
+                                                                 : PublicationStatus::Failed);
+                outcome = result.outcome;
+            }
+        } catch (...) {
+            // A publication must not take the worker down, but it must not disappear either.
+            threw  = true;
+            status = PublicationStatus::Failed;
+        }
+        return status;
+    }
+
+    void account_publication(PublicationStatus status,
+                             const std::optional<cache::SessionPublishOutcome>& outcome,
+                             bool threw) noexcept {
+        if (status == PublicationStatus::Success) {
+            continuation_stats_.publication_successes.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (status == PublicationStatus::Superseded) {
+            continuation_stats_.publication_superseded.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
+        // No default outcome stands in for an unclassified failure: a throw is its own
+        // attribution. Defaulting this to a real outcome once reported every swallowed exception
+        // as a capacity rejection.
+        if (threw || !outcome) {
+            continuation_stats_.publication_failed_error.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        switch (*outcome) {
+        case cache::SessionPublishOutcome::EvictedOnAdmission:
+            continuation_stats_.publication_failed_evicted.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case cache::SessionPublishOutcome::HeadMoved:
+        case cache::SessionPublishOutcome::GenerationMoved:
+        // Reaching the failure branch with this outcome would be a logic surprise: the
+        // immutable path reports it as Superseded. Group it with the other lost races rather
+        // than with a capacity limit it has nothing to do with.
+        case cache::SessionPublishOutcome::AliasAlreadyOwned:
+            continuation_stats_.publication_failed_alias_moved.fetch_add(
+                1, std::memory_order_relaxed);
+            break;
+        case cache::SessionPublishOutcome::LineageMismatch:
+            continuation_stats_.publication_failed_lineage.fetch_add(1, std::memory_order_relaxed);
+            break;
+        // Only a real budget rejection reaches the capacity counter. A malformed or mis-kinded
+        // alias is a caller defect, and Advanced here is a logic surprise; counting either as
+        // capacity once reported a structural publication bug as pressure on a tier that was
+        // almost empty.
+        case cache::SessionPublishOutcome::InvalidAlias:
+        case cache::SessionPublishOutcome::Advanced:
+            continuation_stats_.publication_failed_error.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case cache::SessionPublishOutcome::RejectedTooLarge:
+            continuation_stats_.publication_failed_capacity.fetch_add(
+                1, std::memory_order_relaxed);
+            break;
         }
     }
 
@@ -904,98 +1047,64 @@ private:
                 item = std::move(publications_.front());
                 publications_.pop_front();
             }
-            PublicationStatus status = PublicationStatus::Failed;
-            // No default outcome stands in for an unclassified failure: a throw is its own
-            // attribution. Defaulting this to a real outcome once reported every swallowed
-            // exception as a capacity rejection.
-            std::optional<cache::SessionPublishOutcome> publication_outcome;
-            bool publication_threw = false;
-            try {
-                const cache::StoreOptions options{
-                    .recompute_cost = static_cast<double>(item.image.frontier_tokens),
-                    .l2_idle_ttl    = publication_l2_ttl_,
-                    .l3_idle_ttl    = publication_l3_ttl_,
-                };
-                if (item.immutable) {
-                    const auto frontier_tokens = item.image.frontier_tokens;
-                    const auto result = continuation_cache_->publish_stable_alias(
-                        std::move(item.image), item.session, options);
-                    publication_outcome = result.outcome;
-                    if (result.alias_advanced) {
-                        status = PublicationStatus::Success;
-                        (void)continuation_cache_->queue_persistence(
-                            item.session, result.id, frontier_tokens,
-                            cache::AliasKind::StablePrefix);
-                    } else if (result.outcome == cache::SessionPublishOutcome::AliasAlreadyOwned) {
-                        // Another lane already owns this write-once stable prefix. The alias it
-                        // holds serves this prompt just as well, so the contest is not a failure.
-                        status = PublicationStatus::Superseded;
-                    }
-                } else {
-                    const auto frontier_tokens = item.image.frontier_tokens;
-                    const auto result = continuation_cache_->publish_session_l2(
-                        std::move(item.image), item.session, item.expected_head, options,
-                        item.expected_generation);
-                    if (result.alias_advanced) {
-                        (void)continuation_cache_->queue_persistence(
-                            item.session, result.id, frontier_tokens, cache::AliasKind::Session);
-                    }
-                    status = result.alias_advanced ? PublicationStatus::Success
-                                                   : (result.stored ? PublicationStatus::Superseded
-                                                                    : PublicationStatus::Failed);
-                    publication_outcome = result.outcome;
+            bool export_failed = false;
+            if (item.export_lane) {
+                // The lane is retained and untouched until this returns: the execution thread
+                // waits on the pending flag before reusing or releasing it.
+                const auto export_started = Clock::now();
+                try {
+                    item.image =
+                        instance_.program->export_continuation_lane_background(*item.export_lane);
+                } catch (...) { export_failed = true; }
+                continuation_stats_.export_operations.fetch_add(1, std::memory_order_relaxed);
+                continuation_stats_.export_microseconds.fetch_add(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                              export_started)
+                            .count()),
+                    std::memory_order_relaxed);
+                {
+                    std::lock_guard lock(publication_mutex_);
+                    lane_export_pending_[*item.export_lane] = false;
                 }
-            } catch (...) {
-                // A publication must not take the worker down, but it must not disappear either.
-                publication_threw = true;
-                status            = PublicationStatus::Failed;
+                publication_cv_.notify_all();
+                // The session part may have been superseded while the job was queued; read the
+                // parent the job holds now, not the one it was created with.
+                if (!item.session.empty()) { item.image.parent_id = item.expected_head; }
             }
-            if (status == PublicationStatus::Success) {
-                continuation_stats_.publication_successes.fetch_add(1, std::memory_order_relaxed);
-            } else if (status == PublicationStatus::Superseded) {
-                continuation_stats_.publication_superseded.fetch_add(1,
-                                                                      std::memory_order_relaxed);
-            } else {
-                continuation_stats_.publication_failures.fetch_add(1, std::memory_order_relaxed);
-                if (publication_threw || !publication_outcome) {
-                    continuation_stats_.publication_failed_error.fetch_add(
-                        1, std::memory_order_relaxed);
+            std::optional<cache::SessionPublishOutcome> outcome;
+            bool threw                       = false;
+            PublicationStatus boundary_status = PublicationStatus::Failed;
+            if (!item.boundary_alias.empty()) {
+                // The cache is content-addressed over the serialized image, parent included, so
+                // the boundary copy carries the session's parent too: both aliases then resolve
+                // to one L2 payload instead of storing the same state twice.
+                if (export_failed || item.image.boundary_tokens != item.boundary_depth) {
+                    threw = true;
                 } else {
-                    switch (*publication_outcome) {
-                    case cache::SessionPublishOutcome::EvictedOnAdmission:
-                        continuation_stats_.publication_failed_evicted.fetch_add(
-                            1, std::memory_order_relaxed);
-                        break;
-                    case cache::SessionPublishOutcome::HeadMoved:
-                    case cache::SessionPublishOutcome::GenerationMoved:
-                    // Reaching the failure branch with this outcome would be a logic surprise:
-                    // the immutable path reports it as Superseded. Group it with the other lost
-                    // races rather than with a capacity limit it has nothing to do with.
-                    case cache::SessionPublishOutcome::AliasAlreadyOwned:
-                        continuation_stats_.publication_failed_alias_moved.fetch_add(
-                            1, std::memory_order_relaxed);
-                        break;
-                    case cache::SessionPublishOutcome::LineageMismatch:
-                        continuation_stats_.publication_failed_lineage.fetch_add(
-                            1, std::memory_order_relaxed);
-                        break;
-                    // Only a real budget rejection reaches the capacity counter. A malformed or
-                    // mis-kinded alias is a caller defect, and Advanced here is a logic surprise;
-                    // counting either as capacity once reported a structural publication bug as
-                    // pressure on a tier that was almost empty.
-                    case cache::SessionPublishOutcome::InvalidAlias:
-                    case cache::SessionPublishOutcome::Advanced:
-                        continuation_stats_.publication_failed_error.fetch_add(
-                            1, std::memory_order_relaxed);
-                        break;
-                    case cache::SessionPublishOutcome::RejectedTooLarge:
-                        continuation_stats_.publication_failed_capacity.fetch_add(
-                            1, std::memory_order_relaxed);
-                        break;
-                    }
+                    boundary_status = run_publication(
+                        item.session.empty() ? std::move(item.image) : item.image,
+                        item.boundary_alias, true, std::nullopt, std::nullopt, outcome, threw);
                 }
+                account_publication(boundary_status, outcome, threw);
             }
-            item.ticket->store(status, std::memory_order_release);
+            if (!item.session.empty()) {
+                PublicationStatus status = PublicationStatus::Failed;
+                if (export_failed) {
+                    threw = true;
+                    outcome.reset();
+                } else {
+                    status = run_publication(std::move(item.image), item.session, item.immutable,
+                                             item.expected_head, item.expected_generation,
+                                             outcome, threw);
+                }
+                account_publication(status, outcome, threw);
+                item.ticket->store(status, std::memory_order_release);
+            } else if (item.ticket->load(std::memory_order_acquire) == PublicationStatus::Pending) {
+                // A boundary-only job reports its boundary outcome; a job whose session part was
+                // superseded while queued keeps that verdict.
+                item.ticket->store(boundary_status, std::memory_order_release);
+            }
             {
                 std::lock_guard lock(publication_mutex_);
                 publication_completed_ = item.sequence;
@@ -1170,7 +1279,7 @@ private:
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
-        snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        snapshot.prefilling_requests = static_cast<std::uint32_t>(prefill_lanes_.size());
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (l1_policy_active_ && instance_.program->has_retained_lane(lane)) {
                 ++snapshot.l1_resident_entries;
@@ -1355,6 +1464,9 @@ private:
         // reporting, and the completion handshake already orders the result.
         std::atomic<std::uint32_t> prefill_processed{0};
         std::atomic<std::uint32_t> prefill_reused{0};
+        // Prompt length of the admitted plan; with the two counters above it gives the tokens a
+        // prefilling lane still has to consume, which orders chunk issue across lanes.
+        std::uint32_t prefill_total_tokens = 0;
         std::optional<GenerationBudget> budget;
         // Absent when the guard is disabled. Trips between rounds rather than inside one, so a
         // confirmed cycle costs at most one further round before the lane is terminated.
@@ -1755,49 +1867,74 @@ private:
             std::ranges::find_if(request->boundaries, [](const StableBoundary& boundary) {
                 return boundary.completion_publish;
             });
-        const bool publish_boundary = frontier_boundary != request->boundaries.end();
+        // The boundary alias names the exact prefix through the rewrite frontier, which is the
+        // lane's turn checkpoint: a request sharing only that prefix restores the image and
+        // rewinds to the checkpoint, and a request sharing the generated turn as well appends at
+        // the frontier. One export serves both aliases.
+        const bool publish_boundary =
+            frontier_boundary != request->boundaries.end() &&
+            instance_.program->retained_lane_boundary_tokens(lane) == frontier_boundary->depth;
         if (!publish_session && !publish_boundary) { return; }
-        const auto export_started = Clock::now();
+        const auto publish_started = Clock::now();
         try {
-            // One export serves both aliases. The boundary alias names the exact prefix through
-            // the rewrite frontier, which is this image's turn checkpoint: a request sharing only
-            // that prefix restores the image and rewinds to the checkpoint, and a request sharing
-            // the generated turn as well appends at the frontier.
-            auto image = instance_.program->export_continuation_lane(lane);
-            // The cache is content-addressed over the serialized image, parent included, so the
-            // boundary copy carries the session's parent too: both aliases then resolve to one L2
-            // payload instead of storing the same state twice.
-            if (publish_session) { image.parent_id = request->routed_continuation.id; }
-            if (publish_boundary && image.boundary_tokens == frontier_boundary->depth) {
-                auto ticket = queue_publication(publish_session ? image : std::move(image),
-                                                frontier_boundary->alias, std::nullopt,
-                                                std::nullopt, true);
-                if (ticket) {
-                    request->deepest_published_depth =
-                        std::max(request->deepest_published_depth, frontier_boundary->depth);
-                    request->continuation.completion_publication_queued = true;
-                }
+            // The export itself runs on the publication worker: the lane's device state is
+            // final and stays untouched until the worker has copied it out (every path that
+            // reuses or releases the lane waits on `wait_lane_export`), so the execution thread
+            // only fences the lane and queues the job. The other lanes keep decoding and this
+            // request completes without waiting for gigabytes to cross PCIe.
+            Publication job;
+            job.export_lane = lane;
+            if (publish_boundary) {
+                job.boundary_alias = frontier_boundary->alias;
+                job.boundary_depth = frontier_boundary->depth;
             }
             if (publish_session) {
                 lane_sessions_[lane] =
                     LaneSession{.name                = *request->options.routing_hint,
                                 .expected_head       = request->routed_continuation.id,
                                 .expected_generation = request->routed_continuation.generation};
-                image.parent_id                   = lane_sessions_[lane]->expected_head;
-                lane_sessions_[lane]->publication = queue_publication(
-                    std::move(image), lane_sessions_[lane]->name,
-                    lane_sessions_[lane]->expected_head, lane_sessions_[lane]->expected_generation);
-                request->continuation.completion_publication_queued =
-                    request->continuation.completion_publication_queued ||
-                    static_cast<bool>(lane_sessions_[lane]->publication);
+                job.session             = lane_sessions_[lane]->name;
+                job.expected_head       = lane_sessions_[lane]->expected_head;
+                job.expected_generation = lane_sessions_[lane]->expected_generation;
+            }
+            instance_.program->fence_lane_for_export(lane);
+            PublicationTicket ticket = enqueue_publication(std::move(job));
+            if (ticket) {
+                if (publish_session) { lane_sessions_[lane]->publication = ticket; }
+                if (publish_boundary) {
+                    request->deepest_published_depth =
+                        std::max(request->deepest_published_depth, frontier_boundary->depth);
+                }
+                request->continuation.completion_publication_queued = true;
+            } else if (publish_session) {
+                lane_sessions_[lane].reset();
             }
         } catch (...) {
             // A continuation is an optimization; generation has already completed successfully.
+            lane_sessions_[lane].reset();
         }
-        const double export_seconds =
-            std::chrono::duration<double>(Clock::now() - export_started).count();
-        request->publish_seconds += export_seconds;
-        cumulative_stats_.worker_publish_seconds += export_seconds;
+        const double publish_seconds =
+            std::chrono::duration<double>(Clock::now() - publish_started).count();
+        request->publish_seconds += publish_seconds;
+        cumulative_stats_.worker_publish_seconds += publish_seconds;
+    }
+
+    // Blocks until no background export reads the lane. Every path that mutates or releases a
+    // retained lane's device state goes through here first.
+    void wait_lane_export(std::uint32_t lane) noexcept {
+        if (lane >= kMaximumConcurrency) { return; }
+        try {
+            std::unique_lock lock(publication_mutex_);
+            publication_cv_.wait(lock, [&] {
+                return !lane_export_pending_[lane] || publication_stopping_;
+            });
+        } catch (...) {}
+    }
+
+    [[nodiscard]] bool lane_export_in_flight(std::uint32_t lane) noexcept {
+        if (lane >= kMaximumConcurrency) { return false; }
+        std::lock_guard lock(publication_mutex_);
+        return lane_export_pending_[lane];
     }
 
     // Every involuntary loss of a retained session funnels through here: L1 retention pressure,
@@ -1807,6 +1944,7 @@ private:
     // can never write a new session over a previous session's file. Explicit erase is a deletion
     // request and does not come through here.
     void evict_retained_lane(std::uint32_t lane) noexcept {
+        wait_lane_export(lane);
         spill_retained_lane(lane);
         if (lane < kMaximumConcurrency) { lane_session_path_[lane].clear(); }
         if (!instance_.program->has_retained_lane(lane)) {
@@ -2042,10 +2180,7 @@ private:
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             instance_.program->abort_lane(lane);
             lane_sessions_[lane].reset();
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
+            leave_prefill(lane);
             complete_cancelled(request);
             remove_completed_slot(lane);
             changed = true;
@@ -2212,10 +2347,7 @@ private:
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
-            if (prefill_lane_ && lane == *prefill_lane_) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
+            leave_prefill(lane);
             instance_.program->abort_lane(lane);
             lane_sessions_[lane].reset();
             complete_cancelled(request);
@@ -2224,10 +2356,7 @@ private:
         }
         if (!step.complete) { return; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
-        if (prefill_lane_ && *request->lane == *prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
-        }
+        leave_prefill(*request->lane);
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
@@ -2291,9 +2420,62 @@ private:
                                 closing_watts, started, ended);
     }
 
+    [[nodiscard]] bool lane_is_prefilling(std::uint32_t lane) const noexcept {
+        return std::ranges::find(prefill_lanes_, lane) != prefill_lanes_.end();
+    }
+
+    void enter_prefill(std::uint32_t lane, bool holds_transient) {
+        if (!lane_is_prefilling(lane)) { prefill_lanes_.push_back(lane); }
+        if (holds_transient) { transient_owner_ = lane; }
+    }
+
+    void leave_prefill(std::uint32_t lane) noexcept {
+        std::erase(prefill_lanes_, lane);
+        if (transient_owner_ && *transient_owner_ == lane) {
+            instance_.request_memory.deactivate();
+            transient_owner_.reset();
+        }
+    }
+
+    void clear_prefill_lanes() noexcept {
+        prefill_lanes_.clear();
+        if (transient_owner_) {
+            instance_.request_memory.deactivate();
+            transient_owner_.reset();
+        }
+    }
+
+    [[nodiscard]] static std::uint32_t remaining_prefill_tokens(const Request& request) noexcept {
+        const std::uint32_t consumed = request.prefill_reused.load(std::memory_order_relaxed) +
+                                       request.prefill_processed.load(std::memory_order_relaxed);
+        return request.prefill_total_tokens > consumed ? request.prefill_total_tokens - consumed
+                                                       : 0;
+    }
+
+    // Shortest remaining prompt first, admission order on ties. Chunks are the unit, so this is
+    // preemption at chunk granularity: a lane with a few hundred tokens left finishes within a
+    // couple of units even while another lane still has a hundred thousand to consume, which is
+    // the order that minimises mean time to first token for the set.
+    [[nodiscard]] std::uint32_t select_prefill_lane() const {
+        if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
+        std::uint32_t chosen        = prefill_lanes_.front();
+        std::uint32_t chosen_remain = std::numeric_limits<std::uint32_t>::max();
+        for (const std::uint32_t lane : prefill_lanes_) {
+            const auto& request = slots_[lane];
+            if (request == nullptr || request->decode_ready) {
+                throw std::logic_error("staged prefill lane has invalid request state");
+            }
+            const std::uint32_t remain = remaining_prefill_tokens(*request);
+            if (remain < chosen_remain) {
+                chosen        = lane;
+                chosen_remain = remain;
+            }
+        }
+        return chosen;
+    }
+
     void run_prefill_step() {
-        if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane_;
+        const std::uint32_t lane = select_prefill_lane();
         const auto request       = slots_[lane];
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
@@ -2396,6 +2578,7 @@ private:
         try {
             std::optional<std::uint32_t> target_lane;
             std::uint32_t target_reuse        = std::numeric_limits<std::uint32_t>::max();
+            int target_rank                   = 0;
             std::uint32_t best_resident_reuse = 0;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                 if (slots_[lane] != nullptr) { continue; }
@@ -2403,15 +2586,20 @@ private:
                 const std::uint32_t reuse =
                     request->lane_plans[lane]->summary().reusable_prompt_tokens;
                 best_resident_reuse = std::max(best_resident_reuse, reuse);
-                // Prefer an empty lane, otherwise replace the retained lane least useful to this
-                // request. This is what makes two sessions switch through a single active lane.
-                const bool empty = !instance_.program->has_retained_lane(lane);
-                const bool target_empty =
-                    target_lane && !instance_.program->has_retained_lane(*target_lane);
-                if (!target_lane || (empty && !target_empty) ||
-                    (empty == target_empty && reuse < target_reuse)) {
+                // Prefer an empty lane, then a settled retained lane, then one whose session is
+                // still being exported; within a class replace the retained lane least useful to
+                // this request. This is what makes two sessions switch through a single active
+                // lane.
+                const auto rank = [&](std::uint32_t candidate) -> int {
+                    if (!instance_.program->has_retained_lane(candidate)) { return 0; }
+                    return lane_export_in_flight(candidate) ? 2 : 1;
+                };
+                const int lane_rank = rank(lane);
+                if (!target_lane || lane_rank < target_rank ||
+                    (lane_rank == target_rank && reuse < target_reuse)) {
                     target_lane  = lane;
                     target_reuse = reuse;
+                    target_rank  = lane_rank;
                 }
             }
             if (!target_lane) {
@@ -2811,22 +2999,29 @@ private:
     // Lane choice maximizes reusable prefix; ties break toward the lane whose occupation costs
     // least to replace - an empty lane before any retained session, then the shallowest
     // retained session - so a fresh request never clobbers a deep resident session while a
-    // cheaper lane is available.
+    // cheaper lane is available. A lane whose session is still being exported costs more than
+    // any settled lane: taking it would stall the execution thread on the export.
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
-        std::uint32_t selected_cost  = 0;
-        const auto prefer            = [&](std::uint32_t reuse, std::uint32_t cost) {
+        std::uint64_t selected_cost  = 0;
+        const auto prefer            = [&](std::uint32_t reuse, std::uint64_t cost) {
             return !selected || reuse > selected_reuse ||
                    (reuse == selected_reuse && cost < selected_cost);
+        };
+        const auto replacement_cost = [&](std::uint32_t lane) {
+            const std::uint64_t depth = instance_.program->retained_lane_depth(lane);
+            return lane_export_in_flight(lane)
+                       ? depth + (std::uint64_t{1} << 32)
+                       : depth;
         };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
+            const std::uint64_t cost  = replacement_cost(lane);
             if (instance_.program->can_admit_lane(lane, plan) && prefer(reuse, cost)) {
                 selected       = LaneChoice{.lane = lane};
                 selected_reuse = reuse;
@@ -2840,7 +3035,7 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
+            const std::uint64_t cost  = replacement_cost(lane);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 prefer(reuse, cost)) {
                 selected = LaneChoice{
@@ -2885,6 +3080,12 @@ private:
         if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
+        // The request transient region is a single startup-frozen allocation that a Vision
+        // prefill holds across all of its chunks. A second one waits until the holder finishes;
+        // text prefills need no region and admit freely beside it.
+        if (transient_owner_ && request->lane_plans[lane]->summary().transient_bytes != 0) {
+            return AdmissionProgress::None;
+        }
         // Compared against restore_target_lane: a restore that refused the lane admission then
         // used is a lane-selection divergence, not a genuine capacity shortfall.
         request->continuation.admitted_lane = static_cast<std::int32_t>(lane);
@@ -2918,6 +3119,9 @@ private:
         }
         clear_protection_if_head(request);
 
+        // The lane's device state is rewritten from here on; a background export of the session
+        // it retained must have finished reading it first.
+        wait_lane_export(lane);
         refresh_lane_provenance(lane);
         classify_resident_continuation(
             request->continuation, summary.reusable_prompt_tokens,
@@ -2952,12 +3156,16 @@ private:
             ++cumulative_stats_.admitted_requests;
             invalidate_lane_plans(lane);
 
+            request->prefill_total_tokens = summary.prompt_tokens;
             TransientRegion transient;
             if (needs_prefill) {
-                instance_.request_memory.activate(summary.transient_bytes,
-                                                  summary.transient_alignment);
-                prefill_lane_ = lane;
-                transient     = instance_.request_memory.region();
+                const bool holds_transient = summary.transient_bytes != 0;
+                if (holds_transient) {
+                    instance_.request_memory.activate(summary.transient_bytes,
+                                                      summary.transient_alignment);
+                    transient = instance_.request_memory.region();
+                }
+                enter_prefill(lane, holds_transient);
             }
             publish_runtime_stats();
             target_started                = true;
@@ -2974,7 +3182,7 @@ private:
             // energy split, which for short prompts is the whole of their prefill.
             accumulate_phase_energy(cumulative_stats_.prefill_energy_joules, opening_watts,
                                     closing_watts, unit_started, unit_ended);
-            if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
+            if (!first.complete && !lane_is_prefilling(lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
@@ -2984,10 +3192,7 @@ private:
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
             lane_sessions_[lane].reset();
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
+            leave_prefill(lane);
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
@@ -3353,10 +3558,7 @@ private:
     // per-lane: the requests it served fail, their lanes are aborted, and queued work still runs.
     void fail_round(std::exception_ptr error) noexcept {
         ++cumulative_stats_.decode_rounds_abandoned;
-        if (prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
-        }
+        clear_prefill_lanes();
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
@@ -3377,10 +3579,7 @@ private:
             pending.assign(pending_.begin(), pending_.end());
             pending_.clear();
         }
-        if (prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
-        }
+        clear_prefill_lanes();
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
@@ -3455,7 +3654,7 @@ private:
                 cumulative_stats_.worker_upkeep_seconds +=
                     std::chrono::duration<double>(Clock::now() - upkeep_started).count();
 
-                if (prefill_lane_) {
+                if (!prefill_lanes_.empty()) {
                     // Decode rounds and prefill chunks are not comparable units of work: a chunk
                     // costs several rounds, so alternating them one for one hands the execution
                     // thread almost entirely to whichever lane is still consuming its prompt and
@@ -3476,19 +3675,36 @@ private:
                         decode_seconds_since_prefill_ +=
                             std::chrono::duration<double>(Clock::now() - started).count();
                         previous_unit_was_decode = true;
-                    } else {
-                        const auto started = Clock::now();
-                        timed_prefill_step();
-                        const double step =
-                            std::chrono::duration<double>(Clock::now() - started).count();
-                        // Track the recent cost of a chunk so the balance follows prompt length
-                        // and batch composition rather than a compiled-in constant.
-                        prefill_step_seconds_ = prefill_step_seconds_ == 0.0
-                                                    ? step
-                                                    : 0.75 * prefill_step_seconds_ + 0.25 * step;
-                        decode_seconds_since_prefill_ = 0.0;
-                        previous_unit_was_decode      = false;
+                        continue;
                     }
+                    // A prefill unit. A waiting request that admission can place takes it for its
+                    // first chunk; its lane then competes for chunks shortest-remaining-first, so
+                    // a short continuation suffix is served in a couple of units instead of behind
+                    // the whole of another lane's cold prompt. When nothing can be placed the unit
+                    // goes to the shortest resident prefill as before.
+                    const auto started = Clock::now();
+                    bool ran_unit      = false;
+                    if (have_pending && prefill_lanes_.size() < max_concurrency_) {
+                        const auto admission_started = Clock::now();
+                        const AdmissionProgress progress = try_admit_one();
+                        cumulative_stats_.worker_admission_seconds +=
+                            std::chrono::duration<double>(Clock::now() - admission_started)
+                                .count();
+                        ran_unit = progress == AdmissionProgress::RanGpuUnit;
+                    }
+                    if (!ran_unit) {
+                        if (prefill_lanes_.empty()) { continue; }
+                        timed_prefill_step();
+                    }
+                    const double step =
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    // Track the recent cost of a chunk so the balance follows prompt length
+                    // and batch composition rather than a compiled-in constant.
+                    prefill_step_seconds_ = prefill_step_seconds_ == 0.0
+                                                ? step
+                                                : 0.75 * prefill_step_seconds_ + 0.25 * step;
+                    decode_seconds_since_prefill_ = 0.0;
+                    previous_unit_was_decode      = false;
                     continue;
                 }
                 decode_seconds_since_prefill_ = 0.0;
@@ -3547,7 +3763,13 @@ private:
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
-    std::optional<std::uint32_t> prefill_lane_;
+    // Lanes still consuming their prompt, in admission order. Prefill chunks are issued
+    // shortest-remaining-first across this set and admission stays open while it is non-empty,
+    // so a short suffix never waits behind another lane's long cold prompt.
+    std::vector<std::uint32_t> prefill_lanes_;
+    // The prefilling lane holding the frozen request transient region (Vision encode output).
+    // The region exists once, so at most one such lane prefills at a time.
+    std::optional<std::uint32_t> transient_owner_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::array<std::optional<LaneSession>, kMaximumConcurrency> lane_sessions_{};
     std::array<LaneContinuationProvenance, kMaximumConcurrency> lane_provenance_{};
@@ -3588,6 +3810,9 @@ private:
     std::uint64_t publication_issued_    = 0;
     std::uint64_t publication_completed_ = 0;
     bool publication_stopping_           = false;
+    // Set while a queued or running export job still reads the lane's device state. The
+    // execution thread waits on it (wait_lane_export) before touching a retained lane.
+    std::array<bool, kMaximumConcurrency> lane_export_pending_{};
     std::thread publication_worker_;
 
     // Continuation decoding, run ahead of admission.
@@ -3595,7 +3820,7 @@ private:
     // Decoding a continuation image is pure host work over startup-fixed geometry: it touches no
     // lane state, no device memory and no CUDA API, so §2.6 permits it off the execution thread.
     // Leaving it inline made every restore spend its decode between GPU units, because
-    // try_admit_one() is skipped entirely while a prefill is in flight.
+    // admission was, at the time, skipped entirely while a prefill was in flight.
     //
     // Preparation is speculative and therefore strictly bounded: only the first
     // kPreparationDepth queued requests are decoded ahead, at most kPreparedLimit payloads are

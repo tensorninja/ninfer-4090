@@ -252,6 +252,17 @@ cache::ContinuationImage Program<Variant>::export_continuation_lane(std::uint32_
 }
 
 template <>
+void Program<Variant>::fence_lane_for_export(std::uint32_t lane) {
+    impl_->fence_lane_for_export(lane);
+}
+
+template <>
+cache::ContinuationImage
+Program<Variant>::export_continuation_lane_background(std::uint32_t lane) const {
+    return impl_->export_continuation_lane_background(lane);
+}
+
+template <>
 std::vector<PromptBoundaryAlias>
 Program<Variant>::boundary_aliases(const PreparedPrompt& prompt) const {
     return impl_->boundary_aliases(PreparedPromptAccess::view(prompt));
@@ -323,6 +334,11 @@ Program<Variant>::retained_lane_kv_footprint(std::uint32_t lane) const noexcept 
 template <>
 std::uint32_t Program<Variant>::retained_lane_depth(std::uint32_t lane) const noexcept {
     return impl_->retained_lane_depth(lane);
+}
+
+template <>
+std::uint32_t Program<Variant>::retained_lane_boundary_tokens(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_boundary_tokens(lane);
 }
 
 template <>

@@ -374,7 +374,8 @@ deployed workload rather than treating these values as fixed costs.
   candidate exists under the aliases it has; `not_attempted` means a candidate existed and no
   restore step ever evaluated it, which is a scheduling observation rather than a cache one;
 - cumulative microseconds and operation counts for L2/L3 lookup and restore, preflight,
-  `l2_admission`, and `l3_persistence`.
+  `export` (the device-to-host copy of a completed lane into its image, run by the publication
+  worker off the execution thread), `l2_admission`, and `l3_persistence`.
 
 Lookup hits count alias/catalog lookup before exact target preflight. Aggregate restore successes,
 tokens, and bytes equal the sum of their L1, L2, and L3 series. Every exported `_total` is a

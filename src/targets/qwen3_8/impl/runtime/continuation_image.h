@@ -4,6 +4,7 @@
 #include "artifact/sha256.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "core/pinned_transfer.h"
 #include "runtime/cache/continuation_cache.h"
 #include "targets/qwen3_8/impl/runtime/prefix_identity.h"
 #include <ninfer/targets/qwen3_8/runtime.h>
@@ -583,21 +584,78 @@ inline void paged_segment_names(std::string_view base, std::size_t plane_count,
     return out;
 }
 
+inline void write_linear_header(Writer& out, const LinearAttentionStatePoolSpec& spec) {
+    write_header(out, "linear-state");
+    out.u32(spec.layers);
+    out.i32(spec.conv_channels);
+    out.i32(spec.conv_width);
+    out.i32(spec.value_heads);
+    out.i32(spec.value_head_dim);
+    out.i32(spec.key_head_dim);
+    out.u8(static_cast<std::uint8_t>(spec.conv_dtype));
+}
+
 inline cache::Bytes encode_linear(const LinearAttentionStateImage& image) {
     Writer out;
-    write_header(out, "linear-state");
-    out.u32(image.layers);
-    out.i32(image.conv_channels);
-    out.i32(image.conv_width);
-    out.i32(image.value_heads);
-    out.i32(image.value_head_dim);
-    out.i32(image.key_head_dim);
-    out.u8(static_cast<std::uint8_t>(image.conv_dtype));
+    write_linear_header(out, LinearAttentionStatePoolSpec{
+                                 .layers         = image.layers,
+                                 .conv_channels  = image.conv_channels,
+                                 .conv_width     = image.conv_width,
+                                 .value_heads    = image.value_heads,
+                                 .value_head_dim = image.value_head_dim,
+                                 .key_head_dim   = image.key_head_dim,
+                                 .conv_dtype     = image.conv_dtype,
+                             });
     out.u64(image.conv.size());
     for (const auto& payload : image.conv) { out.blob(payload); }
     out.u64(image.recurrent.size());
     for (const auto& payload : image.recurrent) { out.blob(payload); }
     return std::move(out).finish();
+}
+
+// The "linear-state" segment of one pool slot, byte-identical to
+// encode_linear(export_linear_attention_state(pool, slot, ...)). The wire layout is laid out
+// first and every layer's device copy lands directly at its blob offset, so the segment costs
+// one host allocation and one device-to-host pass instead of a per-layer image that is then
+// serialized again.
+inline cache::Bytes export_linear_segment(const LinearAttentionStatePool& pool, std::int32_t slot,
+                                          PinnedTransferBuffer& transfer, cudaStream_t stream) {
+    const std::uint32_t layers = pool.layer_count();
+    Writer header;
+    write_linear_header(header, pool.spec);
+    cache::Bytes out               = std::move(header).finish();
+    const std::size_t header_bytes = out.size();
+    std::size_t total              = header_bytes + 2 * sizeof(std::uint64_t);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        total += sizeof(std::uint64_t) + pool.conv_slot(layer, slot).bytes();
+        total += sizeof(std::uint64_t) + pool.recurrent_slot(layer, slot).bytes();
+    }
+    out.resize(total);
+    std::size_t cursor = header_bytes;
+    const auto put_u64 = [&](std::uint64_t value) {
+        for (unsigned shift = 0; shift != 64; shift += 8) {
+            out[cursor++] = static_cast<std::uint8_t>(value >> shift);
+        }
+    };
+    std::vector<DeviceToHostTransfer> copies;
+    copies.reserve(2 * static_cast<std::size_t>(layers));
+    const auto emit_slots = [&](auto&& slot_tensor) {
+        put_u64(layers);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const Tensor source = slot_tensor(layer);
+            if (!source.is_contiguous()) {
+                throw std::logic_error("linear attention state slot is not contiguous");
+            }
+            put_u64(source.bytes());
+            copies.push_back({&out, cursor, source.data, source.bytes()});
+            cursor += source.bytes();
+        }
+    };
+    emit_slots([&](std::uint32_t layer) { return pool.conv_slot(layer, slot); });
+    emit_slots([&](std::uint32_t layer) { return pool.recurrent_slot(layer, slot); });
+    if (cursor != out.size()) { throw std::logic_error("linear-state segment layout mismatch"); }
+    transfer.copy_device_to_host(copies, stream);
+    return out;
 }
 
 inline LinearAttentionStateImage decode_linear(std::span<const std::uint8_t> bytes,

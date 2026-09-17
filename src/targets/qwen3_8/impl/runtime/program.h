@@ -351,6 +351,12 @@ public:
         std::uint32_t lane, const RequestPlanImpl& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
+    void fence_lane_for_export(std::uint32_t lane);
+    [[nodiscard]] cache::ContinuationImage
+    export_continuation_lane_background(std::uint32_t lane) const;
+    [[nodiscard]] cache::ContinuationImage export_lane_image(std::uint32_t lane,
+                                                            PinnedTransferBuffer& transfer,
+                                                            cudaStream_t stream) const;
     [[nodiscard]] std::vector<PromptBoundaryAlias>
     boundary_aliases(const PreparedPromptData& prompt) const;
     [[nodiscard]] std::vector<CapturedContinuation>
@@ -378,6 +384,7 @@ public:
     [[nodiscard]] runtime::KvPageFootprint
     retained_lane_kv_footprint(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t retained_lane_boundary_tokens(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
     [[nodiscard]] std::vector<SlotCheckpoint>
     retained_lane_checkpoints(std::uint32_t lane) const;
@@ -448,6 +455,12 @@ public:
     PinnedHostBuffer round_host;
     // One bounded startup allocation for all continuation payload movement (8 MiB per ring slot).
     mutable PinnedTransferBuffer continuation_transfer;
+    // Background continuation export: its own stream and pinned ring so the publication worker
+    // can copy a completed lane out while the engine stream keeps decoding the other lanes, plus
+    // one fence event per lane ordering the export after the lane's last engine-stream work.
+    cudaStream_t export_stream = nullptr;
+    mutable PinnedTransferBuffer export_transfer;
+    std::array<cudaEvent_t, kMaximumConcurrency> export_fence_events{};
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_8::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;

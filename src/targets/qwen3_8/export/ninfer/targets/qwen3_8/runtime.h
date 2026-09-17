@@ -234,6 +234,14 @@ public:
         std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] cache::ContinuationImage export_continuation_lane(std::uint32_t lane) const;
+    // Background export of a retained lane. `fence_lane_for_export` runs on the execution thread
+    // once the lane's state is final and orders the export after the lane's last engine-stream
+    // work; `export_continuation_lane_background` then runs on another thread over its own
+    // stream and pinned ring while the engine stream keeps executing other lanes. The caller
+    // must keep the lane retained and untouched until the background export returns.
+    void fence_lane_for_export(std::uint32_t lane);
+    [[nodiscard]] cache::ContinuationImage
+    export_continuation_lane_background(std::uint32_t lane) const;
     // The prompt's content-addressed boundaries, ascending by depth, each with its alias. Empty
     // for a prompt that is not reusable.
     [[nodiscard]] std::vector<PromptBoundaryAlias>
@@ -282,6 +290,9 @@ public:
     [[nodiscard]] runtime::KvPageFootprint
     retained_lane_kv_footprint(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    // Frontier of the retained lane's turn checkpoint, the depth an export reports as
+    // `boundary_tokens`; zero without a retained session or a valid checkpoint.
+    [[nodiscard]] std::uint32_t retained_lane_boundary_tokens(std::uint32_t lane) const noexcept;
     // Stable identifier (FNV-1a 64 hex) of the lane's resident token ledger; empty unless the
     // lane holds a retained session.
     [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;

@@ -297,6 +297,8 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(continuation_l3_restore_operations);
     NINFER_DELTA(continuation_l2_admission_microseconds);
     NINFER_DELTA(continuation_l2_admission_operations);
+    NINFER_DELTA(continuation_export_microseconds);
+    NINFER_DELTA(continuation_export_operations);
     NINFER_DELTA(continuation_l3_persistence_microseconds);
     NINFER_DELTA(continuation_l3_persistence_operations);
     NINFER_DELTA(continuation_publication_successes);
@@ -382,6 +384,7 @@ bool report_has_activity_impl(const ThroughputReport& report) noexcept {
             delta.continuation_l2_restore_operations != 0 ||
             delta.continuation_l3_restore_operations != 0 ||
             delta.continuation_l2_admission_operations != 0 ||
+            delta.continuation_export_operations != 0 ||
             delta.continuation_l3_persistence_operations != 0 ||
             delta.continuation_publication_successes != 0 ||
             delta.continuation_publication_failures != 0 ||
