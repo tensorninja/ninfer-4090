@@ -13,8 +13,7 @@ namespace ninfer::ops::detail {
 
 enum class Q5LinearAddScheduleId {
     GemvResidual,
-    Split2ExactResidual,
-    MmaResidualR64C16,
+    SmallTMmaResidual,
     MmaResidualR64C24,
     MmaResidualR64C64,
     MmaResidualR64C128,

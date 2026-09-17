@@ -1,12 +1,22 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ops/common/small_t_rowsplit_mma.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// Split-K of the small-T tensor-core route: 5120 rows give 80 64-row tiles, so K is split
+// until the grid fills the machine at two CTAs per SM.
+constexpr SmallTMmaSplitK q5_linear_add_small_t_split_k(std::int32_t k) noexcept {
+    return small_t_mma_split_k(k, 3);
+}
+
+void q5_linear_add_small_t_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      const SmallTMmaWorkspace& scratch, cudaStream_t stream);
 
 // Caller-owned staging for the INT8 prefill route: the group-64 quantized
 // activation codes and their FP32 group scales. Both live in the Op workspace
@@ -39,10 +49,6 @@ void q5_linear_add_int8_residual_launch(const Tensor& x, const Weight& w, Tensor
 
 void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                         cudaStream_t stream);
-void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                       cudaStream_t stream);
-void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream);
 void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream);
 void q5_linear_add_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

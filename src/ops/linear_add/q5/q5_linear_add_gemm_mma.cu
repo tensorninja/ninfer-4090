@@ -12,9 +12,6 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using MmaR64C16Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 16, 64, 16, 8, 2, 3, Q5FragmentPipeline::Serial, Cache::cg,
-                              Cache::cg, Q5ScaleLoad::Pair32>;
 using MmaR64C24Schedule =
     Q5RowSplitMmaGemmSchedule<64, 24, 64, 16, 8, 2, 2, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
@@ -62,11 +59,6 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaSt
 }
 
 } // namespace
-
-void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    launch_route<MmaR64C16Schedule>(x, w, residual_out, stream);
-}
 
 void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {

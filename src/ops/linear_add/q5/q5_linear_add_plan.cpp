@@ -38,19 +38,20 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 6> kK6144Routes{{
+// The small-T tensor-core route owns the whole decode token domain above T = 1:
+// 64-row CTAs with split-K, weight codes contracted as exact integers on the
+// tensor cores, so it stays near the weight-streaming floor through T = 32.
+constexpr std::array<RouteSpec, 5> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{2, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408Routes{{
+constexpr std::array<RouteSpec, 5> kK17408Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{2, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
@@ -67,19 +68,17 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
 // FP64 oracle on dense activations. It is therefore reachable only through
 // AllowA8, exactly as NVFP4's W4A4 routes are reachable only through AllowA4.
 // See docs/maintainer/op-development.md section 2.1.
-constexpr std::array<RouteSpec, 6> kK6144A8Routes{{
+constexpr std::array<RouteSpec, 5> kK6144A8Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{2, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::Int8ResidualR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408A8Routes{{
+constexpr std::array<RouteSpec, 5> kK17408A8Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{2, 32}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::Int8ResidualR64C128},
@@ -130,6 +129,20 @@ std::size_t int8_workspace_bytes(std::int32_t k, std::int32_t cols) {
     return layout.peak_bytes(1);
 }
 
+template <class Allocator>
+SmallTMmaWorkspace allocate_small_t_workspace(Allocator& allocator, std::int32_t rows,
+                                              std::int32_t k, std::int32_t cols) {
+    return allocate_small_t_mma_workspace(allocator, small_t_mma_tile_cols(cols),
+                                          rows / SmallTMmaShape::kRows,
+                                          q5_linear_add_small_t_split_k(k).splits);
+}
+
+std::size_t small_t_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_small_t_workspace(layout, rows, k, cols);
+    return layout.peak_bytes(1);
+}
+
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     for (const SupportSpec& support : kSupports) {
         if (problem.rows == support.rows && problem.k == support.k &&
@@ -146,10 +159,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     switch (schedule) {
     case Q5LinearAddScheduleId::GemvResidual:
         return "linear_add.q5.gemv.residual";
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C16:
-        return "linear_add.q5.mma.r64.c16.cta_collective_residual";
+    case Q5LinearAddScheduleId::SmallTMmaResidual:
+        return "linear_add.q5.small_t.mma.r64.splitk.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
         return "linear_add.q5.mma.r64.c24.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C64:
@@ -177,6 +188,10 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem, Li
             if (route.schedule == Q5LinearAddScheduleId::Int8ResidualR64C128) {
                 return {route.schedule, int8_workspace_bytes(problem.k, problem.cols)};
             }
+            if (route.schedule == Q5LinearAddScheduleId::SmallTMmaResidual) {
+                return {route.schedule,
+                        small_t_workspace_bytes(problem.rows, problem.k, problem.cols)};
+            }
             return {route.schedule, 0};
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
@@ -191,10 +206,22 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
     }
     (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols}, policy);
 
-    // The INT8 staging grows with the token count up to the tile cap, so the
-    // interval's high-water mark is at max_cols; every other route is
-    // workspace-free.
-    return q5_linear_add_resolve_plan({rows, k, padded_k, max_cols}, policy).workspace_bytes;
+    // The INT8 staging grows with the token count up to the tile cap and the
+    // small-T split-K partials with the column tile, so each route's high-water
+    // mark is at the top of its interval. Routes are visited in ascending column
+    // order, so the last column of every route that intersects the interval is
+    // one of the probes below.
+    std::size_t bytes = 0;
+    visit_routes(k, policy, [&](const auto& routes) {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
+            const std::int32_t probe = route.cols.last < max_cols ? route.cols.last : max_cols;
+            const std::size_t route_bytes =
+                q5_linear_add_resolve_plan({rows, k, padded_k, probe}, policy).workspace_bytes;
+            bytes = route_bytes > bytes ? route_bytes : bytes;
+        }
+    });
+    return bytes;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
@@ -217,12 +244,13 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::GemvResidual:
         q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SmallTMmaResidual: {
+        auto scratch_scope                = ws.scope();
+        const SmallTMmaWorkspace scratch = allocate_small_t_workspace(ws, problem.rows,
+                                                                      problem.k, problem.cols);
+        q5_linear_add_small_t_mma_launch(x, w, residual_out, scratch, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C16:
-        q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
-        return;
+    }
     case Q5LinearAddScheduleId::MmaResidualR64C24:
         q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
         return;

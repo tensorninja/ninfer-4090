@@ -32,18 +32,50 @@ __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
 }
 
-template <int Bytes, Cache Policy = Cache::ca>
+// L2 spatial-prefetch hint of cp.async: the copy also pulls the enclosing 64/128/256-byte
+// block into L2, so a stream of short per-row runs reaches DRAM as full-block requests.
+enum class L2Prefetch { None, B64, B128, B256 };
+
+template <int Bytes, Cache Policy = Cache::ca, L2Prefetch Prefetch = L2Prefetch::None>
 __device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
     static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp_async supports 4, 8, or 16 bytes");
     if constexpr (Policy == Cache::cg) {
         static_assert(Bytes == 16, "cp.async.cg requires a 16-byte copy");
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                     :
-                     : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+        if constexpr (Prefetch == L2Prefetch::B256) {
+            asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+        } else if constexpr (Prefetch == L2Prefetch::B128) {
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+        } else if constexpr (Prefetch == L2Prefetch::B64) {
+            asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], 16;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+        } else {
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+        }
     } else {
-        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n"
-                     :
-                     : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
+        if constexpr (Prefetch == L2Prefetch::B256) {
+            asm volatile("cp.async.ca.shared.global.L2::256B [%0], [%1], %2;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
+        } else if constexpr (Prefetch == L2Prefetch::B128) {
+            asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
+        } else if constexpr (Prefetch == L2Prefetch::B64) {
+            asm volatile("cp.async.ca.shared.global.L2::64B [%0], [%1], %2;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
+        } else {
+            asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n"
+                         :
+                         : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
+        }
     }
 }
 
