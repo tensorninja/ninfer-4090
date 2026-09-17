@@ -17,8 +17,8 @@
 namespace ninfer::ops::detail {
 
 inline constexpr std::int32_t kLoraTileTokensHost = 8;
-inline constexpr std::int32_t kLoraMaximumSplits  = 16;
-inline constexpr std::int32_t kLoraTargetBlocks   = 256;
+inline constexpr std::int32_t kLoraMaximumSplits  = 64;
+inline constexpr std::int32_t kLoraTargetBlocks   = 512;
 
 [[nodiscard]] inline std::int32_t lora_token_tiles(std::int32_t tokens) {
     return (tokens + kLoraTileTokensHost - 1) / kLoraTileTokensHost;

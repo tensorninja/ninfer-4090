@@ -577,6 +577,126 @@ a restore regression. A cost model for the transfer alone is not a substitute: o
 37 KB pinned copies already reach 8.87 GB/s against 13.16 GB/s for 8 MB copies, so device transfer
 was never the dominant term in a restore, and host-side decoding was.
 
+### Admission during prefill
+
+Before the prefilling set, the executor admitted a pending request only at the prefill-unit
+boundaries of the single lane it was prefilling and never started a second prefill while one was
+in flight. On the live log of 1,713 requests (prompt p50 44k / p90 131k tokens, three lanes), 76%
+of all request queue time passed while a lane was free, and a 131k-token prompt arriving behind
+another waited 44–89 s before its own prefill began. The executor now keeps a set of prefilling
+lanes, issues each chunk to the lane with the fewest remaining prompt tokens, and admits one
+pending request per prefill unit whenever a lane is free
+(`docs/maintainer/concurrent-inference-architecture.md` §7.3). Two drivers under `tools/bench/`
+measure it from the request log:
+
+| Driver | Workload | Result |
+|---|---|---|
+| `run_admission_latency.py` | 131k-token prompt, then an 8k-token prompt 5 s later | short: queue 0.07 s, TTFT 2.4 s (2.3 s own prefill); long: 159k prompt tokens prefilled in 69.5 s with the short request's prefill and 256-token decode interleaved |
+| `run_session_swarm.py` | 8 `prompt_cache_key` sessions over 3 lanes, 6 turns, 24k-token opening turn, `--continuation-cache l1-l2` | queue time with a free lane 2.6% (none during a prefill); 13.8 req/min; L2-hit turns TTFT mean 23.6 s = queue 22.0 + prepare 0.40 + restore 0.15 + prefill 0.97 |
+
+The swarm is the closed loop described above, so its TTFT is still queueing; what the change
+removes is the head-of-line wait behind a long prefill. At this point the 1.39 s mean publish of
+each turn's checkpoint still ran synchronously on the execution thread after the last token; the
+next section moves it off.
+
+### Prompt preparation
+
+`timings_seconds.prepare` on the live log was 1.07 s p50 and 4.2 s p90, about 20 µs per prompt
+token, while the tokenizer alone encodes 750k tok/s. The cost was boundary resolution: every
+template boundary (one assistant opener per turn, the client breakpoints, and the turn-rewrite and
+user-turn frontiers) was validated by re-tokenizing the rendered prefix up to its byte cut and
+comparing it with the complete encoding, so a chat with `M` assistant turns tokenized its prompt
+about `M/2` times over. `Tokenizer::encode_segmented` now keeps the added-token segmentation of
+the one complete encoding: added tokens split the text into independently encoded segments, so
+the encoding of any byte prefix shares every segment before the cut and only the partial segment
+holding the cut is re-encoded. The boundary contract is unchanged and
+`ninfer_qwen3_8_tokenizer_real_test` checks the result against the re-tokenizing reference on a
+222k-token, 26-boundary chat (4.6 s reference, 0.30 s now, 0.29 s for the plain encode).
+
+Measured on the live server with `max_tokens=1` requests:
+
+| Messages | Prompt tokens | `prepare` before | `prepare` after |
+|---:|---:|---:|---:|
+| 20 | 40,171 | 0.55 s | 0.09 s |
+| 20 | 131,872 | 1.69 s | 0.22 s |
+| 60 | 42,108 | 1.32 s | 0.09 s |
+| 60 | 136,790 | 3.96 s | 0.20 s |
+
+### Continuation export off the execution thread
+
+A completed `prompt_cache_key` turn publishes the lane's continuation image, and the export that
+produces it - about 700 MB of KV pages, GDN state and hidden vectors for a 40k-token session -
+ran on the execution thread between GPU units: `publish` was 0.95 s p50 / 2 s p90 on the live
+log and 1.39 s mean in the swarm, and every other lane made no progress for its duration. The
+completion path now only records a fence event on the engine stream and hands the lane to the
+publication worker, which exports it over the Program's own stream and pinned ring while the
+engine stream keeps decoding, then publishes the image as before. The lane stays retained and is
+not rewritten until the export returns; lane choice ranks such a lane behind every settled lane
+so only the same session's next turn ever waits on it
+(`docs/maintainer/concurrent-inference-architecture.md` §2.6).
+
+`run_session_swarm.py`, same configuration as the row above (8 sessions, 3 lanes, 6 turns,
+24k-token opening turn, `--continuation-cache l1-l2`), before and after; the after run also
+carries the prompt-preparation change:
+
+| | before | after |
+|---|---:|---:|
+| throughput | 13.8 req/min | 17.3 req/min |
+| wall time, 48 requests | 238.6 s | 192.5 s |
+| `publish` mean on the request | 1.39 s | 11 µs |
+| export on the worker, 50 exports | - | 0.37 s mean (18.5 s total) |
+| L2-hit turn TTFT mean | 23.6 s = queue 22.0 + prepare 0.40 + restore 0.15 + prefill 0.97 | 18.2 s = queue 17.0 + prepare 0.08 + restore 0.11 + prefill 0.98 |
+| per-request decode rate p50 | 51.7 tok/s | 51.1 tok/s |
+
+The 48 synchronous exports had held the execution thread for about 65 s of the 239 s run; the
+queue absorbed most of that, as the closed-loop model predicts, and TTFT fell with throughput.
+The per-request decode rate did not move because it is set by the three-lane batch, not by the
+stalls, which landed between requests. Export cost is now visible as
+`continuation_export_microseconds`/`operations` rather than as a phase of the request.
+
+### Batched decode: the small-T linear routes
+
+With MTP K=3 every decode round verifies four positions per lane, so the projections run at
+T = 4·B: 4, 8 and 12 for one to three lanes. Aggregate decode measured through the request log
+(`tools/bench/run_decode_scaling.py`, 8k-token prompts, `--continuation-cache off
+--no-prefix-reuse`) is 98 → 151 → 172 tok/s for B = 1, 2, 3, with the round growing from 24.0 ms
+to 31.5 ms to 43.9 ms; a weight-streaming-bound round would stay near 24 ms. The Op benchmarks
+(`bench/ops`, cold L2, medians) locate the growth in the T=2..16 SIMT routes:
+
+| Op (route at T≤16) | T=1 | T=4 | T=8 | T=12 | T=16 |
+|---|---:|---:|---:|---:|---:|
+| Q4 gate/up + SwiGLU 34816×5120 (`SmallTExact`) | 144 µs | 147 (1.02×) | 155 (1.07×) | 179 (1.24×) | 198 (1.37×) |
+| Q5 down + residual 5120×17408 (`simt.split2.exact`) | 94 | 102 (1.09×) | 132 (1.40×) | 194 (2.05×) | 250 (2.65×) |
+| Q5 out + residual 5120×6144 (`simt.split2.exact`) | 40 | 42 (1.05×) | 55 (1.38×) | 72 (1.80×) | 96 (2.4×, mma) |
+| attention input projection Q4/Q5 (`ParentSplitFixed`) | 40 | 46 (1.15×) | 82 (2.05×) | 125 (3.1×) | 152 (3.8×) |
+| GDN input projection Q4/Q5 | 42 | 49 (1.17×) | 104 (2.5×) | 176 (4.2×) | 202 (4.8×) |
+
+Summed over 48 GDN and 16 attention layers the projections account for 21.7 ms of the B=1 round
+and 38.9 ms of the 43.9 ms B=3 round against a 20.5 ms weight-streaming floor; the routes above
+T=8 are bound by SIMT instruction issue (activation loads and dequantization per FMA, 11–14
+TFLOP/s), not by DRAM. The draft head already has a tensor-core small-T route
+(`q4_small_t_mma_kernel`, 131072×5120): 1.03× its T=1 time at T=8, and 1.21×/1.44× at T=12/16
+when its catalog is extended past T=8, where its cost is L2 traffic for the activations each
+16-row CTA re-reads. The next step for aggregate decode is therefore a tensor-core small-T route
+for the four decoder projections above - wider row tiles with split-K for the 5120-row weights
+so the activation tile is amortized, dequant-to-fragment for Q4 and Q5, T padded to 16 - under
+`A16Only`, qualified against the FP64 oracle with the A16 criterion and registered over the
+whole T interval so B=1 (T=4, already at the floor) and prefix reuse are unaffected. Reaching
+1.2× the floor at T=12 would take the B=3 round from 43.9 ms to about 30 ms, or roughly
+250 tok/s aggregate.
+
+Two related settings were measured on the same protocol and left as they are. MTP K=4 loses to
+K=3 at every batch (B=1/2/3: 88/130/163 tok/s against 98/151/172): the extra verify position adds
+more to the round (26.5 vs 24.0 ms at B=1) than its acceptance gain returns (2.43 vs 2.36 tokens
+per round). And a rank-16 LoRA adapter over seven sites (`cyberstrike-1.5-6500`) costs 1.8 ms
+per round - 7.5% at B=1, 4% at B=3 - which `nsys` attributes to 144 `lora_down`/`lora_up` pairs
+per forward rather than to bandwidth (the adapter is 84 MB). The down kernel ran on at most 16
+split-K blocks and took 8.5 µs median; raising the split cap to 64 blocks
+(`src/ops/launcher/lora_delta.h`) brings the pair from 15.2 µs to 11.1 µs, about 0.6 ms per
+round. The remaining cost is the two launches' latency chains, which a fused single-plane
+reduction could roughly halve again; that is the next LoRA step if adapter decode matters more
+than the batched-decode route above.
+
 ### Energy measurement
 
 Energy per token is reported alongside throughput. A watt-second is a joule, so tokens per
