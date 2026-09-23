@@ -61,7 +61,7 @@ Two engine endpoints, added for this dashboard:
   LoRA bank, per-slot state, the registered adapter inventory, and cache occupancy paired with the
   configured capacities. Polled at 1 Hz. Because it is complete,
   the client resynchronizes by simply fetching it again.
-- `GET /events` — Server-Sent Events carrying the same schema-19 records that
+- `GET /events` — Server-Sent Events carrying the same schema-20 records that
   `--request-log-jsonl` writes, byte for byte. A late subscriber receives the retained
   `server_start` plus a bounded backlog, so a browser opened mid-run still knows the engine
   configuration.

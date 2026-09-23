@@ -99,11 +99,29 @@ struct ToolDefinition {
     bool strict = false;
 };
 
+// A generated call is Incomplete when the output ended before the model closed it. Its arguments
+// are then exactly the prefix that was streamed, with no closing added, so they are not a JSON
+// object and cannot be replayed as history.
+enum class ToolCallState : std::uint8_t {
+    Complete,
+    Incomplete,
+};
+
 struct ToolCall {
     std::string id;
     std::string name;
     std::string arguments_json;
+    ToolCallState state = ToolCallState::Complete;
 };
+
+// Whether generated calls hand the turn to the client: at least one call, and every one closed.
+// Only then do the protocols report a tool-call finish instead of the engine's finish reason.
+[[nodiscard]] inline bool tool_calls_completed(const std::vector<ToolCall>& calls) noexcept {
+    for (const ToolCall& call : calls) {
+        if (call.state != ToolCallState::Complete) { return false; }
+    }
+    return !calls.empty();
+}
 
 enum class ToolChoiceMode {
     Auto,

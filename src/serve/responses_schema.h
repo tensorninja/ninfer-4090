@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -82,6 +83,14 @@ struct ResponsesStreamFinish {
 
 // Stateful semantic-event encoder for one Responses SSE stream. It assigns
 // stable Item IDs and monotonically increasing sequence_number values.
+//
+// Items are emitted live and contiguously: reasoning, then an optional message,
+// then function calls. The first call closes the reasoning and message Items,
+// since the parser publishes no content after a call. A call is added with
+// empty arguments, streams argument deltas, and is done as soon as the model
+// closes it; finish() closes a call the output cut short as incomplete with
+// exactly the arguments it streamed. finish() requires the terminal outcome to
+// equal what was streamed and stages only the remaining closing events.
 class ResponsesEventStream {
 public:
     ResponsesEventStream(std::string response_id, std::int64_t created_at, ResponsesRequest request,
@@ -97,6 +106,9 @@ public:
     std::vector<std::string> prompt_progress(const ninfer::PromptProgress& progress);
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
+    std::vector<std::string> tool_call_begin(std::size_t index, const ToolCall& call);
+    std::vector<std::string> tool_call_arguments(std::size_t index, const std::string& delta);
+    std::vector<std::string> tool_call_end(std::size_t index, const ToolCall& call);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltResponse& response);
     std::string failed(const ApiError& error);

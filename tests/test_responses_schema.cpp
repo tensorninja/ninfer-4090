@@ -569,6 +569,32 @@ int test_response_object() {
                           tool_response.at("output").back().at("call_id") == "call_weather" &&
                           !tool_response.at("output").back().at("id").get<std::string>().empty(),
                       "function call has distinct Item id and call_id");
+
+    // Items carry their own status: the message ended when the model began calling, a closed
+    // call completed, and the call the output cut short is incomplete. Only a closed call with
+    // object arguments can be replayed as continuation history.
+    GenerationOutcome cut = sample_outcome();
+    cut.text              = "Checking.";
+    cut.finish_reason     = ninfer::FinishReason::OutputLimit;
+    cut.tool_calls        = {ToolCall{"call_a", "weather", R"({"city":"Paris"})"},
+                             ToolCall{"call_b", "weather", R"(["Paris"])"},
+                             ToolCall{"call_c", "weather", R"({"city": "Ber)",
+                                      ToolCallState::Incomplete}};
+    const BuiltResponse cut_built = make_response_object("resp_cut", 123, request, runtime, cut);
+    const Json& cut_output        = cut_built.body.at("output");
+    failures += check(cut_built.body.at("status") == "incomplete" && cut_output.size() == 5 &&
+                          cut_output[1].at("type") == "message" &&
+                          cut_output[1].at("status") == "completed" &&
+                          cut_output[2].at("status") == "completed" &&
+                          cut_output[3].at("status") == "completed" &&
+                          cut_output[4].at("status") == "incomplete" &&
+                          cut_output[4].at("arguments") == R"({"city": "Ber)",
+                      "message and call Items carry their own completion status");
+    failures += check(cut_built.output_history.size() == 1 &&
+                          cut_built.output_history[0].tool_calls.size() == 1 &&
+                          cut_built.output_history[0].tool_calls[0].id == "call_a" &&
+                          cut_built.output_history[0].content[0].text == "Checking.",
+                      "history replays only closed calls with object arguments");
     return failures;
 }
 
@@ -674,6 +700,8 @@ int test_sse_sequence() {
     wire.insert(wire.end(), more.begin(), more.end());
     more = encoder.content_delta("ans");
     wire.insert(wire.end(), more.begin(), more.end());
+    more = encoder.content_delta("wer");
+    wire.insert(wire.end(), more.begin(), more.end());
     GenerationOutcome outcome    = sample_outcome();
     ResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
@@ -717,34 +745,105 @@ int test_sse_function_call() {
                                                             {"max_output_tokens", 32},
                                                             {"stream", true}},
                                                        limits());
+    // Reasoning, a message, a call the model closed, and a call the output cut short, each
+    // published as the parser decided it.
     ResponsesEventStream encoder("resp_tool_stream", 123, request, {});
     std::vector<std::string> wire = encoder.start();
+    auto append = [&wire](const std::vector<std::string>& events) {
+        wire.insert(wire.end(), events.begin(), events.end());
+    };
+    const ToolCall weather{"call_weather", "weather", R"({"city": "Paris"})"};
+    const ToolCall clock{"call_time", "time", R"({"zone": "Eur)", ToolCallState::Incomplete};
+    append(encoder.reasoning_delta("look it up"));
+    append(encoder.content_delta("Checking."));
+    append(encoder.tool_call_begin(0, ToolCall{weather.id, weather.name, ""}));
+    append(encoder.tool_call_arguments(0, R"({"city": ")"));
+    append(encoder.tool_call_arguments(0, R"(Paris"})"));
+    append(encoder.tool_call_end(0, weather));
+    append(encoder.tool_call_begin(1, ToolCall{clock.id, clock.name, ""}));
+    append(encoder.tool_call_arguments(1, clock.arguments_json));
     GenerationOutcome outcome;
+    outcome.text              = "Checking.";
+    outcome.reasoning         = "look it up";
     outcome.prompt_tokens     = 8;
-    outcome.completion_tokens = 4;
-    outcome.finish_reason     = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
+    outcome.completion_tokens = 40;
+    outcome.finish_reason     = ninfer::FinishReason::OutputLimit;
+    outcome.tool_calls        = {weather, clock};
     ResponsesStreamFinish finish = encoder.finish(outcome);
-    wire.insert(wire.end(), finish.events_before_terminal.begin(),
-                finish.events_before_terminal.end());
+    append(finish.events_before_terminal);
     wire.push_back(encoder.terminal(finish.response));
 
-    int failures = 0;
-    std::string arguments;
-    std::string item_id;
+    int failures                    = 0;
+    std::uint64_t expected_sequence = 0;
+    int next_index                  = 0;
+    int open_index                  = -1;
+    bool items_contiguous           = true;
+    std::vector<Json> added;
+    std::vector<Json> done;
+    std::vector<std::string> arguments(2);
+    std::vector<std::string> arguments_done(2);
     for (const std::string& event : wire) {
         const Json payload = parse_event(event);
-        if (payload.at("type") == "response.function_call_arguments.delta") {
-            arguments += payload.at("delta").get<std::string>();
-            item_id = payload.at("item_id").get<std::string>();
+        failures += check(payload.at("sequence_number") == expected_sequence++,
+                          "sequence_number is contiguous across function call events");
+        const std::string type = payload.at("type").get<std::string>();
+        // Output Items are contiguous: each is added, streamed and done before the next opens.
+        if (payload.contains("output_index")) {
+            const int index = payload.at("output_index").get<int>();
+            if (type == "response.output_item.added") {
+                items_contiguous = items_contiguous && open_index == -1 && index == next_index;
+                open_index       = next_index++;
+                added.push_back(payload.at("item"));
+            } else {
+                items_contiguous = items_contiguous && index == open_index;
+            }
+            if (type == "response.output_item.done") {
+                open_index = -1;
+                done.push_back(payload.at("item"));
+            }
+        }
+        if (type == "response.function_call_arguments.delta") {
+            arguments.at(static_cast<std::size_t>(payload.at("output_index").get<int>() - 2)) +=
+                payload.at("delta").get<std::string>();
+        }
+        if (type == "response.function_call_arguments.done") {
+            arguments_done.at(static_cast<std::size_t>(payload.at("output_index").get<int>() - 2)) =
+                payload.at("arguments").get<std::string>();
         }
     }
-    failures +=
-        check(arguments == R"({"city":"Paris"})", "function argument deltas reconstruct arguments");
-    const Json& item = finish.response.body.at("output").at(0);
-    failures += check(item.at("type") == "function_call" && item.at("id") == item_id &&
-                          item.at("call_id") == "call_weather" && item_id != "call_weather",
-                      "function stream preserves distinct stable Item id and call_id");
+    failures += check(items_contiguous && open_index == -1 && added.size() == 4 &&
+                          done.size() == 4,
+                      "reasoning, message and calls stream as contiguous Items");
+    failures += check(added[2] == Json({{"id", added[2].at("id")},
+                                        {"type", "function_call"},
+                                        {"status", "in_progress"},
+                                        {"call_id", "call_weather"},
+                                        {"name", "weather"},
+                                        {"arguments", ""}}) &&
+                          added[2].at("id") != "call_weather",
+                      "function_call Item is announced with its name and empty arguments");
+    failures += check(done[1].at("type") == "message" && done[1].at("status") == "completed" &&
+                          done[1].at("content")[0].at("text") == "Checking.",
+                      "message Item completes when the first call begins");
+    failures += check(arguments[0] == R"({"city": "Paris"})" &&
+                          arguments_done[0] == arguments[0] &&
+                          done[2].at("status") == "completed" &&
+                          done[2].at("arguments") == arguments[0],
+                      "closed call streams argument deltas and completes");
+    failures += check(arguments[1] == R"({"zone": "Eur)" && arguments_done[1] == arguments[1] &&
+                          done[3].at("status") == "incomplete",
+                      "cut-short call keeps exactly its streamed arguments and is incomplete");
+
+    const Json terminal = parse_event(wire.back());
+    const Json& output  = terminal.at("response").at("output");
+    failures += check(terminal.at("type") == "response.incomplete" && output.size() == 4 &&
+                          output[2].at("id") == added[2].at("id") &&
+                          output[3].at("id") == added[3].at("id") &&
+                          output[3].at("status") == "incomplete",
+                      "terminal response repeats the streamed Items and their ids");
+    failures += check(finish.response.output_history[0].tool_calls.size() == 1 &&
+                          finish.response.output_history[0].tool_calls[0].id == "call_weather",
+                      "cut-short call is not replayed as continuation history");
     return failures;
 }
 

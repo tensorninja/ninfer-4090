@@ -727,8 +727,8 @@ int test_tool_response_serialization() {
     const CompletionUsage usage{12, 6};
     const std::vector<ToolCall> calls = {
         ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
-    const Json j = Json::parse(
-        make_chat_completion_tool_response("id-tool", "m", 222, "", "need weather", calls, usage));
+    const Json j = Json::parse(make_chat_completion_tool_response(
+        "id-tool", "m", 222, "", "need weather", calls, "tool_calls", usage));
 
     failures += check(j.at("object") == "chat.completion", "tool response object");
     const Json& choice = j.at("choices").at(0);
@@ -746,10 +746,25 @@ int test_tool_response_serialization() {
     failures += check(j.at("usage").at("total_tokens") == 18, "tool usage total");
 
     const Json with_content = Json::parse(make_chat_completion_tool_response(
-        "id-tool-2", "m", 223, "Calling weather.", "", calls, usage));
+        "id-tool-2", "m", 223, "Calling weather.", "", calls, "tool_calls", usage));
     failures +=
         check(with_content.at("choices").at(0).at("message").at("content") == "Calling weather.",
               "tool content prefix carried");
+
+    // A call the output cut short keeps exactly its streamed prefix and the engine's finish.
+    const std::vector<ToolCall> cut = {
+        ToolCall{"call_cut", "get_weather", R"({"city": "Par)", ToolCallState::Incomplete}};
+    const Json truncated = Json::parse(
+        make_chat_completion_tool_response("id-tool-3", "m", 224, "", "", cut, "length", usage));
+    failures += check(truncated.at("choices").at(0).at("finish_reason") == "length" &&
+                          truncated.at("choices")
+                                  .at(0)
+                                  .at("message")
+                                  .at("tool_calls")
+                                  .at(0)
+                                  .at("function")
+                                  .at("arguments") == R"({"city": "Par)",
+                      "incomplete call keeps its prefix and the length finish");
     return failures;
 }
 
@@ -805,21 +820,37 @@ int test_chunk_serialization() {
 }
 
 int test_tool_chunk_serialization() {
-    int failures                      = 0;
-    const std::vector<ToolCall> calls = {
-        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
-    const Json chunk = parse_sse(make_chat_chunk_tool_calls("id", "m", 1, calls, true));
-    failures += check(chunk.at("object") == "chat.completion.chunk", "tool chunk object");
-    const Json& delta = chunk.at("choices").at(0).at("delta");
-    const Json& call  = delta.at("tool_calls").at(0);
-    failures += check(call.at("index") == 0, "tool chunk index");
-    failures += check(call.at("id") == "call_abc", "tool chunk id");
-    failures += check(call.at("type") == "function", "tool chunk type");
-    failures += check(call.at("function").at("name") == "get_weather", "tool chunk name");
+    int failures        = 0;
+    const ToolCall call = {"call_abc", "get_weather", ""};
+
+    // OpenAI's grammar: the first chunk for a call index carries id, type and name with empty
+    // arguments, so a client can show the call before any argument exists.
+    const Json begin = parse_sse(make_chat_chunk_tool_call_begin("id", "m", 1, 1, call, true));
+    failures += check(begin.at("object") == "chat.completion.chunk", "tool chunk object");
+    failures += check(begin.at("choices").at(0).at("finish_reason").is_null(),
+                      "tool begin chunk has no finish reason");
+    const Json& opened = begin.at("choices").at(0).at("delta").at("tool_calls").at(0);
+    failures += check(opened.at("index") == 1 && opened.at("id") == "call_abc" &&
+                          opened.at("type") == "function" &&
+                          opened.at("function").at("name") == "get_weather" &&
+                          opened.at("function").at("arguments") == "",
+                      "tool begin chunk carries index, id, type, name and empty arguments");
     failures +=
-        check(call.at("function").at("arguments") == R"({"city":"Paris"})", "tool chunk arguments");
-    failures +=
-        check(chunk.contains("usage") && chunk.at("usage").is_null(), "tool chunk usage null");
+        check(begin.contains("usage") && begin.at("usage").is_null(), "tool chunk usage null");
+
+    // Later chunks carry only the index and an argument fragment; the fragments concatenate.
+    std::string arguments;
+    for (const char* fragment : {R"({"city": ")", "Par", R"(is"})"}) {
+        const Json chunk =
+            parse_sse(make_chat_chunk_tool_call_arguments("id", "m", 1, 1, fragment, false));
+        const Json& delta = chunk.at("choices").at(0).at("delta").at("tool_calls").at(0);
+        failures += check(delta.at("index") == 1 && !delta.contains("id") &&
+                              !delta.contains("type") && !delta.at("function").contains("name"),
+                          "tool argument chunk carries only index and arguments");
+        failures += check(!chunk.contains("usage"), "no usage key when include_usage=false");
+        arguments += delta.at("function").at("arguments").get<std::string>();
+    }
+    failures += check(arguments == R"({"city": "Paris"})", "tool argument fragments concatenate");
 
     const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "tool_calls", true));
     failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "tool_calls",

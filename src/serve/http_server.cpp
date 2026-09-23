@@ -87,7 +87,7 @@ nlohmann::json gpu_json(const GpuTelemetry& gpu, const ServerEnergyTotals& energ
             {"throttle_reasons", gpu.throttle_reasons}};
 }
 
-// One SSE frame carrying a complete schema-19 record. The record's own `event` field names the
+// One SSE frame carrying a complete schema-20 record. The record's own `event` field names the
 // frame so a browser can attach one listener per record type.
 std::string event_frame(std::string_view event, std::string_view payload) {
     std::string frame;
@@ -142,6 +142,11 @@ void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
+}
+
+void write_stream_items(httplib::DataSink& sink, StreamingRequest& request,
+                        const std::vector<std::string>& items) {
+    for (const std::string& item : items) { write_stream_item(sink, request, item); }
 }
 
 void set_owned_content(httplib::Response& response, std::string body,
@@ -397,11 +402,11 @@ bool report_has_activity_impl(const ThroughputReport& report) noexcept {
             delta.kv_growth_curtailed != 0;
 }
 
-std::string_view unstreamed_content(const GenerationOutcome& outcome) {
-    if (outcome.streamed_content_bytes > outcome.text.size()) {
-        throw std::logic_error("streamed content exceeds terminal content");
-    }
-    return std::string_view(outcome.text).substr(outcome.streamed_content_bytes);
+// A turn hands control to the client only when every call it announced completed; a call the
+// output cut short reports the engine's reason ("length"), as OpenAI does.
+const char* chat_finish_reason(const GenerationOutcome& outcome) {
+    return tool_calls_completed(outcome.tool_calls) ? "tool_calls"
+                                                    : finish_reason_wire(outcome.finish_reason);
 }
 
 } // namespace
@@ -677,7 +682,7 @@ void HttpServer::register_routes() {
     server_.Get("/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
         handle_telemetry(req, res);
     });
-    // The schema-19 record stream, identical to what --request-log-jsonl appends, as named SSE
+    // The schema-20 record stream, identical to what --request-log-jsonl appends, as named SSE
     // events. A new reader is replayed the retained server_start record and the recent ring
     // before live delivery begins.
     server_.Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1165,7 +1170,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls,
+                    chat_finish_reason(outcome), usage);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
@@ -1181,7 +1187,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
     const bool include_usage = stream->prepared.include_usage;
-    const bool tool_capable  = stream->prepared.tool_capable;
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -1190,7 +1195,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable,
+        [this, stream, id, created, model, include_usage,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -1211,6 +1216,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
+                output.on_tool_call_begin = [&](std::size_t index, const ToolCall& call) {
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_tool_call_begin(id, model, created, index,
+                                                                      call, include_usage));
+                };
+                output.on_tool_call_arguments = [&](std::size_t index, const std::string& delta) {
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_tool_call_arguments(
+                                          id, model, created, index, delta, include_usage));
+                };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
@@ -1219,33 +1234,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 const CompletionUsage usage = usage_with_timings(outcome);
-                const std::string_view remaining = unstreamed_content(outcome);
-                if (!outcome.tool_calls.empty()) {
-                    if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_tool_calls(
-                                          id, model, created, outcome.tool_calls, include_usage));
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_final(id, model, created, "tool_calls",
-                                                            include_usage, usage));
-                } else {
-                    if (tool_capable && !remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
-                    }
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_final(id, model, created,
-                                              finish_reason_wire(outcome.finish_reason),
-                                              include_usage, usage));
-                }
+                write_stream_item(sink, *stream,
+                                  make_chat_chunk_final(id, model, created,
+                                                        chat_finish_reason(outcome), include_usage,
+                                                        usage));
                 if (include_usage) {
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
@@ -1352,8 +1344,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage = usage_with_timings(outcome);
-            const char* stop_reason =
-                messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+            const char* stop_reason     = messages_stop_reason(
+                outcome.finish_reason, tool_calls_completed(outcome.tool_calls));
             set_owned_content(res,
                               make_messages_response(id, model, outcome.text, outcome.reasoning,
                                                      outcome.tool_calls, stop_reason, usage),
@@ -1368,15 +1360,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    auto stream             = std::make_shared<StreamingRequest>(std::move(prepared));
-    const bool tool_capable = stream->prepared.tool_capable;
+    auto stream = std::make_shared<StreamingRequest>(std::move(prepared));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, model, input_tokens, tool_capable,
+        [this, stream, id, model, input_tokens,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -1384,37 +1375,25 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             }
             stream->started = true;
 
-            int next_index     = 0;
-            bool thinking_open = false;
-            int thinking_index = -1;
-            bool text_open     = false;
-            int text_index     = -1;
+            MessagesEventStream encoder(id, model, input_tokens);
             try {
-                write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
+                write_stream_items(sink, *stream, encoder.start());
 
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    if (!thinking_open) {
-                        thinking_index = next_index++;
-                        thinking_open  = true;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_thinking(thinking_index));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_thinking(thinking_index, text));
+                    write_stream_items(sink, *stream, encoder.reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    if (thinking_open) {
-                        write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
-                        thinking_open = false;
-                    }
-                    if (!text_open) {
-                        text_index = next_index++;
-                        text_open  = true;
-                        write_stream_item(sink, *stream, make_content_block_start_text(text_index));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_text(text_index, text));
+                    write_stream_items(sink, *stream, encoder.content_delta(text));
+                };
+                output.on_tool_call_begin = [&](std::size_t index, const ToolCall& call) {
+                    write_stream_items(sink, *stream, encoder.tool_call_begin(index, call));
+                };
+                output.on_tool_call_arguments = [&](std::size_t index, const std::string& delta) {
+                    write_stream_items(sink, *stream, encoder.tool_call_arguments(index, delta));
+                };
+                output.on_tool_call_end = [&](std::size_t index, const ToolCall&) {
+                    write_stream_items(sink, *stream, encoder.tool_call_end(index));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -1423,48 +1402,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                const std::string_view remaining = unstreamed_content(outcome);
-
-                if (thinking_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
-                    thinking_open = false;
-                }
-                if (text_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(text_index));
-                    text_open = false;
-                }
-
-                if (tool_capable) {
-                    if (!remaining.empty()) {
-                        const int idx = next_index++;
-                        write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_text(idx, std::string(remaining)));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
-                    }
-                    for (const ToolCall& call : outcome.tool_calls) {
-                        const int idx = next_index++;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_tool_use(idx, call));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_tool_json(idx, call.arguments_json));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
-                    }
-                }
-
-                if (next_index == 0) {
-                    const int idx = next_index++;
-                    write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                    write_stream_item(sink, *stream, make_content_block_stop(idx));
-                }
-
-                const char* stop_reason =
-                    messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-                write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, usage_with_timings(outcome)));
-                write_stream_item(sink, *stream, make_message_stop());
+                write_stream_items(sink, *stream,
+                                   encoder.finish(outcome.finish_reason,
+                                                  usage_with_timings(outcome)));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {

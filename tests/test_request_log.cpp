@@ -372,6 +372,32 @@ int main() {
                 std::string::npos,
         "human generation logs omit the client-visible request id");
 
+    // Only a turn whose calls all closed hands control to the client; a call the output cut short
+    // keeps the engine's finish and is counted, as are completed calls with non-object arguments.
+    GenerationOutcome tool_outcome = outcome;
+    tool_outcome.tool_calls        = {ToolCall{"call_a", "read", R"({"path":"a"})"},
+                                      ToolCall{"call_b", "read", R"(["a"])"},
+                                      ToolCall{"call_c", "read", R"({"path":"b)",
+                                               ToolCallState::Incomplete}};
+    tool_outcome.tool_call_discarded_bytes = 7;
+    const Json tool_done =
+        Json::parse(format_request_done_json("serve-test", 3000, context, tool_outcome));
+    failures += check(tool_done.at("result").at("finish_reason") == "output_limit" &&
+                          tool_done.at("result").at("tool_call_count") == 3 &&
+                          tool_done.at("result").at("tool_calls_incomplete") == 1 &&
+                          tool_done.at("result").at("tool_calls_invalid_arguments") == 1 &&
+                          tool_done.at("result").at("tool_call_discarded_bytes") == 7,
+                      "request_done must count incomplete, invalid, and dropped tool output");
+    const std::string tool_human = format_request_done(context, tool_outcome);
+    failures += check(tool_human.find("finish=output_limit tool_calls=3 tool_calls_incomplete=1 "
+                                      "tool_calls_invalid_arguments=1 "
+                                      "tool_call_discarded_bytes=7") != std::string::npos,
+                      "human request log must not report an incomplete call turn as tool_calls");
+    tool_outcome.tool_calls.pop_back();
+    failures += check(format_request_done(context, tool_outcome).find("finish=tool_calls ") !=
+                          std::string::npos,
+                      "human request log must report a completed call turn as tool_calls");
+
     ThroughputReport throughput;
     throughput.interval_seconds                            = 2.0;
     throughput.computed_prefill_tokens                     = 100;

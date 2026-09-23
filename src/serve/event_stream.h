@@ -2,7 +2,7 @@
 
 // The structured record funnel: one schema instance, two transports.
 //
-// `request_log.cpp` owns the record format (schema 19). This class owns the live instance of it -
+// `request_log.cpp` owns the record format (schema 20). This class owns the live instance of it -
 // the per-process `server_instance_id`, the timestamp, and the fan-out - so a record is formatted
 // exactly once and delivered to both the optional `--request-log-jsonl` file and every connected
 // GET /events subscriber. Adding the stream therefore does not duplicate the schema, and a

@@ -1,6 +1,6 @@
 // Transport to a running ninfer-serve, plus the equivalent offline path for a JSONL file.
 //
-// Two channels with different jobs. GET /events carries the schema-19 record stream, which is
+// Two channels with different jobs. GET /events carries the schema-20 record stream, which is
 // append-only history: throughput samples and completed requests. GET /telemetry is polled for
 // instantaneous state - board sensors, scheduler occupancy, VRAM, cache fill - because those are
 // levels rather than events and a snapshot cannot be reconstructed by replaying deltas.

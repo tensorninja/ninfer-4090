@@ -7,6 +7,7 @@
 #include "ninfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
+#include "serve/tool_call_parser.h"
 
 #include <chrono>
 #include <cstddef>
@@ -50,12 +51,14 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
+    // Calls parsed from a tool-capable request's output, each Complete or cut short Incomplete.
     std::vector<ToolCall> tool_calls;
-    int prompt_tokens                  = 0;
-    int completion_tokens              = 0;
-    int reasoning_tokens               = 0;
-    std::size_t streamed_content_bytes = 0;
-    ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
+    // Non-whitespace output the parser dropped after the first call (see ToolCallStreamResult).
+    std::size_t tool_call_discarded_bytes = 0;
+    int prompt_tokens                     = 0;
+    int completion_tokens                 = 0;
+    int reasoning_tokens                  = 0;
+    ninfer::FinishReason finish_reason    = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
     // Lane that served the request and the retained session's digest (empty when the lane did
     // not retain it) - the handle a client needs for /slots save operations.
@@ -63,9 +66,16 @@ struct GenerationOutcome {
     std::string session_digest;
 };
 
+// Streaming callbacks, invoked on the request's consumer thread in output order. For a
+// tool-capable request, content is the text outside tool calls, and each call arrives as begin
+// (id and name), argument deltas that concatenate to its arguments_json, and end only once the
+// model closed it; the terminal outcome carries the same content and calls.
 struct StreamSink {
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(std::size_t index, const ToolCall& call)> on_tool_call_begin;
+    std::function<void(std::size_t index, const std::string& delta)> on_tool_call_arguments;
+    std::function<void(std::size_t index, const ToolCall& call)> on_tool_call_end;
     std::function<void(const ninfer::PromptProgress& progress)> on_prompt_progress;
     std::function<bool()> is_cancelled;
 };
@@ -81,6 +91,7 @@ struct PreparedRequest {
     bool include_usage                     = false;
     bool tool_capable                      = false;
     std::size_t tool_name_max_length       = 64;
+    ToolParameterKinds tool_parameters;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;

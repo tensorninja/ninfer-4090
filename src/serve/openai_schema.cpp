@@ -652,17 +652,25 @@ void add_timings(Json& payload, const CompletionUsage& usage) {
     payload["timings"] = std::move(timings);
 }
 
-Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index) {
+Json tool_calls_json(const std::vector<ToolCall>& tool_calls) {
     Json out = Json::array();
-    for (std::size_t i = 0; i < tool_calls.size(); ++i) {
-        const ToolCall& call = tool_calls[i];
-        Json item            = {{"id", call.id},
-                                {"type", "function"},
-                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
-        if (include_index) { item["index"] = static_cast<int>(i); }
-        out.push_back(std::move(item));
+    for (const ToolCall& call : tool_calls) {
+        out.push_back(Json{{"id", call.id},
+                           {"type", "function"},
+                           {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}});
     }
     return out;
+}
+
+Json chat_tool_call_chunk(const std::string& id, const std::string& model, std::int64_t created,
+                          Json tool_call, bool include_usage) {
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array(
+        {Json{{"index", 0},
+              {"delta", Json{{"tool_calls", Json::array({std::move(tool_call)})}}},
+              {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
+    return payload;
 }
 
 std::string sse_event(const Json& payload) { return "data: " + payload.dump() + "\n\n"; }
@@ -796,10 +804,11 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
+                                               const char* finish_reason,
                                                const CompletionUsage& usage) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
-                    {"tool_calls", tool_calls_json(tool_calls, false)}};
+                    {"tool_calls", tool_calls_json(tool_calls)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
     Json payload = {
         {"id", id},
@@ -808,7 +817,7 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"model", model},
         {"choices",
          Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
+             {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
@@ -848,17 +857,24 @@ std::string make_chat_chunk_content(const std::string& id, const std::string& mo
     return sse_event(payload);
 }
 
-std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
-                                       std::int64_t created,
-                                       const std::vector<ToolCall>& tool_calls,
-                                       bool include_usage) {
-    Json payload = base_chunk(id, model, created);
-    payload["choices"] =
-        Json::array({Json{{"index", 0},
-                          {"delta", Json{{"tool_calls", tool_calls_json(tool_calls, true)}}},
-                          {"finish_reason", nullptr}}});
-    if (include_usage) { payload["usage"] = nullptr; }
-    return sse_event(payload);
+std::string make_chat_chunk_tool_call_begin(const std::string& id, const std::string& model,
+                                            std::int64_t created, std::size_t index,
+                                            const ToolCall& call, bool include_usage) {
+    return sse_event(chat_tool_call_chunk(
+        id, model, created,
+        Json{{"index", index},
+             {"id", call.id},
+             {"type", "function"},
+             {"function", Json{{"name", call.name}, {"arguments", ""}}}},
+        include_usage));
+}
+
+std::string make_chat_chunk_tool_call_arguments(const std::string& id, const std::string& model,
+                                                std::int64_t created, std::size_t index,
+                                                const std::string& delta, bool include_usage) {
+    return sse_event(chat_tool_call_chunk(
+        id, model, created, Json{{"index", index}, {"function", Json{{"arguments", delta}}}},
+        include_usage));
 }
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,

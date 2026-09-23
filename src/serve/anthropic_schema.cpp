@@ -8,8 +8,10 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -574,8 +576,8 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     return out;
 }
 
-const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls) {
-    if (has_tool_calls) { return "tool_use"; }
+const char* messages_stop_reason(ninfer::FinishReason reason, bool tool_calls_completed) {
+    if (tool_calls_completed) { return "tool_use"; }
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
@@ -631,6 +633,8 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                           {"usage", messages_usage(usage)}};
     return payload.dump();
 }
+
+namespace {
 
 std::string make_message_start(const std::string& id, const std::string& model, int input_tokens) {
     const Json message = {{"id", id},
@@ -703,6 +707,111 @@ std::string make_message_delta(const char* stop_reason, const CompletionUsage& u
 }
 
 std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }
+
+} // namespace
+
+MessagesEventStream::MessagesEventStream(std::string id, std::string model, int input_tokens)
+    : id_(std::move(id)), model_(std::move(model)), input_tokens_(input_tokens) {}
+
+std::vector<std::string> MessagesEventStream::start() {
+    if (started_) { throw std::logic_error("Messages event stream already started"); }
+    started_ = true;
+    return {make_message_start(id_, model_, input_tokens_)};
+}
+
+std::vector<std::string> MessagesEventStream::reasoning_delta(const std::string& text) {
+    require_streaming();
+    if (text.empty()) { return {}; }
+    std::vector<std::string> events;
+    open_block(Block::Thinking, events);
+    events.push_back(make_content_block_delta_thinking(open_index_, text));
+    return events;
+}
+
+std::vector<std::string> MessagesEventStream::content_delta(const std::string& text) {
+    require_streaming();
+    // The parser publishes no content after a call, so text never follows a tool_use block.
+    if (calls_begun_ != 0) { throw std::logic_error("invalid content delta event state"); }
+    if (text.empty()) { return {}; }
+    std::vector<std::string> events;
+    open_block(Block::Text, events);
+    events.push_back(make_content_block_delta_text(open_index_, text));
+    return events;
+}
+
+std::vector<std::string> MessagesEventStream::tool_call_begin(std::size_t index,
+                                                              const ToolCall& call) {
+    require_streaming();
+    if (index != calls_begun_ || open_ == Block::ToolUse) {
+        throw std::logic_error("invalid tool_use event state");
+    }
+    std::vector<std::string> events;
+    stop_open_block(events);
+    open_       = Block::ToolUse;
+    open_index_ = next_index_++;
+    ++calls_begun_;
+    events.push_back(make_content_block_start_tool_use(open_index_, call));
+    return events;
+}
+
+std::vector<std::string> MessagesEventStream::tool_call_arguments(std::size_t index,
+                                                                  const std::string& delta) {
+    require_open_call(index);
+    if (delta.empty()) { return {}; }
+    return {make_content_block_delta_tool_json(open_index_, delta)};
+}
+
+std::vector<std::string> MessagesEventStream::tool_call_end(std::size_t index) {
+    require_open_call(index);
+    ++calls_complete_;
+    std::vector<std::string> events;
+    stop_open_block(events);
+    return events;
+}
+
+std::vector<std::string> MessagesEventStream::finish(ninfer::FinishReason reason,
+                                                     const CompletionUsage& usage) {
+    require_streaming();
+    finished_ = true;
+    std::vector<std::string> events;
+    // A tool_use block the output cut short stops with exactly the input it streamed.
+    stop_open_block(events);
+    if (next_index_ == 0) {
+        events.push_back(make_content_block_start_text(next_index_));
+        events.push_back(make_content_block_stop(next_index_));
+        ++next_index_;
+    }
+    const bool completed = calls_begun_ != 0 && calls_complete_ == calls_begun_;
+    events.push_back(make_message_delta(messages_stop_reason(reason, completed), usage));
+    events.push_back(make_message_stop());
+    return events;
+}
+
+void MessagesEventStream::require_streaming() const {
+    if (!started_ || finished_) { throw std::logic_error("invalid Messages stream event state"); }
+}
+
+void MessagesEventStream::require_open_call(std::size_t index) const {
+    require_streaming();
+    if (open_ != Block::ToolUse || index + 1 != calls_begun_) {
+        throw std::logic_error("invalid tool_use event state");
+    }
+}
+
+void MessagesEventStream::open_block(Block block, std::vector<std::string>& events) {
+    if (open_ == block) { return; }
+    stop_open_block(events);
+    open_       = block;
+    open_index_ = next_index_++;
+    events.push_back(block == Block::Thinking ? make_content_block_start_thinking(open_index_)
+                                              : make_content_block_start_text(open_index_));
+}
+
+void MessagesEventStream::stop_open_block(std::vector<std::string>& events) {
+    if (open_ == Block::None) { return; }
+    events.push_back(make_content_block_stop(open_index_));
+    open_ = Block::None;
+}
 
 std::string make_messages_ping() { return sse("ping", Json{{"type", "ping"}}); }
 

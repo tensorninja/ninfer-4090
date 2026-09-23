@@ -32,6 +32,57 @@ function captureAndForward(requests, fetchImpl = globalThis.fetch) {
   };
 }
 
+// Hands the SDK an untouched response while keeping a copy of the raw SSE body, so a test can
+// check the wire grammar the SDK consumed.
+function captureStreams(streams, fetchImpl = globalThis.fetch) {
+  return async (input, init = {}) => {
+    const response = await fetchImpl(input, init);
+    if (!response.body) return response;
+    const [forSdk, forTest] = response.body.tee();
+    streams.push(new Response(forTest).text());
+    return new Response(forSdk, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
+function ssePayloads(text) {
+  return text.split('\n\n')
+    .flatMap(event => event.split('\n').filter(line => line.startsWith('data: ')))
+    .map(line => line.slice('data: '.length))
+    .filter(data => data !== '[DONE]')
+    .map(data => JSON.parse(data));
+}
+
+async function collectToolStream(result) {
+  const parts = [];
+  for await (const part of result.fullStream) {
+    if (part.type.startsWith('tool-') || part.type === 'finish') parts.push(part);
+  }
+  return parts;
+}
+
+// The SDK sees the call announced by name before its input streams, the input arrive in more than
+// one delta, and the call close once, with the turn handed back as a tool-call finish.
+function assertStreamedWeatherCall(parts) {
+  const types = parts.map(part => part.type);
+  const start = types.indexOf('tool-input-start');
+  const end = types.indexOf('tool-input-end');
+  assert.ok(start >= 0 && end > start, `tool input brackets: ${types.join(' ')}`);
+  assert.equal(parts[start].toolName, 'weather');
+  const deltas = parts.slice(start + 1, end).filter(part => part.type === 'tool-input-delta');
+  assert.ok(deltas.length >= 2, `arguments streamed in ${deltas.length} delta(s)`);
+  const input = JSON.parse(deltas.map(part => part.delta).join(''));
+  assert.match(input.city, /paris/i);
+  const call = parts.find(part => part.type === 'tool-call');
+  assert.equal(call.toolName, 'weather');
+  assert.equal(call.toolCallId, parts[start].id);
+  assert.deepEqual(call.input, input);
+  assert.equal(parts.at(-1).finishReason, 'tool-calls');
+}
+
 function provider(baseURL, fetch) {
   return createOpenAI({
     baseURL: apiBaseURL(baseURL),
@@ -491,6 +542,76 @@ test('live Responses supports non-strict serialized tool history', { skip: liveS
   assert.equal(requests[0].body.tools[0].strict ?? false, false);
   assert.equal(requests[0].body.input.find(item => item.type === 'function_call').arguments, '{"city":"Paris"}');
   assert.equal(requests[0].body.input.find(item => item.type === 'function_call_output').output, '{"temperatureC":20}');
+});
+
+const weatherCall = {
+  prompt: 'What is the weather in Paris right now? Call the weather tool.',
+  tools: { weather: tool({ description: 'Get the current weather for a city', inputSchema: weatherSchema }) },
+  maxOutputTokens: 512,
+};
+
+test('live Chat streamText streams a tool call as it is written', { skip: liveSkip }, async () => {
+  const streams = [];
+  const openai = provider(env.baseURL, captureStreams(streams));
+  const parts = await collectToolStream(streamText({
+    ...weatherCall,
+    model: openai.chat(env.model),
+    providerOptions: { openai: { reasoningEffort: 'none' } },
+  }));
+  assertStreamedWeatherCall(parts);
+
+  // OpenAI's chunk grammar: the first entry for a call index names it with empty arguments,
+  // later entries carry only argument fragments, and the closing brace ends the last fragment.
+  const chunks = ssePayloads(await streams[0]);
+  const entries = chunks.flatMap(chunk => chunk.choices?.[0]?.delta?.tool_calls ?? []);
+  assert.ok(entries.length >= 3, `tool call spread over ${entries.length} chunk(s)`);
+  assert.deepEqual(entries[0], {
+    index: 0,
+    id: entries[0].id,
+    type: 'function',
+    function: { name: 'weather', arguments: '' },
+  });
+  assert.match(entries[0].id, /\S/);
+  for (const entry of entries.slice(1)) {
+    assert.deepEqual(Object.keys(entry).sort(), ['function', 'index']);
+    assert.deepEqual(Object.keys(entry.function), ['arguments']);
+  }
+  assert.ok(entries.at(-1).function.arguments.endsWith('}'));
+  assert.equal(chunks.find(chunk => chunk.choices?.[0]?.finish_reason)?.choices[0].finish_reason, 'tool_calls');
+});
+
+test('live Responses streamText streams a function_call Item as it is written', { skip: liveSkip }, async () => {
+  const streams = [];
+  const openai = provider(env.baseURL, captureStreams(streams));
+  const parts = await collectToolStream(streamText({
+    ...weatherCall,
+    model: openai.responses(env.model),
+    providerOptions: { openai: { forceReasoning: true, reasoningEffort: 'none' } },
+  }));
+  assertStreamedWeatherCall(parts);
+
+  // One contiguous function_call Item: added in progress with empty arguments, argument deltas,
+  // then done events carrying the concatenated arguments, under contiguous sequence numbers.
+  const events = ssePayloads(await streams[0]);
+  events.forEach((event, index) => assert.equal(event.sequence_number, index));
+  const added = events.findIndex(event =>
+    event.type === 'response.output_item.added' && event.item.type === 'function_call');
+  assert.ok(added >= 0);
+  const item = events[added].item;
+  const { id: itemId, call_id: callId, ...announced } = item;
+  assert.deepEqual(announced, { type: 'function_call', status: 'in_progress', name: 'weather', arguments: '' });
+  assert.ok(itemId && callId && itemId !== callId);
+  const itemEvents = events.slice(added + 1).filter(event => event.item_id === item.id || event.item?.id === item.id);
+  const deltas = itemEvents.filter(event => event.type === 'response.function_call_arguments.delta');
+  assert.ok(deltas.length >= 2, `arguments streamed in ${deltas.length} delta(s)`);
+  const argumentsText = deltas.map(event => event.delta).join('');
+  assert.deepEqual(itemEvents.slice(deltas.length).map(event => event.type), [
+    'response.function_call_arguments.done',
+    'response.output_item.done',
+  ]);
+  assert.equal(itemEvents.at(-2).arguments, argumentsText);
+  assert.equal(itemEvents.at(-1).item.status, 'completed');
+  assert.equal(events.at(-1).type, 'response.completed');
 });
 
 test('live store:false Responses returns public reasoning with the ignored include hint', { skip: liveSkip }, async () => {

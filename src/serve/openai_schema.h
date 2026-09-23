@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -35,10 +36,13 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage);
+// A response carrying tool calls. `finish_reason` is "tool_calls" only when every call completed;
+// a call the output cut short keeps its partial arguments and the engine's reason ("length").
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
+                                               const char* finish_reason,
                                                const CompletionUsage& usage);
 
 // Streaming SSE event strings ("data: {...}\n\n"). The first chunk carries the
@@ -56,9 +60,15 @@ std::string make_chat_chunk_reasoning(const std::string& id, const std::string& 
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
                                     std::int64_t created, const std::string& delta_text,
                                     bool include_usage);
-std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
-                                       std::int64_t created,
-                                       const std::vector<ToolCall>& tool_calls, bool include_usage);
+// A streamed tool call, in OpenAI's grammar: the first chunk for call `index` carries its id,
+// type and name with empty arguments; later chunks carry only argument fragments. The fragments
+// concatenate to the call's arguments, whose closing `}` arrives only when the call completes.
+std::string make_chat_chunk_tool_call_begin(const std::string& id, const std::string& model,
+                                            std::int64_t created, std::size_t index,
+                                            const ToolCall& call, bool include_usage);
+std::string make_chat_chunk_tool_call_arguments(const std::string& id, const std::string& model,
+                                                std::int64_t created, std::size_t index,
+                                                const std::string& delta, bool include_usage);
 // Final chunk: `delta: {}` with finish_reason. When `usage.has_timings` is set a
 // top-level `timings` block is included (matching llama.cpp's stream convention)
 // so proxies can derive per-request rates from the final chunk alone.

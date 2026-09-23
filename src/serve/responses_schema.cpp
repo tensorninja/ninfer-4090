@@ -1063,10 +1063,11 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
 
     if (!outcome.text.empty() || outcome.tool_calls.empty()) {
         if (ids.message.empty()) { ids.message = new_response_item_id("msg"); }
+        // A message followed by calls ended when the model began calling.
         built.output_items.push_back(
             Json{{"id", ids.message},
                  {"type", "message"},
-                 {"status", item_status},
+                 {"status", outcome.tool_calls.empty() ? item_status : "completed"},
                  {"role", "assistant"},
                  {"content", Json::array({Json{{"type", "output_text"},
                                                {"annotations", Json::array()},
@@ -1079,18 +1080,27 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
             ids.function_calls[index] = new_response_item_id("fc");
         }
         const ToolCall& call = outcome.tool_calls[index];
-        built.output_items.push_back(Json{{"id", ids.function_calls[index]},
-                                          {"type", "function_call"},
-                                          {"status", "completed"},
-                                          {"call_id", call.id},
-                                          {"name", call.name},
-                                          {"arguments", call.arguments_json}});
+        built.output_items.push_back(
+            Json{{"id", ids.function_calls[index]},
+                 {"type", "function_call"},
+                 {"status", call.state == ToolCallState::Complete ? "completed" : "incomplete"},
+                 {"call_id", call.id},
+                 {"name", call.name},
+                 {"arguments", call.arguments_json}});
     }
 
+    // Stored context must render on a previous_response_id continuation, and the template
+    // renders only calls whose arguments are a JSON object. A call cut short or written as
+    // invalid JSON stays visible in the output Items but is not replayed.
     ChatTurn history;
     history.role              = "assistant";
     history.reasoning_content = outcome.reasoning;
-    history.tool_calls        = outcome.tool_calls;
+    for (const ToolCall& call : outcome.tool_calls) {
+        if (call.state == ToolCallState::Complete &&
+            Json::parse(call.arguments_json, nullptr, false).is_object()) {
+            history.tool_calls.push_back(call);
+        }
+    }
     if (!outcome.text.empty()) {
         ContentPart part;
         part.kind     = ContentKind::Text;
@@ -1301,6 +1311,36 @@ public:
                           Json{{"output_index", message_index}, {"item", item}}))};
     }
 
+    struct StreamedCall {
+        std::string item_id;
+        int output_index = -1;
+        std::string call_id;
+        std::string name;
+        std::string arguments;
+        bool done = false;
+    };
+
+    std::vector<std::string> close_function_call(StreamedCall& call, const char* item_status) {
+        call.done       = true;
+        const Json item = {{"id", call.item_id},      {"type", "function_call"},
+                           {"status", item_status},   {"call_id", call.call_id},
+                           {"name", call.name},       {"arguments", call.arguments}};
+        return {sse(event("response.function_call_arguments.done",
+                          Json{{"item_id", call.item_id},
+                               {"output_index", call.output_index},
+                               {"name", call.name},
+                               {"arguments", call.arguments}})),
+                sse(event("response.output_item.done",
+                          Json{{"output_index", call.output_index}, {"item", item}}))};
+    }
+
+    StreamedCall& open_call(std::size_t index) {
+        if (!started || finish_built || index >= calls.size() || calls[index].done) {
+            throw std::logic_error("invalid function call event state");
+        }
+        return calls[index];
+    }
+
     std::string id;
     std::int64_t created_at = 0;
     ResponsesRequest request;
@@ -1318,6 +1358,7 @@ public:
     bool terminal_emitted  = false;
     std::string reasoning_text;
     std::string content_text;
+    std::vector<StreamedCall> calls;
     ItemIds ids;
 };
 
@@ -1372,7 +1413,7 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
 }
 
 std::vector<std::string> ResponsesEventStream::content_delta(const std::string& text) {
-    if (!impl_->started || impl_->finish_built) {
+    if (!impl_->started || impl_->finish_built || !impl_->calls.empty()) {
         throw std::logic_error("invalid content delta event state");
     }
     if (text.empty()) { return {}; }
@@ -1391,9 +1432,61 @@ std::vector<std::string> ResponsesEventStream::content_delta(const std::string& 
     return events;
 }
 
+std::vector<std::string> ResponsesEventStream::tool_call_begin(std::size_t index,
+                                                               const ToolCall& call) {
+    if (!impl_->started || impl_->finish_built || index != impl_->calls.size()) {
+        throw std::logic_error("invalid function call event state");
+    }
+    // Output Items stay contiguous: the parser publishes no content after a call, so the
+    // reasoning and message Items are finished once the first call begins.
+    std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
+    std::vector<std::string> closed = impl_->close_message(impl_->content_text);
+    events.insert(events.end(), std::make_move_iterator(closed.begin()),
+                  std::make_move_iterator(closed.end()));
+
+    Impl::StreamedCall streamed;
+    streamed.item_id      = new_response_item_id("fc");
+    streamed.output_index = impl_->next_output_index++;
+    streamed.call_id      = call.id;
+    streamed.name         = call.name;
+    impl_->ids.function_calls.push_back(streamed.item_id);
+    const Json item = {{"id", streamed.item_id},     {"type", "function_call"},
+                       {"status", "in_progress"},    {"call_id", streamed.call_id},
+                       {"name", streamed.name},      {"arguments", ""}};
+    events.push_back(sse(impl_->event("response.output_item.added",
+                                      Json{{"output_index", streamed.output_index},
+                                           {"item", item}})));
+    impl_->calls.push_back(std::move(streamed));
+    return events;
+}
+
+std::vector<std::string> ResponsesEventStream::tool_call_arguments(std::size_t index,
+                                                                   const std::string& delta) {
+    Impl::StreamedCall& call = impl_->open_call(index);
+    if (delta.empty()) { return {}; }
+    call.arguments += delta;
+    return {sse(impl_->event("response.function_call_arguments.delta",
+                             Json{{"item_id", call.item_id},
+                                  {"output_index", call.output_index},
+                                  {"delta", delta}}))};
+}
+
+std::vector<std::string> ResponsesEventStream::tool_call_end(std::size_t index,
+                                                             const ToolCall& call) {
+    Impl::StreamedCall& streamed = impl_->open_call(index);
+    if (call.arguments_json != streamed.arguments) {
+        throw std::logic_error("function call arguments differ from their deltas");
+    }
+    return impl_->close_function_call(streamed, "completed");
+}
+
 ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outcome) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid Responses stream finish state");
+    }
+    // Content and calls went out live, so the terminal outcome is exactly what streamed.
+    if (outcome.text != impl_->content_text || outcome.tool_calls.size() != impl_->calls.size()) {
+        throw std::logic_error("streamed output does not match terminal output");
     }
     impl_->finish_built = true;
     ResponsesStreamFinish finished;
@@ -1416,55 +1509,13 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
     }
     append(impl_->close_reasoning(outcome.reasoning));
 
-    const bool needs_message = !outcome.text.empty() || outcome.tool_calls.empty();
-    if (needs_message) {
+    if (impl_->calls.empty()) {
         append(impl_->ensure_message());
-        if (outcome.text != impl_->content_text) {
-            if (!outcome.text.starts_with(impl_->content_text)) {
-                throw std::logic_error("streamed content does not match terminal content");
-            }
-            const std::string suffix = outcome.text.substr(impl_->content_text.size());
-            if (!suffix.empty()) {
-                impl_->content_text += suffix;
-                finished.events_before_terminal.push_back(sse(impl_->event(
-                    "response.output_text.delta", Json{{"item_id", impl_->ids.message},
-                                                       {"output_index", impl_->message_index},
-                                                       {"content_index", 0},
-                                                       {"delta", suffix},
-                                                       {"logprobs", Json::array()}})));
-            }
-        }
         append(impl_->close_message(outcome.text, item_status));
     }
-
-    impl_->ids.function_calls.reserve(outcome.tool_calls.size());
-    for (const ToolCall& call : outcome.tool_calls) {
-        const std::string item_id = new_response_item_id("fc");
-        impl_->ids.function_calls.push_back(item_id);
-        const int output_index = impl_->next_output_index++;
-        const Json added_item  = {{"id", item_id},           {"type", "function_call"},
-                                  {"status", "in_progress"}, {"call_id", call.id},
-                                  {"name", call.name},       {"arguments", ""}};
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.added",
-                             Json{{"output_index", output_index}, {"item", added_item}})));
-        if (!call.arguments_json.empty()) {
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
-        }
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.function_call_arguments.done", Json{{"item_id", item_id},
-                                                          {"output_index", output_index},
-                                                          {"name", call.name},
-                                                          {"arguments", call.arguments_json}})));
-        const Json done_item = {{"id", item_id},         {"type", "function_call"},
-                                {"status", "completed"}, {"call_id", call.id},
-                                {"name", call.name},     {"arguments", call.arguments_json}};
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.done",
-                             Json{{"output_index", output_index}, {"item", done_item}})));
+    // A call the output cut short keeps exactly the arguments it streamed.
+    for (Impl::StreamedCall& call : impl_->calls) {
+        if (!call.done) { append(impl_->close_function_call(call, "incomplete")); }
     }
 
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,

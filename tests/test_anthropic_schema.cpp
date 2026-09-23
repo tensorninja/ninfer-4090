@@ -17,6 +17,7 @@
 #include <iostream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -637,81 +638,166 @@ int test_response_serialization() {
     return failures;
 }
 
+struct SseEvent {
+    std::string type;
+    Json data;
+};
+
+void append_events(std::vector<SseEvent>& out, const std::vector<std::string>& wire) {
+    for (const std::string& event : wire) {
+        SseEvent parsed;
+        parsed.data = parse_sse(event, &parsed.type);
+        out.push_back(std::move(parsed));
+    }
+}
+
+std::string event_types(const std::vector<SseEvent>& events) {
+    std::string out;
+    for (const SseEvent& event : events) {
+        out += event.type;
+        if (event.data.contains("index")) { out += '@' + event.data.at("index").dump(); }
+        out += ' ';
+    }
+    return out;
+}
+
+// Every block's index is the next free one, and each opens, streams and stops before the next.
+bool blocks_are_contiguous(const std::vector<SseEvent>& events) {
+    int next = 0;
+    int open = -1;
+    for (const SseEvent& event : events) {
+        if (event.type == "content_block_start") {
+            if (open != -1 || event.data.at("index") != next) { return false; }
+            open = next++;
+        } else if (event.type == "content_block_delta") {
+            if (event.data.at("index") != open) { return false; }
+        } else if (event.type == "content_block_stop") {
+            if (event.data.at("index") != open) { return false; }
+            open = -1;
+        }
+    }
+    return open == -1;
+}
+
 int test_streaming_events() {
     int failures = 0;
-    std::string type;
-
-    const Json start = parse_sse(make_message_start("msg_1", "claude-x", 11), &type);
-    failures += check(type == "message_start", "message_start event type");
-    failures += check(start.at("type") == "message_start", "message_start payload type");
-    failures += check(start.at("message").at("id") == "msg_1", "message_start id");
-    failures += check(start.at("message").at("model") == "claude-x", "message_start model");
-    failures += check(start.at("message").at("usage").at("input_tokens") == 11,
-                      "message_start input_tokens");
-    failures += check(start.at("message").at("content").is_array() &&
-                          start.at("message").at("content").empty(),
-                      "message_start empty content");
-
-    const Json tstart = parse_sse(make_content_block_start_text(1), &type);
-    failures += check(type == "content_block_start" && tstart.at("index") == 1 &&
-                          tstart.at("content_block").at("type") == "text",
-                      "text block start");
-
-    const Json think_start = parse_sse(make_content_block_start_thinking(0), &type);
-    failures +=
-        check(think_start.at("content_block").at("type") == "thinking", "thinking block start");
-
-    const Json tdelta = parse_sse(make_content_block_delta_text(1, "hi"), &type);
-    failures +=
-        check(type == "content_block_delta" && tdelta.at("delta").at("type") == "text_delta" &&
-                  tdelta.at("delta").at("text") == "hi",
-              "text_delta");
-
-    const Json thdelta = parse_sse(make_content_block_delta_thinking(0, "hmm"), &type);
-    failures += check(thdelta.at("delta").at("type") == "thinking_delta" &&
-                          thdelta.at("delta").at("thinking") == "hmm",
-                      "thinking_delta");
-
-    const ToolCall call{"toolu_2", "get_weather", R"({"city":"Paris"})"};
-    const Json tustart = parse_sse(make_content_block_start_tool_use(2, call), &type);
-    failures += check(tustart.at("content_block").at("type") == "tool_use" &&
-                          tustart.at("content_block").at("id") == "toolu_2" &&
-                          tustart.at("content_block").at("name") == "get_weather" &&
-                          tustart.at("content_block").at("input").is_object() &&
-                          tustart.at("content_block").at("input").empty(),
-                      "tool_use block start with empty input");
-
-    const Json ijdelta =
-        parse_sse(make_content_block_delta_tool_json(2, R"({"city":"Paris"})"), &type);
-    failures += check(ijdelta.at("delta").at("type") == "input_json_delta" &&
-                          ijdelta.at("delta").at("partial_json") == R"({"city":"Paris"})",
-                      "input_json_delta");
-
-    const Json stop = parse_sse(make_content_block_stop(2), &type);
-    failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
-
-    failures += check(start.at("message").at("usage").at("cache_read_input_tokens") == 0 &&
-                          start.at("message").at("usage").at("cache_creation_input_tokens") == 0,
-                      "message_start reports no cache activity before admission");
 
     CompletionUsage final_usage;
     final_usage.prompt_tokens      = 20;
     final_usage.completion_tokens  = 5;
     final_usage.cache_hit_tokens   = 12;
     final_usage.cache_write_tokens = 6;
-    const Json mdelta = parse_sse(make_message_delta("tool_use", final_usage), &type);
+
+    // Thinking, text, then two tool_use blocks, each streamed live and stopped as the model
+    // closes its call.
+    MessagesEventStream stream("msg_1", "claude-x", 11);
+    std::vector<SseEvent> events;
+    append_events(events, stream.start());
+    append_events(events, stream.reasoning_delta("hm"));
+    append_events(events, stream.reasoning_delta("m"));
+    append_events(events, stream.content_delta("hi"));
+    append_events(events, stream.tool_call_begin(0, ToolCall{"toolu_2", "get_weather", ""}));
+    append_events(events, stream.tool_call_arguments(0, R"({"city": ")"));
+    append_events(events, stream.tool_call_arguments(0, R"(Paris"})"));
+    append_events(events, stream.tool_call_end(0));
+    append_events(events, stream.tool_call_begin(1, ToolCall{"toolu_3", "get_time", ""}));
+    append_events(events, stream.tool_call_arguments(1, "{}"));
+    append_events(events, stream.tool_call_end(1));
+    append_events(events, stream.finish(ninfer::FinishReason::StopToken, final_usage));
+
+    failures += check(event_types(events) ==
+                          "message_start content_block_start@0 content_block_delta@0 "
+                          "content_block_delta@0 content_block_stop@0 content_block_start@1 "
+                          "content_block_delta@1 content_block_stop@1 content_block_start@2 "
+                          "content_block_delta@2 content_block_delta@2 content_block_stop@2 "
+                          "content_block_start@3 content_block_delta@3 content_block_stop@3 "
+                          "message_delta message_stop ",
+                      "thinking -> text -> tool_use event order: " + event_types(events));
+    failures += check(blocks_are_contiguous(events), "content block indices are contiguous");
+
+    const Json& start = events.at(0).data;
+    failures += check(start.at("type") == "message_start" &&
+                          start.at("message").at("id") == "msg_1" &&
+                          start.at("message").at("model") == "claude-x" &&
+                          start.at("message").at("content").is_array() &&
+                          start.at("message").at("content").empty() &&
+                          start.at("message").at("stop_reason").is_null(),
+                      "message_start shape");
+    failures += check(start.at("message").at("usage").at("input_tokens") == 11 &&
+                          start.at("message").at("usage").at("cache_read_input_tokens") == 0 &&
+                          start.at("message").at("usage").at("cache_creation_input_tokens") == 0,
+                      "message_start reports the prompt and no cache activity before admission");
+
+    failures += check(events.at(1).data.at("content_block") ==
+                              Json({{"type", "thinking"}, {"thinking", ""}}) &&
+                          events.at(2).data.at("delta") ==
+                              Json({{"type", "thinking_delta"}, {"thinking", "hm"}}),
+                      "thinking block start and thinking_delta");
+    failures += check(events.at(5).data.at("content_block") ==
+                              Json({{"type", "text"}, {"text", ""}}) &&
+                          events.at(6).data.at("delta") ==
+                              Json({{"type", "text_delta"}, {"text", "hi"}}),
+                      "text block start and text_delta");
+
+    // A tool_use block starts with the call's id and name and an empty input, before any
+    // argument exists; input_json_delta fragments concatenate to the arguments.
+    failures += check(events.at(8).data.at("content_block") == Json({{"type", "tool_use"},
+                                                                      {"id", "toolu_2"},
+                                                                      {"name", "get_weather"},
+                                                                      {"input", Json::object()}}),
+                      "tool_use block start carries id, name and empty input");
+    std::string partial_json;
+    for (const std::size_t at : {std::size_t{9}, std::size_t{10}}) {
+        failures += check(events.at(at).data.at("delta").at("type") == "input_json_delta",
+                          "tool arguments stream as input_json_delta");
+        partial_json += events.at(at).data.at("delta").at("partial_json").get<std::string>();
+    }
     failures +=
-        check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
-                  mdelta.at("delta").at("stop_sequence").is_null() &&
-                  mdelta.at("usage").at("output_tokens") == 5 &&
-                  mdelta.at("usage").at("input_tokens") == 2 &&
-                  mdelta.at("usage").at("cache_read_input_tokens") == 12 &&
-                  mdelta.at("usage").at("cache_creation_input_tokens") == 6,
-              "message_delta stop_reason + cumulative usage split");
+        check(partial_json == R"({"city": "Paris"})", "input_json_delta fragments concatenate");
 
-    const Json mstop = parse_sse(make_message_stop(), &type);
-    failures += check(type == "message_stop" && mstop.at("type") == "message_stop", "message_stop");
+    const Json& message_delta = events.at(15).data;
+    failures += check(message_delta.at("delta").at("stop_reason") == "tool_use" &&
+                          message_delta.at("delta").at("stop_sequence").is_null() &&
+                          message_delta.at("usage").at("output_tokens") == 5 &&
+                          message_delta.at("usage").at("input_tokens") == 2 &&
+                          message_delta.at("usage").at("cache_read_input_tokens") == 12 &&
+                          message_delta.at("usage").at("cache_creation_input_tokens") == 6,
+                      "message_delta: tool_use once every call closed, cumulative usage split");
+    failures += check(events.at(16).data == Json({{"type", "message_stop"}}), "message_stop");
 
+    // A call the output cut short stops with exactly the input it streamed, and the turn keeps
+    // the engine's reason instead of handing control to the client.
+    MessagesEventStream cut("msg_2", "claude-x", 3);
+    std::vector<SseEvent> cut_events;
+    append_events(cut_events, cut.start());
+    append_events(cut_events, cut.content_delta("Checking."));
+    append_events(cut_events, cut.tool_call_begin(0, ToolCall{"toolu_4", "get_weather", ""}));
+    append_events(cut_events, cut.tool_call_arguments(0, R"({"city": "Par)"));
+    append_events(cut_events,
+                  cut.finish(ninfer::FinishReason::OutputLimit, CompletionUsage{3, 9}));
+    failures += check(event_types(cut_events) ==
+                          "message_start content_block_start@0 content_block_delta@0 "
+                          "content_block_stop@0 content_block_start@1 content_block_delta@1 "
+                          "content_block_stop@1 message_delta message_stop ",
+                      "cut-short tool_use block is stopped at finish: " + event_types(cut_events));
+    failures += check(cut_events.at(5).data.at("delta").at("partial_json") == R"({"city": "Par)" &&
+                          cut_events.at(7).data.at("delta").at("stop_reason") == "max_tokens",
+                      "cut-short call keeps its prefix and reports max_tokens");
+
+    // No output still yields one (empty) text block.
+    MessagesEventStream empty("msg_3", "claude-x", 1);
+    std::vector<SseEvent> empty_events;
+    append_events(empty_events, empty.start());
+    append_events(empty_events,
+                  empty.finish(ninfer::FinishReason::StopToken, CompletionUsage{1, 0}));
+    failures += check(event_types(empty_events) ==
+                              "message_start content_block_start@0 content_block_stop@0 "
+                              "message_delta message_stop " &&
+                          empty_events.at(1).data.at("content_block").at("type") == "text" &&
+                          empty_events.at(3).data.at("delta").at("stop_reason") == "end_turn",
+                      "empty output streams one empty text block");
+
+    std::string type;
     const Json ping = parse_sse(make_messages_ping(), &type);
     failures += check(type == "ping" && ping.at("type") == "ping", "ping");
     return failures;

@@ -290,6 +290,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 output.on_content = [&](const std::string& text) {
                     write_stream_items(sink, *stream, stream->encoder->content_delta(text));
                 };
+                output.on_tool_call_begin = [&](std::size_t index, const ToolCall& call) {
+                    write_stream_items(sink, *stream, stream->encoder->tool_call_begin(index, call));
+                };
+                output.on_tool_call_arguments = [&](std::size_t index, const std::string& delta) {
+                    write_stream_items(sink, *stream,
+                                       stream->encoder->tool_call_arguments(index, delta));
+                };
+                output.on_tool_call_end = [&](std::size_t index, const ToolCall& call) {
+                    write_stream_items(sink, *stream, stream->encoder->tool_call_end(index, call));
+                };
                 output.on_prompt_progress = [&](const ninfer::PromptProgress& progress) {
                     write_stream_items(sink, *stream, stream->encoder->prompt_progress(progress));
                 };
@@ -310,8 +320,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 if (commit == ResponseCommitAction::FailCancelled) {
                     throw ApiException(request_cancelled_error());
                 }
-                // finish() only stages success events. Nothing reaches the wire until put()
-                // succeeds, so a storage failure can emit exactly one response.failed terminal.
+                // Items went out live as the model wrote them; finish() only stages the events
+                // that close what is still open. Those and the terminal reach the wire only after
+                // put() succeeds, so a storage failure can emit exactly one response.failed
+                // terminal.
                 if (commit == ResponseCommitAction::StoreThenSend) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();

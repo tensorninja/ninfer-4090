@@ -106,6 +106,26 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
     return "unknown";
 }
 
+// A completed call whose arguments are not a JSON object cannot be replayed as history, which
+// requires an object; an incomplete call holds only the prefix the output reached.
+struct ToolCallCounts {
+    std::size_t incomplete        = 0;
+    std::size_t invalid_arguments = 0;
+};
+
+ToolCallCounts count_tool_calls(const std::vector<ToolCall>& calls) {
+    ToolCallCounts counts;
+    for (const ToolCall& call : calls) {
+        if (call.state == ToolCallState::Incomplete) {
+            ++counts.incomplete;
+            continue;
+        }
+        const Json arguments = Json::parse(call.arguments_json, nullptr, false);
+        if (arguments.is_discarded() || !arguments.is_object()) { ++counts.invalid_arguments; }
+    }
+    return counts;
+}
+
 const char* continuation_cache_tiers_name(ContinuationCacheTiers tiers) {
     switch (tiers) {
     case ContinuationCacheTiers::Off:
@@ -425,8 +445,19 @@ std::string format_request_done(const RequestLogContext& context,
 
     std::ostringstream out;
     out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] done finish="
-        << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
-    if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
+        << (tool_calls_completed(outcome.tool_calls) ? "tool_calls"
+                                                      : finish_reason_name(outcome.finish_reason));
+    if (!outcome.tool_calls.empty()) {
+        const ToolCallCounts counts = count_tool_calls(outcome.tool_calls);
+        out << " tool_calls=" << outcome.tool_calls.size();
+        if (counts.incomplete != 0) { out << " tool_calls_incomplete=" << counts.incomplete; }
+        if (counts.invalid_arguments != 0) {
+            out << " tool_calls_invalid_arguments=" << counts.invalid_arguments;
+        }
+    }
+    if (outcome.tool_call_discarded_bytes != 0) {
+        out << " tool_call_discarded_bytes=" << outcome.tool_call_discarded_bytes;
+    }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " cache=" << metrics.prefix_cache_hit_tokens
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
@@ -674,8 +705,9 @@ std::string format_request_start_json(const std::string& server_instance_id,
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    Json record       = event_base(server_instance_id, timestamp, "request_done");
-    record["request"] = request_json(context);
+    Json record                 = event_base(server_instance_id, timestamp, "request_done");
+    record["request"]           = request_json(context);
+    const ToolCallCounts counts = count_tool_calls(outcome.tool_calls);
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
@@ -685,7 +717,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
-             {"tool_call_count", outcome.tool_calls.size()}};
+             {"tool_call_count", outcome.tool_calls.size()},
+             {"tool_calls_incomplete", counts.incomplete},
+             {"tool_calls_invalid_arguments", counts.invalid_arguments},
+             {"tool_call_discarded_bytes", outcome.tool_call_discarded_bytes}};
     // queue + restore + prefill decompose the engine-side part of ttft. prepare and vision are
     // frontend work that precedes submission.
     record["timings_seconds"] = Json{{"prepare", outcome.metrics.prepare_seconds},

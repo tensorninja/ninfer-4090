@@ -58,7 +58,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
 | `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE stream of the schema-19 records `--request-log-jsonl` writes |
+| `GET /events` | SSE stream of the schema-20 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -92,7 +92,7 @@ reported apart from `restore_failures` because a deferral leaves the candidate l
 and a failure does not. The same counters appear on the throughput record as cumulative totals
 paired with interval deltas, so churn is readable from a replayed log as well as live.
 
-`GET /events` streams the same schema-19 records `--request-log-jsonl` appends, as named SSE
+`GET /events` streams the same schema-20 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
@@ -207,6 +207,11 @@ both OpenAI spellings are present they must carry the same boolean value. Unknow
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
+
+Tool calls stream in `delta.tool_calls` while the model writes them. The first entry for a call
+`index` carries `id`, `type: "function"`, and `function.name`, with `function.arguments: ""`.
+Later entries carry only `index` and an argument fragment. See [Tool calls](#tool-calls) for
+announcement, argument conversion, and the finish reason of a call the output cut short.
 
 ### Multimodal request
 
@@ -419,6 +424,10 @@ a later request. NInfer does not execute functions or enforce JSON Schema throug
 decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
 custom free-form tools are rejected.
 
+A `function_call` Item is `completed` when the model closed the call and `incomplete` when the
+output ended inside it; a message Item followed by calls is always `completed`. See
+[Tool calls](#tool-calls).
+
 ### Response object and usage
 
 A terminal wire response has `object: "response"` and exactly one of `completed`, `incomplete`, or
@@ -477,10 +486,22 @@ The normal lifecycle is:
 4. matching summary/content completion and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
-Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
-and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
-does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
+Each function call is its own Item and streams while the model writes it:
+
+1. `response.output_item.added` with an `in_progress` `function_call` Item whose `arguments` is
+   empty;
+2. `response.function_call_arguments.delta` events for the argument fragments;
+3. `response.function_call_arguments.done` and `response.output_item.done` when the model closes
+   the call.
+
+The reasoning and message Items are finished before the first call's Item is added, so Items never
+interleave. If the output ends inside a call, that call's `.done` events come at the end of the
+stream, with status `incomplete`. IDs, output indices, and content indices remain stable, and
+concatenated deltas equal the terminal Item. Responses SSE does not emit the Chat Completions
+`[DONE]` sentinel.
+
+With tools enabled, ordinary answer text still streams immediately. The only text held back is
+trailing whitespace and a possible `<tool_call>` prefix, until the next output settles them.
 Malformed tool markup is flushed back as ordinary text without losing bytes.
 
 For stored streams, successful storage is the commit point before staged completion events are sent.
@@ -572,6 +593,12 @@ events. `thinking.type: "disabled"` disables thinking; other supported values en
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
 uses the server default.
 
+A stream opens content blocks in output order with contiguous indices: thinking, then text, then
+one `tool_use` block per call. A `tool_use` block starts as soon as its call is announced, with the
+call's `id`, its `name`, and `input: {}`. It then streams `input_json_delta` fragments that
+concatenate to the call's input and stops when the model closes the call. See
+[Tool calls](#tool-calls).
+
 Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
 `max`. The value is then checked against the loaded chat template in the same way as the OpenAI
 endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
@@ -605,6 +632,72 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Tool calls
+
+Chat Completions, Responses, and Messages use the same tool-call parser. NInfer renders function
+definitions into the Qwen prompt and does not execute tools. It also does not use constrained
+decoding to enforce the client's JSON Schema. The model writes a call in the template's XML form:
+
+```text
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>
+```
+
+NInfer converts this to the protocol's JSON while the model is still generating it, so a client can
+show the tool and its arguments as they arrive. A request uses the parser when it declares tools or
+carries tool-call history.
+
+A call is announced once `<tool_call>`, optional whitespace, and `<function=NAME>` have arrived and
+`NAME` is a valid function name: 1 to 64 characters from `[A-Za-z0-9_-]`, or up to 128 on the
+Messages endpoint. The name does not have to be a declared tool. The announcement carries the call
+ID and name with empty arguments. The arguments then stream as JSON fragments that concatenate to
+the call's `arguments`. Each parameter's type comes from the request's own tool schema:
+
+| Declared parameter type, ignoring `null` | Streamed as |
+|---|---|
+| `string` | an escaped JSON string, as the model writes it |
+| `object`, `array`, or both | the model's JSON as written, once the value starts with `{` or `[` |
+| anything else, including undeclared tools and parameters | the whole value at `</parameter>`: its JSON when it parses, otherwise a JSON string |
+
+The parser strips exactly one framing newline from each end of a value and keeps indentation and
+inner whitespace. A `string` parameter stays a string even when its text looks like JSON. The
+closing `}` arrives only when the model closes the call with `</function>` or a bare
+`</tool_call>`. Until then the client never holds a complete-looking argument object for an
+unfinished call.
+
+A Hermes-style JSON body inside `<tool_call>` is different: the parser validates it whole at
+`</tool_call>` and emits it as one argument fragment.
+
+Text before the first call streams as ordinary content. If some markup never becomes a valid call,
+it is released as text with no bytes lost. After the first call, any output that is not another call
+is dropped, as the reference Qwen parser does. The request log counts the dropped bytes. Calls are
+numbered in output order, and every protocol closes its text block or message before the first
+call.
+
+A call that the output ends inside stays incomplete. It keeps exactly the argument prefix that was
+streamed and is never closed automatically. The turn then keeps the engine's finish reason instead
+of handing control to the client. For the output limit, the context limit, and the repetition guard
+the protocols report:
+
+| Outcome | Chat Completions | Responses | Anthropic Messages |
+|---|---|---|---|
+| every call closed | `finish_reason: "tool_calls"` | each call Item `completed` | `stop_reason: "tool_use"` |
+| a call cut short | `finish_reason: "length"` | that Item `incomplete`; the response is `incomplete` | `stop_reason: "max_tokens"` |
+
+Tool-call history must carry JSON-object arguments. An incomplete call cannot be sent back as
+history, and neither can a completed call whose arguments are not an object. For the same reason,
+stored Responses continuation history keeps only closed calls with object arguments.
+
+A call written inside a `<think>` block that is still open is held back rather than streamed as
+reasoning. If `</think>` arrives later, the held text is released as reasoning. If the block never
+closes, the call reaches the parser only when generation ends and arrives all at once, not while it
+is being written. Reasoning after that `<tool_call>` is held until then as well.
 
 ## Authentication and CORS
 
@@ -755,7 +848,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-19 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-20 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -764,7 +857,7 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call counts, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, board energy, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
 
@@ -776,6 +869,17 @@ fields and the `continuation_export_*` metrics. Its `speculative` object contain
 `backend`, `draft_window`, `rounds`, `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and
 `accepted_per_position`. Rates can be derived downstream from raw token counts and seconds instead
 of rounded stderr strings.
+
+`request_done.result.finish_reason` is always the engine's reason. The result also carries
+`tool_call_count` and three [tool-call](#tool-calls) quality counters:
+
+- `tool_calls_incomplete`: calls the output ended inside;
+- `tool_calls_invalid_arguments`: closed calls whose arguments are not a JSON object;
+- `tool_call_discarded_bytes`: non-whitespace bytes of non-call output after the first call,
+  which were dropped.
+
+The human completion line prints `finish=tool_calls` only when every call closed. Otherwise it prints
+the engine's reason. It adds `tool_calls=`, and prints the three counters when they are nonzero.
 
 `request_done.continuation_cache` reports stable `source` (`none`, `l1`, `l2`, `l3`), `alias_kind`
 (`none`, `routed_session`, `stable_prefix`), and `final_miss_reason` names, plus lookup/preflight/restore
@@ -983,9 +1087,8 @@ exact accepted target prefix so a following compatible turn can still reuse it. 
 context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
 `stop`/ `end_turn`.
 
-Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+Function tools are rendered into the model prompt, and generated calls are parsed and streamed as
+[Tool calls](#tool-calls) describes.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

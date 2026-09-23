@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -216,19 +218,25 @@ void check_preparation_control(Clock::time_point deadline,
     }
 }
 
-class ServiceOutputSink final : public ninfer::OutputSink {
+// Forwards engine output to a StreamSink. A tool-capable request's content runs through the
+// incremental tool-call parser, so calls reach the client while the model is still writing them.
+class ServiceOutputSink final : public ninfer::OutputSink, private ToolCallEvents {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
+    ServiceOutputSink(const StreamSink& sink, const PreparedRequest& prepared) : sink_(&sink) {
+        if (prepared.tool_capable) {
+            tool_stream_.emplace(prepared.tool_parameters, prepared.tool_name_max_length,
+                                 static_cast<ToolCallEvents*>(this));
+        }
+    }
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else {
-            std::string visible =
-                filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
-            publish_content(visible);
+        } else if (tool_stream_) {
+            tool_stream_->feed(delta.text);
+        } else if (sink_->on_content) {
+            sink_->on_content(delta.text);
         }
     }
 
@@ -236,22 +244,30 @@ public:
         if (sink_->on_prompt_progress) { sink_->on_prompt_progress(progress); }
     }
 
-    std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
-        return content_bytes_;
-    }
+    // Ends the parse of a tool-capable request, publishing whatever the end of output decides.
+    ToolCallStreamResult finish_tool_calls() { return tool_stream_->finish(); }
 
 private:
-    void publish_content(const std::string& text) {
-        if (text.empty() || !sink_->on_content) { return; }
-        sink_->on_content(text);
-        content_bytes_ += text.size();
+    void content(std::string_view text) override {
+        if (sink_->on_content) { sink_->on_content(std::string(text)); }
+    }
+
+    void tool_call_begin(std::size_t index, const ToolCall& call) override {
+        if (sink_->on_tool_call_begin) { sink_->on_tool_call_begin(index, call); }
+    }
+
+    void tool_call_arguments(std::size_t index, std::string_view delta) override {
+        if (sink_->on_tool_call_arguments) {
+            sink_->on_tool_call_arguments(index, std::string(delta));
+        }
+    }
+
+    void tool_call_end(std::size_t index, const ToolCall& call) override {
+        if (sink_->on_tool_call_end) { sink_->on_tool_call_end(index, call); }
     }
 
     const StreamSink* sink_ = nullptr;
-    bool filter_tool_calls_ = false;
-    ToolCallStreamFilter tool_filter_;
-    std::size_t content_bytes_ = 0;
+    std::optional<QwenToolCallStream> tool_stream_;
 };
 
 } // namespace
@@ -365,6 +381,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
+    if (prepared.tool_capable) {
+        prepared.tool_parameters = ToolParameterKinds::from_tools(request.tools);
+    }
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
@@ -445,9 +464,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
-    if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
-    }
+    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared); }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
@@ -496,16 +513,21 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
-    bool is_tool_call_response = false;
     if (prepared.tool_capable) {
-        ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
-        outcome.text          = std::move(parsed.content);
-        is_tool_call_response = parsed.is_tool_call_response;
-        if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
-    }
-    if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
+        // A streamed request was parsed as it was published; the engine's terminal content is
+        // the concatenation of those deltas, so a buffered request parses it in one feed.
+        ToolCallStreamResult parsed;
+        if (output_sink) {
+            parsed = output_sink->finish_tool_calls();
+        } else {
+            QwenToolCallStream parser(std::move(prepared.tool_parameters),
+                                      prepared.tool_name_max_length);
+            parser.feed(outcome.text);
+            parsed = parser.finish();
+        }
+        outcome.text                      = std::move(parsed.content);
+        outcome.tool_calls                = std::move(parsed.tool_calls);
+        outcome.tool_call_discarded_bytes = parsed.discarded_bytes;
     }
     return outcome;
 }

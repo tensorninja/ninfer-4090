@@ -199,6 +199,12 @@ export interface RequestDoneRecord extends RecordEnvelope {
     prefix_reuse_path: string
     finish_reason: string
     tool_call_count: number
+    /** Present from schema 20: calls the output cut short before they closed. */
+    tool_calls_incomplete?: number
+    /** Present from schema 20: completed calls whose arguments are not a JSON object. */
+    tool_calls_invalid_arguments?: number
+    /** Present from schema 20: bytes of non-call output after the first call, dropped. */
+    tool_call_discarded_bytes?: number
   }
   timings_seconds: RequestTimings
   continuation_cache: ContinuationDiagnostics
