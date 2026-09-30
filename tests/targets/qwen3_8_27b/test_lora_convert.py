@@ -283,6 +283,107 @@ def test_report_records_the_adapter_contract(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# decision adapters
+# --------------------------------------------------------------------------
+
+
+def _decision_source(tmp_path: Path, temperature: float = 1.38) -> Path:
+    source = tmp_path / "decision_src"
+    synthetic.write_adapter(
+        out_dir=source, kind="random", rank=RANK, alpha=ALPHA, variant="a",
+        seed=9, site_keys=inventory.ALL_SITE_KEYS, sigma=0.02, use_rslora=False,
+    )
+    synthetic.write_decision_head(source, seed=9, sigma=0.01, temperature=temperature)
+    return source
+
+
+def test_decision_head_round_trips_as_bf16_with_its_metadata(tmp_path: Path) -> None:
+    from safetensors.torch import load_file
+
+    source = _decision_source(tmp_path)
+    head = convert_lora.load_decision_head(
+        source / "decision_head.safetensors", description="probe", release_date="2026-09-30"
+    )
+    out = tmp_path / "decider.lora.ninfer"
+    report = convert_lora.convert(source, out, decision_head=head)
+    artifact = Artifact.open(out)
+
+    # Head objects follow every factor and the metadata resource is last, so a generative
+    # prefix of the directory is exactly the generative adapter.
+    names = [obj.name for obj in artifact.objects]
+    assert names[-5:] == [name for name, _ in inventory.DECISION_HEAD_TENSORS] + [
+        inventory.DECISION_METADATA_OBJECT
+    ]
+    assert report["kind"] == "decision"
+    assert report["objects"]["resources"] == 1
+
+    # BF16 round-to-nearest-even of the trainer's FP32 values, bit for bit.
+    stored = load_file(str(source / "decision_head.safetensors"))
+    for key, name in (("query.weight", "decision/head/query/weight"),
+                      ("query.bias", "decision/head/query/bias"),
+                      ("key.weight", "decision/head/key/weight"),
+                      ("key.bias", "decision/head/key/bias")):
+        expected = stored[key].to(torch.bfloat16)
+        assert torch.equal(_decoded(artifact, name).view(torch.int16),
+                           expected.view(torch.int16))
+
+    metadata = json.loads(bytes(artifact.payload(artifact.find(inventory.DECISION_METADATA_OBJECT))))
+    assert set(metadata) == inventory.DECISION_METADATA_KEYS
+    assert metadata["delimiters"] == inventory.DECISION_DELIMITERS
+    assert metadata["description"] == "probe"
+    assert metadata["release_date"] == "2026-09-30"
+    # The temperature is stored as the FP32 value the engine divides by, exactly.
+    assert metadata["temperature"] == float(torch.tensor(1.38, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("pointer_dim", "128", "pointer_dim"),
+        ("logit_scale", "0.125", "logit_scale"),
+        ("readout", "last_token", "readout"),
+        ("escape", "none", "escape"),
+        ("delimiters", json.dumps({**inventory.DECISION_DELIMITERS, "decide": "<|im_end|>"}),
+         "delimiters"),
+        ("delimiter_ids", json.dumps({**inventory.DECISION_DELIMITER_IDS, "state": 1}),
+         "delimiter ids"),
+        ("temperature", "0", "temperature"),
+        ("release_date", "2026-02-30", "release date"),
+    ],
+)
+def test_decision_head_contract_violations_are_rejected(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    source = _decision_source(tmp_path)
+    path = source / "decision_head.safetensors"
+    with safe_open(str(path), framework="pt") as handle:
+        metadata = dict(handle.metadata())
+        tensors = {key: handle.get_tensor(key) for key in handle.keys()}
+    metadata[field] = value
+    save_file(tensors, str(path), metadata=metadata)
+    with pytest.raises(convert_lora.LoraConversionError, match=message):
+        convert_lora.load_decision_head(path)
+
+
+def test_decision_head_with_a_foreign_tensor_is_rejected(tmp_path: Path) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    source = _decision_source(tmp_path)
+    path = source / "decision_head.safetensors"
+    with safe_open(str(path), framework="pt") as handle:
+        metadata = dict(handle.metadata())
+        tensors = {key: handle.get_tensor(key) for key in handle.keys()}
+    tensors["key.weight"] = tensors["key.weight"][:, :4096].contiguous()
+    save_file(tensors, str(path), metadata=metadata)
+    with pytest.raises(convert_lora.LoraConversionError, match="shape"):
+        convert_lora.load_decision_head(path)
+
+
+# --------------------------------------------------------------------------
 # rejections
 # --------------------------------------------------------------------------
 
@@ -326,7 +427,7 @@ def test_rejected_adapter_configurations(tmp_path: Path, overrides: dict, messag
         ("up_proj", "silu(gate) * up"),
         ("in_proj_qkv", "fused causal convolution"),
         ("in_proj_z", "fused causal convolution"),
-        ("lm_head", "not a registered adapter site"),
+        ("lm_head", "logits destination"),
     ],
 )
 def test_excluded_modules_are_rejected_by_name(tmp_path: Path, module: str, fragment: str) -> None:

@@ -85,6 +85,9 @@ public:
         return default_stop_token_ids_;
     }
 
+    // The id of a token named by its exact content: an added token first, then the base
+    // vocabulary (HF convert_tokens_to_ids). Throws std::out_of_range when absent.
+    [[nodiscard]] int token_id(std::string_view content) const;
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;

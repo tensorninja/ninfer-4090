@@ -20,6 +20,12 @@
 // adapter that trained fewer sites, or trained at a lower rank, stages zeros into the remainder.
 // That is exact rather than approximate - a zero factor contributes nothing - and it is the
 // padding contract `ninfer/ops/lora.h` already states.
+//
+// An adapter is of one of two kinds. A generative adapter carries only factors. A decision adapter
+// additionally carries the System One pointer head - the four `decision/head/*` BF16 objects - and
+// the `decision/metadata` JSON resource, all five together. When the pool holds any decision
+// adapter every slab gains the head region after its sites; a generative occupant stages zeros
+// there, which no decision ever reads because decisions select only decision adapters.
 
 #include <ninfer/targets/qwen3_8/model_view.h>
 #include <ninfer/types.h>
@@ -97,6 +103,15 @@ struct LoraInventory {
     [[nodiscard]] std::size_t site_count() const noexcept;
 };
 
+// Byte offsets of the pointer head inside one slab: BF16 [pointer_dim, hidden] weights and
+// [pointer_dim] biases of the query and key projections.
+struct DecisionHeadPlan {
+    std::uint64_t query_weight = 0;
+    std::uint64_t query_bias   = 0;
+    std::uint64_t key_weight   = 0;
+    std::uint64_t key_bias     = 0;
+};
+
 // The frozen bank geometry. Built once, before the first slot is staged.
 struct LoraBankProfile {
     std::int32_t rank        = 0;
@@ -104,11 +119,21 @@ struct LoraBankProfile {
     LoraInventory inventory;
     std::array<LoraFullLayerPlan, kFullAttentionLayers> full_layers;
     std::array<LoraGdnLayerPlan, kGdnLayers> gdn_layers;
+    // Present when the pool holds a decision adapter.
+    std::optional<DecisionHeadPlan> decision_head;
+};
+
+// Host metadata of a decision adapter, read from its `decision/metadata` resource.
+struct DecisionAdapterMetadata {
+    float temperature = 1.0F;
+    std::string description;
+    std::string release_date;
 };
 
 // One discovered adapter. `fingerprint` is the container's SHA-256 content identity and is what
 // namespaces the adapter's continuation state; a pool position is a residency detail that must
-// never reach a cache key or a persisted image.
+// never reach a cache key or a persisted image. The fingerprint covers the head and its metadata,
+// so a head-only retrain is a different adapter scope.
 struct LoraPoolEntry {
     std::string name;
     std::filesystem::path path;
@@ -116,6 +141,8 @@ struct LoraPoolEntry {
     std::uint64_t file_bytes = 0;
     artifact::Sha256Digest fingerprint{};
     LoraInventory inventory;
+    LoraAdapterKind kind = LoraAdapterKind::Generative;
+    DecisionAdapterMetadata decision;
 };
 
 struct LoraDiscovery {

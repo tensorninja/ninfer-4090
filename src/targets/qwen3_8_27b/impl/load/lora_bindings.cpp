@@ -1,10 +1,16 @@
 #include "targets/qwen3_8_27b/impl/load/lora_bindings.h"
 
+#include <ninfer/targets/qwen3_8/decision.h>
+
 #include "artifact/typed_binding.h"
+#include "targets/qwen3_8_27b/impl/config.h"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <initializer_list>
 #include <map>
@@ -28,6 +34,27 @@ constexpr std::int32_t kAttentionValues = 6144;
 constexpr std::int32_t kGdnValues       = 6144;
 constexpr std::int32_t kIntermediate    = 17408;
 constexpr std::uint64_t kSlabAlignment  = 256;
+constexpr std::int32_t kPointerDim      = DecisionConfig::pointer_dim;
+static_assert(DecisionConfig::hidden == kHidden);
+
+// The decision objects: the pointer head's four BF16 tensors and its metadata resource. A
+// decision adapter carries all five; a generative adapter carries none.
+constexpr std::string_view kHeadQueryWeight  = "decision/head/query/weight";
+constexpr std::string_view kHeadQueryBias    = "decision/head/query/bias";
+constexpr std::string_view kHeadKeyWeight    = "decision/head/key/weight";
+constexpr std::string_view kHeadKeyBias      = "decision/head/key/bias";
+constexpr std::string_view kDecisionMetadata = "decision/metadata";
+constexpr std::array<std::string_view, 5> kDecisionObjects = {
+    kHeadQueryWeight, kHeadQueryBias, kHeadKeyWeight, kHeadKeyBias, kDecisionMetadata};
+
+// `decision/metadata` is one JSON object with exactly these members.
+constexpr std::string_view kDecisionFormat        = "ninfer-decision-head";
+constexpr std::int64_t kDecisionFormatVersion     = 1;
+constexpr std::array<std::string_view, 5> kDelimiterKeys = {"state", "question", "option_open",
+                                                            "option_close", "decide"};
+constexpr std::array<std::string_view, 12> kDecisionMetadataKeys = {
+    "format",      "format_version", "pointer_dim", "hidden_size", "logit_scale", "temperature",
+    "readout",     "escape",         "delimiters",  "description", "release_date", "base_model"};
 
 bool registered_rank(std::int32_t rank) {
     return rank == 8 || rank == 16 || rank == 32 || rank == 64;
@@ -223,12 +250,180 @@ void read_inventory(const artifact::Reader& reader, LoraInventory& inventory,
             gdn.down   = read_site(reader, mlp_down_site(layer), rank, "mlp/down");
         }
     }
+    for (const std::string_view name : kDecisionObjects) { registered_objects.emplace(name); }
     for (const artifact::ObjectDescriptor& object : reader.objects()) {
         const std::string_view name = artifact::object_name(object);
         if (!registered_objects.contains(name)) {
             throw artifact::ArtifactError("unregistered LoRA object '" + std::string(name) + "'");
         }
     }
+}
+
+std::vector<std::uint64_t> head_shape(std::string_view name) {
+    if (name == kHeadQueryWeight || name == kHeadKeyWeight) {
+        return {static_cast<std::uint64_t>(kPointerDim), static_cast<std::uint64_t>(kHidden)};
+    }
+    return {static_cast<std::uint64_t>(kPointerDim)};
+}
+
+void require_head_tensor(const artifact::Reader& reader, std::string_view name) {
+    const auto* tensor = std::get_if<artifact::TensorDescriptor>(reader.find(name));
+    if (tensor == nullptr) {
+        throw artifact::ArtifactError(std::string(name) + ": a decision head object is a tensor");
+    }
+    if (tensor->format != NumericFormat::BF16 ||
+        tensor->layout != artifact::StorageLayout::ContiguousLeV1) {
+        throw artifact::ArtifactError(std::string(name) +
+                                      ": a decision head tensor must be BF16 contiguous-le-v1");
+    }
+    if (tensor->shape != head_shape(name)) {
+        throw artifact::ArtifactError(std::string(name) + ": decision head shape is not [" +
+                                      std::to_string(kPointerDim) +
+                                      (name.ends_with("/weight") ? ", " + std::to_string(kHidden)
+                                                                 : std::string()) +
+                                      "]");
+    }
+}
+
+// YYYY-MM-DD with a month and day in range. The converter checks the calendar.
+bool valid_release_date(std::string_view date) {
+    if (date.size() != 10 || date[4] != '-' || date[7] != '-') { return false; }
+    for (const std::size_t index : {0U, 1U, 2U, 3U, 5U, 6U, 8U, 9U}) {
+        if (date[index] < '0' || date[index] > '9') { return false; }
+    }
+    const int month = (date[5] - '0') * 10 + (date[6] - '0');
+    const int day   = (date[8] - '0') * 10 + (date[9] - '0');
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+const nlohmann::json& metadata_member(const nlohmann::json& metadata, std::string_view key) {
+    const auto found = metadata.find(key);
+    if (found == metadata.end()) {
+        throw artifact::ArtifactError("decision/metadata lacks '" + std::string(key) + "'");
+    }
+    return *found;
+}
+
+std::string metadata_string(const nlohmann::json& metadata, std::string_view key) {
+    const nlohmann::json& value = metadata_member(metadata, key);
+    if (!value.is_string()) {
+        throw artifact::ArtifactError("decision/metadata '" + std::string(key) +
+                                      "' is not a string");
+    }
+    return value.get<std::string>();
+}
+
+std::int64_t metadata_integer(const nlohmann::json& metadata, std::string_view key) {
+    const nlohmann::json& value = metadata_member(metadata, key);
+    if (!value.is_number_integer()) {
+        throw artifact::ArtifactError("decision/metadata '" + std::string(key) +
+                                      "' is not an integer");
+    }
+    return value.get<std::int64_t>();
+}
+
+double metadata_number(const nlohmann::json& metadata, std::string_view key) {
+    const nlohmann::json& value = metadata_member(metadata, key);
+    if (!value.is_number()) {
+        throw artifact::ArtifactError("decision/metadata '" + std::string(key) +
+                                      "' is not a number");
+    }
+    return value.get<double>();
+}
+
+// Validates the registered metadata contract: the head geometry and scale the family executes,
+// kev's readout, escape rule and delimiters, and the host metadata the product layer publishes.
+DecisionAdapterMetadata parse_decision_metadata(std::span<const std::byte> bytes) {
+    const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    nlohmann::json metadata;
+    try {
+        metadata = nlohmann::json::parse(text);
+    } catch (const nlohmann::json::exception& error) {
+        throw artifact::ArtifactError(std::string("decision/metadata is not JSON: ") +
+                                      error.what());
+    }
+    if (!metadata.is_object()) {
+        throw artifact::ArtifactError("decision/metadata is not a JSON object");
+    }
+    for (const auto& [key, value] : metadata.items()) {
+        (void)value;
+        if (std::find(kDecisionMetadataKeys.begin(), kDecisionMetadataKeys.end(), key) ==
+            kDecisionMetadataKeys.end()) {
+            throw artifact::ArtifactError("decision/metadata has unregistered member '" + key +
+                                          "'");
+        }
+    }
+    if (metadata_string(metadata, "format") != kDecisionFormat ||
+        metadata_integer(metadata, "format_version") != kDecisionFormatVersion) {
+        throw artifact::ArtifactError("decision/metadata is not " + std::string(kDecisionFormat) +
+                                      " version " + std::to_string(kDecisionFormatVersion));
+    }
+    if (metadata_integer(metadata, "pointer_dim") != kPointerDim ||
+        metadata_integer(metadata, "hidden_size") != kHidden) {
+        throw artifact::ArtifactError("decision/metadata head geometry is not [" +
+                                      std::to_string(kPointerDim) + ", " +
+                                      std::to_string(kHidden) + "]");
+    }
+    // The pointer logit is (k . q) / sqrt(pointer_dim) / T; the scale is fixed by the geometry.
+    if (metadata_number(metadata, "logit_scale") != 1.0 / std::sqrt(double{kPointerDim})) {
+        throw artifact::ArtifactError("decision/metadata logit_scale is not 1/sqrt(pointer_dim)");
+    }
+    if (metadata_string(metadata, "readout") != "final_norm" ||
+        metadata_string(metadata, "escape") != "kev-v1") {
+        throw artifact::ArtifactError(
+            "decision/metadata readout/escape is not the registered final_norm/kev-v1");
+    }
+    const nlohmann::json& delimiters = metadata_member(metadata, "delimiters");
+    if (!delimiters.is_object() || delimiters.size() != kDelimiterKeys.size()) {
+        throw artifact::ArtifactError("decision/metadata delimiters is not the five-member object");
+    }
+    for (std::size_t index = 0; index < kDelimiterKeys.size(); ++index) {
+        const auto found = delimiters.find(kDelimiterKeys[index]);
+        if (found == delimiters.end() || !found->is_string() ||
+            found->get<std::string>() != qwen3_8::kDecisionDelimiterNames[index]) {
+            throw artifact::ArtifactError("decision/metadata delimiter '" +
+                                          std::string(kDelimiterKeys[index]) + "' is not " +
+                                          std::string(qwen3_8::kDecisionDelimiterNames[index]));
+        }
+    }
+
+    DecisionAdapterMetadata parsed;
+    const double temperature = metadata_number(metadata, "temperature");
+    parsed.temperature       = static_cast<float>(temperature);
+    if (!std::isfinite(parsed.temperature) || parsed.temperature <= 0.0F ||
+        static_cast<double>(parsed.temperature) != temperature) {
+        throw artifact::ArtifactError(
+            "decision/metadata temperature is not a positive finite FP32 value");
+    }
+    parsed.description  = metadata_string(metadata, "description");
+    parsed.release_date = metadata_string(metadata, "release_date");
+    if (!valid_release_date(parsed.release_date)) {
+        throw artifact::ArtifactError("decision/metadata release_date is not YYYY-MM-DD");
+    }
+    (void)metadata_string(metadata, "base_model");
+    return parsed;
+}
+
+// Reads the decision objects. Returns the adapter's kind; a partial set is malformed.
+LoraAdapterKind read_decision(const artifact::Reader& reader, DecisionAdapterMetadata& metadata) {
+    std::size_t present = 0;
+    for (const std::string_view name : kDecisionObjects) {
+        present += reader.find(name) != nullptr ? 1U : 0U;
+    }
+    if (present == 0) { return LoraAdapterKind::Generative; }
+    if (present != kDecisionObjects.size()) {
+        throw artifact::ArtifactError(
+            "decision adapter is incomplete: the four decision/head tensors and "
+            "decision/metadata are required together");
+    }
+    for (const std::string_view name : kDecisionObjects) {
+        if (name != kDecisionMetadata) { require_head_tensor(reader, name); }
+    }
+    if (std::get_if<artifact::ResourceDescriptor>(reader.find(kDecisionMetadata)) == nullptr) {
+        throw artifact::ArtifactError("decision/metadata is not a resource");
+    }
+    metadata = parse_decision_metadata(reader.payload(kDecisionMetadata).data);
+    return LoraAdapterKind::Decision;
 }
 
 // Assigns slab offsets for the profile's inventory. A factor named by two sites - the shared
@@ -365,7 +560,8 @@ std::size_t LoraInventory::site_count() const noexcept {
 
 namespace {
 
-LoraBankProfile build_bank_profile(const LoraInventory& inventory, std::int32_t rank) {
+LoraBankProfile build_bank_profile(const LoraInventory& inventory, std::int32_t rank,
+                                   bool decision_head) {
     LoraBankProfile profile;
     profile.rank      = rank;
     profile.inventory = inventory;
@@ -393,6 +589,14 @@ LoraBankProfile build_bank_profile(const LoraInventory& inventory, std::int32_t 
             if (have.output) { plan.output = place_site(slab, gdn_output_site(layer), rank); }
             if (have.down) { plan.down = place_site(slab, mlp_down_site(layer), rank); }
         }
+    }
+    if (decision_head) {
+        profile.decision_head = DecisionHeadPlan{
+            .query_weight = slab.place(std::string(kHeadQueryWeight), kPointerDim, kHidden),
+            .query_bias   = slab.place(std::string(kHeadQueryBias), 1, kPointerDim),
+            .key_weight   = slab.place(std::string(kHeadKeyWeight), kPointerDim, kHidden),
+            .key_bias     = slab.place(std::string(kHeadKeyBias), 1, kPointerDim),
+        };
     }
     profile.slab_bytes = align_up(slab.bytes(), kSlabAlignment);
     return profile;
@@ -429,6 +633,7 @@ LoraDiscovery discover_lora_pool(const LoraOptions& options,
 
     std::set<std::string> seen;
     std::int32_t bank_rank = 0;
+    bool any_decision      = false;
     LoraInventory united;
     for (const std::filesystem::path& path : candidates) {
         const std::string name = pool_name(path);
@@ -450,6 +655,7 @@ LoraDiscovery discover_lora_pool(const LoraOptions& options,
             if (!entry.inventory.any()) {
                 throw artifact::ArtifactError("carries no registered site, so it corrects nothing");
             }
+            entry.kind = read_decision(reader, entry.decision);
             if (!registered_rank(entry.rank)) {
                 throw artifact::ArtifactError("rank " + std::to_string(entry.rank) +
                                               " is not registered; supported ranks are 8, 16, 32,"
@@ -467,6 +673,7 @@ LoraDiscovery discover_lora_pool(const LoraOptions& options,
             entry.file_bytes  = reader.file_bytes();
             entry.fingerprint = reader.content_fingerprint();
             bank_rank         = std::max(bank_rank, entry.rank);
+            any_decision      = any_decision || entry.kind == LoraAdapterKind::Decision;
             united.merge(entry.inventory);
             discovery.pool.push_back(std::move(entry));
         } catch (const std::exception& failure) {
@@ -488,7 +695,7 @@ LoraDiscovery discover_lora_pool(const LoraOptions& options,
                                     "' holds no '.ninfer' adapter");
     }
 
-    discovery.profile = build_bank_profile(united, bank_rank);
+    discovery.profile = build_bank_profile(united, bank_rank, any_decision);
     return discovery;
 }
 
@@ -523,7 +730,25 @@ LoraBank::LoraBank(LoraDiscovery discovery, std::uint32_t slots, DeviceContext& 
     view_.device_bytes = device_bytes_;
     view_.pool         = this;
     view_.fingerprints.reserve(pool_.size());
-    for (const LoraPoolEntry& entry : pool_) { view_.fingerprints.push_back(entry.fingerprint); }
+    view_.kinds.reserve(pool_.size());
+    view_.decision_temperatures.reserve(pool_.size());
+    for (const LoraPoolEntry& entry : pool_) {
+        view_.fingerprints.push_back(entry.fingerprint);
+        view_.kinds.push_back(entry.kind);
+        view_.decision_temperatures.push_back(
+            entry.kind == LoraAdapterKind::Decision ? entry.decision.temperature : 1.0F);
+    }
+    if (profile_.decision_head) {
+        // Weights are row-major [pointer_dim, hidden]; shapes list the contiguous extent first.
+        const DecisionHeadPlan& head          = *profile_.decision_head;
+        qwen3_8::DecisionHeadWeights& weights = view_.decision_head;
+        weights.query_weight =
+            Tensor(base_ + head.query_weight, DType::BF16, {kHidden, kPointerDim});
+        weights.query_bias = Tensor(base_ + head.query_bias, DType::BF16, {kPointerDim});
+        weights.key_weight = Tensor(base_ + head.key_weight, DType::BF16, {kHidden, kPointerDim});
+        weights.key_bias   = Tensor(base_ + head.key_bias, DType::BF16, {kPointerDim});
+        weights.slot_stride = static_cast<std::size_t>(slab);
+    }
     for (std::size_t index = 0; index < kFullAttentionLayers; ++index) {
         const LoraFullLayerPlan& source     = profile_.full_layers[index];
         qwen3_8::LoraFullLayerWeights& view = view_.full_layers[index];
@@ -579,6 +804,19 @@ void LoraBank::assemble(const LoraPoolEntry& entry, const artifact::Reader& read
             copy_site(plan.output, gdn_output_site(layer), have.output);
             copy_site(plan.down, mlp_down_site(layer), have.down);
         }
+    }
+
+    // The head is copied verbatim: its geometry is fixed, so it needs no padding.
+    if (profile_.decision_head && entry.kind == LoraAdapterKind::Decision) {
+        const DecisionHeadPlan& head = *profile_.decision_head;
+        const auto copy_head         = [&](std::string_view name, std::uint64_t offset) {
+            const artifact::PayloadSpan payload = reader.payload(name);
+            std::memcpy(slab + offset, payload.data.data(), payload.data.size());
+        };
+        copy_head(kHeadQueryWeight, head.query_weight);
+        copy_head(kHeadQueryBias, head.query_bias);
+        copy_head(kHeadKeyWeight, head.key_weight);
+        copy_head(kHeadKeyBias, head.key_bias);
     }
 }
 

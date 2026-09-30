@@ -185,6 +185,57 @@ baselines, the per-stratum headline, the competence and JSON gates, and the stre
 runs at a rank and schedule that experiment specifies against. Its authority is
 `llm-datasets/docs/persona-adapter.md`; nothing here should be read as a result for it.
 
+### 3.3 REVISIT: decision adapters use only these six modules
+
+> Deliberate limitation, chosen 2026-09-29. Re-evaluate once served decision metrics exist.
+
+System One decision adapters (§4.6) use exactly the registered module set above plus the pointer
+head. The reference decision model, Kev-27B on the same `Qwen/Qwen3.8-27B` base, adapts every linear
+layer: attention q/k/v/o, the GDN input projections and `out_proj`, and MLP gate/up/down. The
+excluded families are excluded for the structural reasons in the table above, and accepting that for
+decisions keeps the shared LoRA kernels, the chat adapters' prefill/decode cost, and the slab size
+unchanged; rank remains the capacity lever.
+
+**Risk.** Decision accuracy and calibration may fall below the all-linear recipe. Part of any gap
+also comes from NF4 QLoRA training and quantized serving, so the two causes have to be separated
+before blaming the site set.
+
+**Evidence, 2026-09-29.** `systemone-decision-v7` was trained at rank 16 on the six modules plus the
+head, for one epoch on the decision-v7 train split, with `T = 1.414`. It was served from the
+groupwise-int artifact with BF16 KV on an RTX 4090, and `llmdata.probes.systemone` scored the
+clean knowable questions. The locked test partition was scored once, on the final build:
+
+| | Questions | Accuracy | Brier | NLL | ECE |
+|---|---:|---:|---:|---:|---:|
+| served, development | 1,264 | 0.871 | 0.184 | 0.356 | 0.024 |
+| served, locked test | 1,200 | 0.856 | 0.190 | 0.355 | 0.020 |
+| trainer, NF4 base, development at `T` | 1,264 | 0.876 | 0.181 | 0.345 | 0.027 |
+| Kev-27B, published, development / locked test | | 0.866 / 0.870 | | | |
+
+Kev publishes no decision-v7 Brier. The accuracy standard error is about 0.01 on each split.
+Development is 0.005 above Kev-27B and the locked test 0.014 below it, 1.4 standard errors. Neither
+split shows a significant gap to the all-linear recipe, though the test point estimate is lower.
+Kev-27B also trained on `round6/b1v2` (decision-v7 plus date, unknowable, long-state and soft-target
+records), a superset of the data here. On the test, `score` questions are the weakest type (0.596,
+against 0.913 for `choice` and 0.929 for `noul`), as they are on development.
+
+The served-to-trainer difference comes from the training base, not from the engine or the site set.
+Over the 280 gate questions, the PyTorch row-form reference on the `.ninfer` base differs from the
+trainer's NF4 rows by max |Δp| 0.166 (mean 0.020, 5 argmax flips). The served engine differs from
+that reference by 0.029 (mean 0.0025, no flips). The KV codec does not move these metrics
+measurably ([serving fidelity](../serving.md#system-one-fidelity)).
+
+**Evidence still to collect.** Optionally, a PyTorch-only control trained with all-linear targets on
+the same data and recipe and evaluated in the trainer. It would isolate the site effect. Kev-27B's
+better-known 0.896 / 0.160 figures are the out-of-domain transfer-v4 locked test, not decision-v7.
+
+**What revisiting would take.** LoRA inside `linear_swiglu` as a pre-activation delta for gate and
+up; LoRA inside `gdn_input_proj` and its conv snapshot/record forms; larger slabs in every slot
+(gate/up alone is about 92 MB per slot at rank 16 and 369 MB at rank 64, GDN inputs about 33 MB per
+slot at rank 16); slower LoRA prefill/decode for chat adapters too; and updates to the converter and
+binder site tables and to the `llm-datasets` target profile. The same note lives in
+`llm-datasets/docs/targets/qwen3_8_27b.md`.
+
 ## 4. Adapter artifact contract
 
 ### 4.1 Container
@@ -269,6 +320,70 @@ base_model.model.model.layers.{l}.self_attn.q_proj.lora_A.weight
 
 PEFT convention: `lora_A.weight` is `[r, in_features]`, `lora_B.weight` is `[out_features, r]`.
 Writes a `<out>.conversion.json` report mirroring `tools/convert/qwen3_8/common/conversion.py:187-243`.
+
+### 4.6 Decision adapters
+
+An adapter has one of two kinds under the same `qwen3.8-27b/lora-bf16` identity. A **generative**
+adapter carries only the factors above and serves chat. A **decision** adapter additionally carries
+the System One pointer head and serves only `/systemone` decisions; each kind is rejected on the
+other's route. The kind is the presence of the head: all five objects below are present together or
+not at all, and the binder rejects a partial set.
+
+```
+decision/head/query/weight    BF16 [256,5120]
+decision/head/query/bias      BF16 [256]
+decision/head/key/weight      BF16 [256,5120]
+decision/head/key/bias        BF16 [256]
+decision/metadata             raw-bytes-v1 UTF-8 JSON
+```
+
+The head is kev's `PointerHead`, read from the final-RMSNorm hidden state `h` at each option's
+closing `<|box_end|>` and at the question's decide `<|fim_suffix|>`:
+
+```
+q = Wq h_decide + bq,   k_i = Wk h_option_i + bk,   p = softmax_i((k_i . q) / (16 T))
+```
+
+`decision/metadata` holds exactly these keys, each validated at conversion and again at discovery:
+
+| Key | Value |
+|---|---|
+| `format`, `format_version` | `ninfer-decision-head`, `1` |
+| `pointer_dim`, `hidden_size` | `256`, `5120` |
+| `logit_scale` | `0.0625` (the `1/16` above) |
+| `temperature` | calibrated `T > 0`, exactly representable in FP32 |
+| `readout` | `final_norm` |
+| `escape` | `kev-v1`: `<\|name\|>` in rendered text becomes `<¦name¦>` before tokenization |
+| `delimiters` | role → token: `state` `<\|fim_prefix\|>`, `question` `<\|fim_middle\|>`, `option_open` `<\|box_start\|>`, `option_close` `<\|box_end\|>`, `decide` `<\|fim_suffix\|>` |
+| `description`, `release_date` | served on `GET /systemone/v1/models`; `release_date` is `YYYY-MM-DD` |
+| `base_model` | the trainer's base checkpoint, recorded for provenance |
+
+The engine resolves the delimiter names through the base tokenizer at load and rejects an adapter
+whose recorded delimiters differ from the registered set. Temperature, description, and release date
+are host-side pool metadata; the head Op receives `1/(16 T)` as a scalar.
+
+Conversion takes the trainer's hand-off file by its canonical name, never by glob:
+
+```
+python3 -m tools.convert.qwen3_8_27b.convert_lora --adapter <peft_dir> \
+  --decision-head <peft_dir>/decision_head.safetensors \
+  --description "..." --release-date YYYY-MM-DD --out <name>.lora.ninfer
+```
+
+`decision_head.safetensors` holds FP32 `query.weight` `[256,5120]`, `query.bias`, `key.weight`, and
+`key.bias`, with safetensors metadata `format=systemone-pointer-head`, `format_version=1`,
+`pointer_dim`, `hidden_size`, `logit_scale`, `temperature`, `readout`, `escape`, `delimiters`
+(JSON), and `base_model`. The converter rounds the head to BF16, validates shapes, the delimiter set,
+and the scale, and records `kind` and the decision metadata in the conversion report.
+
+**Slab.** When the pool holds any decision adapter, every slot gains a head region after its sites:
+2 × (256 × 5120 + 256) × 2 B = 5.0 MiB per slot. A generative occupant stages zeros there, and no
+decision reads a generative slot because decisions select only decision adapters. A pool without a
+decision adapter has no head region, so chat-only deployments pay nothing.
+
+**Identity.** The adapter's content fingerprint is the complete-artifact SHA-256, so it covers the
+head and its metadata: a head-only retrain or a recalibrated temperature is a different adapter scope
+and never reuses the previous adapter's cached states.
 
 ## 5. Op contract — `ops::lora_delta_add`
 
@@ -819,7 +934,8 @@ the feature as a whole, because per-column adapter routing is the one genuinely 
 | # | Layer | Requires | Location |
 |---|---|---|---|
 | 1 | Op unit test — tiers 1/2/3 against the FP32 oracle, bank built in memory, including `adapter_index < 0` | GPU only | `tests/ops/test_lora_delta_add.cpp` and `tests/ops/lora/`, following `tests/ops/op_check.h` and `op_tester.h` |
-| 2 | Converter — synthetic PEFT → `.ninfer`, object inventory, decoded values, rejection of excluded modules | nothing | `tests/targets/qwen3_8_27b/` |
+| 2 | Converter — synthetic PEFT → `.ninfer`, object inventory, decoded values, rejection of excluded modules; a decision head round-trips exactly and every head/metadata contract violation is rejected | nothing | `tests/targets/qwen3_8_27b/test_lora_convert.py` |
+| 2b | Pool and slab — union profile, rank padding, restaging without residue; with a decision adapter, the head region is planned, holds the artifact's head bytes for a decision occupant and zeros for a generative one | two adapters, one of them a decision adapter for the head arm | `tests/targets/qwen3_8_27b/test_lora_pool.cpp` |
 | 3 | Reference vs engine — a trained adapter, applied at the same sites, read from the PEFT directory so a converter fault cannot be inherited | BF16 checkpoint, a PEFT adapter | `tools/reference/qwen3_8_27b/lora.py`, `--lora` on `cli.py` |
 | 4 | Engine — a trained adapter moves the **first** greedy token; a zero adapter does not, and does not leak; a mixed-adapter decode batch matches sequential runs; prefix reuse is isolated in both directions; multimodal prefill applies the adapter; a saved slot keeps its adapter identity; an adapted long prefill fits the workspace; a `gdn/output`-only adapter moves the output, isolating the correction on the 48 GDN layers | `models/qwen3_8_27b.ninfer`, two co-registerable adapters, and a one-site GDN fixture | `tests/targets/qwen3_8_27b/test_engine_lora_real.cpp` |
 | 5 | Serving — `/v1/models`, 404 on unknown, routing, mixed batch, prefix isolation | `models/qwen3_8_27b.ninfer` | `tests/test_serve_options.cpp`, `test_openai_schema.cpp`, live server |
@@ -832,6 +948,10 @@ exit 77 without it; layer 4 additionally needs `NINFER_QWEN3_8_27B_LORA_ZERO`,
 inventory so the test isolates adapter application from union-profile normalization; the third is a
 one-site fixture built with
 `make_synthetic_lora.py --kind random --sigma 0.2 --sites gdn/output` and gets its own Engine.
+Layer 2b reads `NINFER_QWEN3_8_27B_LORA_ZERO` with `NINFER_QWEN3_8_27B_LORA_GDN_ONLY` for the union
+arm and with `NINFER_QWEN3_8_27B_LORA_DECISION` for the head arm; the decision fixture is any
+adapter converted with `--decision-head`, for example a synthetic one from
+`make_synthetic_lora.py --decision-head`.
 
 Layer 4 exists because the coverage claim that used to stand here was false. It read: a zero adapter
 reproduces the base byte-identically while a dense adapter diverges, therefore "the correction is

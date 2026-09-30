@@ -100,6 +100,11 @@ The work specific to this branch, each with the measurement that established it:
   moved held-out reward on unseen puzzles from 0.6029 to 0.8624, then converted, banked and served
   through exactly the same runtime path as an SFT adapter. Adapter training and its evaluation are
   owned by the separate `llm-datasets` repository. [Details](#runtime-lora-adapters)
+- **System One decisions.** A decision adapter — a LoRA adapter plus a calibrated pointer head —
+  answers TypeSafe's System One protocol (`noul`, `choice` and `score` questions over one state)
+  under `/systemone`, so the TypeSafe SDK works against it unchanged. Decisions share the chat
+  process's weights, KV pool and adapter slots, never sample or decode, and reproduce kev's request
+  rendering, token layout and answer arithmetic exactly. [Details](docs/serving.md#system-one-decisions)
 
 ## Measured results on the RTX 4090
 

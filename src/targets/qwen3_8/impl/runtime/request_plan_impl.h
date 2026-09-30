@@ -237,7 +237,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // A resident prefix produced under a different adapter is not reusable: its KV and GDN
     // recurrent state encode that adapter's weights.
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained &&
-        sequence.adapter == base.adapter) {
+        !sequence.decision_state && sequence.adapter == base.adapter) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;

@@ -354,6 +354,39 @@ logical B:       3
 
 empty slot 不进入 model batch，因此 slot reuse 或 hole 不需要不同的 execution model。
 
+### 4.5 System One decision
+
+System One decision（`Engine::submit_decision`/`decide`，27B target）与 generation 进入同一 bounded
+FIFO，由同一 protected admission 授予 slot/lane 与 state entitlement，并与 generation 共享 weights、KV
+pool、LoRA slots（admission 时同样按 LRU swap）和 shared workspace。它是 prefill-only request：
+
+```text
+RECEIVED → WAITING → PREFILL(state chunks, branch units) → MODEL_FINISHED
+```
+
+- 它从不进入 `DECODE_READY`，也不参与 decode round：没有 sampling、RNG、stop、output session、MTP
+  proposal 或 turn checkpoint。最后一个 unit 直接产出全部 question 的 probabilities。
+- Units：未复用的 state suffix 按 `prefill_chunk` 切成普通 prefill chunks；之后每个 packed branch pass
+  （按 first-fit 把若干短 branch 装进至多 `prefill_chunk` 列）和每个长 branch 的每个 chunk 各是一个
+  `PrefillChunk(request)` unit。Admission 的 service work 与这些 units 一一对应。
+- Branch 只看到 state 与自身。Packed pass 由 segmented mixers 一次执行：attention 对每个 segment 读取
+  state 的 KV `[0,Ls)` 和自身 causal past，GDN convolution/recurrence 让每个 segment 从 lane 的 current
+  slot 起步；它们只读该 slot，不写出任何 final state。长 branch 先把 current slot `copy_slot` 到
+  turn-checkpoint slot，再在该副本上逐 chunk prefill。Branch KV 写在 `Ls` 之后、该 lane 自己的 pages
+  中（`paged-kv-cache.md` §9.6），只在当前 unit 内被读取。
+- 完成时 KV trim 回 `Ls`，释放 growth entitlement；`allow_prefix_reuse` 时 lane 把 `[0,Ls)` 保留为
+  retained decision state（带 adapter），否则清空 lane。下一 decision 仅在 adapter 相同、其 state tokens
+  以 retained frontier 为前缀时复用它，只 prefill 剩余 state suffix。Generation 不复用 decision state，
+  decision 也不复用 generation 的 retained state。
+- L2/L3 只匹配完整的 exact state（`continuation-cache.md` 的 System One decision states 一节）：提交时
+  decision 只按 adapter-scoped exact-state alias 查询 descriptors；admission 仅在没有 idle lane retained
+  整个 state 时，把 `decision_state` image（main-text KV `[0,Ls)` 与 current GDN slot）restore 到一个
+  idle lane，之后只运行 branch units。完成时若提交时的查询没有可用 image，执行线程只 fence lane 并入队，
+  由 publication worker 导出并发布。前缀延伸复用仍只属于 L1 lane planning；chat 与 decision 的 image
+  互不消费。
+- Cancellation 在 unit boundary 生效：未完成的 decision 丢弃 lane state，与 generation 的 prefill
+  cancellation 相同。
+
 ---
 
 ## 5. Request ingress and admission
@@ -791,7 +824,8 @@ PrefillChunk(request)
 DecodeRound(all decode-ready requests)
 ```
 
-完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。
+完整 request 不是 scheduling unit。所有 GPU work 在一条 execution lane 上串行执行。System One
+decision 的 state chunk、packed branch pass 和长 branch chunk 都以 `PrefillChunk(request)` 提交（§4.5）。
 
 Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
 复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；

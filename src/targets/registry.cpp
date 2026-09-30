@@ -133,7 +133,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
-    summary.lora_adapter_names   = std::move(lora.names);
+    summary.lora_adapters        = std::move(lora.adapters);
+    summary.decisions_supported  = Target::supports_decisions;
     summary.lora_rank            = lora.rank;
     summary.lora_slots           = lora.slots;
     summary.lora_device_bytes    = lora.device_bytes;

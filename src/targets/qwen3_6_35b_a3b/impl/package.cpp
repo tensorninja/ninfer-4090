@@ -11,6 +11,8 @@
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 
+static_assert(Package::supports_decisions == Variant::supports_decisions);
+
 class LoadPlan::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan)

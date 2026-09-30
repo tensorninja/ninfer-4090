@@ -7,6 +7,7 @@
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
+#include "serve/systemone_service.h"
 
 #include <httplib.h>
 
@@ -35,6 +36,12 @@ public:
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
 
+    // The decision adapter the System One SDK-default model name answers with; empty when the
+    // alias is unbound or no service is attached.
+    [[nodiscard]] std::string systemone_alias_binding() const {
+        return systemone_ ? systemone_->alias_binding() : std::string();
+    }
+
     // Resolves an API `model` string to the adapter it selects. Returns nullopt when the string
     // names no served model; an empty string means the base weights.
     [[nodiscard]] std::optional<std::string> resolve_model(const std::string& model) const;
@@ -60,12 +67,20 @@ private:
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_telemetry(const httplib::Request& req, httplib::Response& res) const;
     void handle_events(const httplib::Request& req, httplib::Response& res);
+    // System One (TypeSafe) routes under the /systemone base path.
+    void handle_systemone(const httplib::Request& req, httplib::Response& res);
+    void handle_systemone_models(const httplib::Request& req, httplib::Response& res) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
     void log_request_start(const RequestLogContext& context);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void log_request_error(const RequestLogContext& context, const std::string& message);
+    void log_decision_start(const DecisionLogContext& context);
+    void log_decision_done(const DecisionLogContext& context, const ninfer::DecisionResult& result,
+                           std::uint32_t output_tokens);
+    void log_decision_error(const DecisionLogContext& context, int status,
+                            const std::string& message);
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
@@ -84,6 +99,8 @@ private:
     // Served model id per registered adapter, in bank order: `<public model id>-<adapter name>`.
     std::vector<std::string> adapter_model_ids_;
     std::vector<std::string> adapter_names_;
+    // Present once a service is attached.
+    std::optional<SystemOneService> systemone_;
     ResponseStore response_store_;
     ServeMetrics metrics_;
     EventStream events_;

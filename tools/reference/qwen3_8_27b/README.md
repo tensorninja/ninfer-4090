@@ -43,3 +43,27 @@ preparation. Multimodal MTP uses the composed Vision embedding for the shifted i
 prefill chunk boundaries.
 
 The target-specific source-BF16 Vision comparison lives in `tools/parity/qwen3_8_27b/`.
+
+## Decisions
+
+`decision.py` is the row-form System One oracle for engine decision probabilities:
+
+```bash
+python3 -m tools.reference.qwen3_8_27b.decision \
+  --weights out/qwen3_8_27b.ninfer \
+  --lora <peft_dir> --decision-head <peft_dir>/decision_head.safetensors \
+  --prepared prepared.jsonl --out probabilities.jsonl
+```
+
+`--prepared` takes the engine's `ninfer-decision-prepared` token layout, one JSON object or a
+`.jsonl` file of them, and checks that every readout offset lands on its delimiter. The state row is
+prefilled once and snapshotted. Each branch is then prefilled from that snapshot at positions
+starting at the state length, so it sees the state and itself only. kev's PointerHead reads the
+final-norm hidden states at each option's `<|box_end|>` and at the branch's `<|fim_suffix|>`. The
+output head never runs. The head comes from the trainer's `decision_head.safetensors`, rounded to
+BF16 and evaluated in FP64. The LoRA comes from the PEFT directory, as with `--lora` for chat.
+
+The output is one `ninfer-decision-probabilities` object per prepared object, with one probability
+list per question in branch order. `--temperature` overrides the head's `T`, and `--kv-dtype`,
+`--prefill-chunk`, `--gpu-memory`, and `--headroom` work as they do for chat. All inputs share one
+model load. `decide(model, head, prepared)` exposes the same computation to parity drivers.

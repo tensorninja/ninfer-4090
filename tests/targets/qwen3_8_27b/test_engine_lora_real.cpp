@@ -132,8 +132,15 @@ std::vector<ninfer::TokenId> run(ninfer::Engine& engine, std::uint32_t output_to
 
 // Discovery names an adapter by its file stem and orders the pool by file name.
 int verify_registration(const ninfer::Engine& engine) {
-    const ninfer::LoadSummary& load       = engine.load_summary();
-    const std::vector<std::string>& names = load.lora_adapter_names;
+    const ninfer::LoadSummary& load = engine.load_summary();
+    std::vector<std::string> names;
+    for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+        if (adapter.kind != ninfer::LoraAdapterKind::Generative) {
+            std::cerr << "adapter " << adapter.name << " is not generative\n";
+            return 1;
+        }
+        names.push_back(adapter.name);
+    }
     if (names.size() != 2 || names[0] != kTrainedName || names[1] != kZeroName) {
         std::cerr << "discovered adapter names are wrong: " << names.size() << " entries\n";
         return 1;

@@ -265,6 +265,59 @@ Chunking limits workspace. It does not reset positions or state between chunks.
 
 The eager and CUDA Graph record/replay paths execute the same model schedule.
 
+### System One decisions
+
+A decision is a prefill-only request for a decision adapter: the adapter's LoRA sites plus a
+pointer head. Its layout is kev's row form. The state row is `[<|fim_prefix|>, state...]`, with
+`Ls` tokens including the delimiter. Each question `q` adds one branch,
+`[<|fim_middle|>, instructions..., (<|box_start|>, option_k..., <|box_end|>) for k = 1..K,
+<|fim_suffix|>]`, with delimiter ids 248060, 248061, 248049, 248050 and 248062.
+
+Every branch continues the state alone:
+
+- branch token `j` has position `Ls + j`, so positions restart at `Ls` for every branch;
+- attention sees the state `[0, Ls)` and the branch's own tokens `[0, j]`, never another branch;
+- the GDN causal convolution and recurrence start from the state's final window and state, and no
+  branch's final state is kept.
+
+After the final `(1+w)` RMSNorm, the readouts are the hidden columns of the branch's last token
+(`h_d`) and of each option's `<|box_end|>` (`h_k`). The pointer head is BF16 `W_q, W_k [256,5120]`
+and `b_q, b_k [256]`, with the adapter's calibrated temperature `T`:
+
+```text
+q   = W_q h_d + b_q
+k_k = W_k h_k + b_k
+z_k = (k_k · q) / sqrt(256) / T
+p   = softmax_k(z)            over the question's K options
+```
+
+No `lm_head` runs, nothing is sampled, and no MTP state exists for a decision lane.
+
+Execution follows these semantics without materializing a row per question. The state is prefilled
+like a prompt, continued from a retained decision state of the same adapter, or imported from that
+adapter's L2/L3 image of exactly this state
+([decision states](../continuation-cache.md#system-one-decision-states)). Branches that fit a
+pass are packed first-fit, in request order, into passes of at most `prefill_chunk` columns. A pass
+streams the weights once over all its columns, with a host-built RoPE position vector. Only the
+sequence mixers are segment-aware: branch K/V go through the lane's KV codec into scratch positions
+`[Ls + c_s, Ls + c_s + T_s)` above the state, attention streams the state's keys once per tile of
+branch columns, whichever segments the tile spans, before each column attends to its own segment's
+earlier keys, and the GDN convolution and recurrence run each segment from the resident read-only
+state. A branch
+longer than a pass runs chunk by chunk from a copy of the state's GDN slot, with its K/V at
+`[Ls, Ls + T_b)`. Completion drops every position above `Ls`, which is a host page-map update, and
+the lane keeps `[0, Ls)` as a retained decision state.
+
+Every unit of a decision, state chunks and branch passes alike, runs in `TextPhase::Decision`: its
+GEMMs take BF16 activations and never the group-64 INT8 activation profile that chat prefill
+admits, because that profile alone moves decision probabilities past kev's serving tolerance. A
+pass still selects its A16 routes by width, so a question's probabilities vary, at BF16 accumulation
+scale, with the other questions that share its request. State and branch K/V pass through the
+server's KV codec like chat K/V, so the codec is part of a decision's numerics
+([serving fidelity](../serving.md#system-one-fidelity)). A repeated cold request is bit-identical,
+and a restored state is behaviorally equivalent to a cold one. An imported image is a byte copy of
+the state that published it, so a decision on it is bit-identical to one continuing that state.
+
 ## 7. MTP draft model
 
 The checkpoint contains one MTP decoder layer. It is a small draft model conditioned on both the

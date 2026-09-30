@@ -4,6 +4,7 @@
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "runtime/cache/continuation_cache.h"
+#include <ninfer/targets/qwen3_8/decision.h>
 #include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include <cstddef>
@@ -25,9 +26,14 @@ namespace ninfer::targets::qwen3_8 {
 // the thread that decoded it to the executor thread that imports it, and never inspects it.
 struct DecodedContinuation;
 
+// The pass kind a target leaf runs in. It selects the activation-compute profile a leaf may admit:
+// INT8 activations are admitted in Prefill only. Decision is a System One pass (state chunk,
+// packed branch pass or long-branch chunk): prefill-shaped, but held to the A16 profile so that
+// decision probabilities stay within the serving tolerance of the BF16 evaluation path.
 enum class TextPhase {
     Prefill,
     Verify,
+    Decision,
 };
 
 struct GraphExecutionProfile {
@@ -214,7 +220,51 @@ public:
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,
                                                                 runtime::TransientRegion transient);
+    // Advances a staged generation prefill or a decision by one unit.
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+    // System One decisions. A decision plans into the same base and lane plans as a generation,
+    // is admitted under the same lane/KV/adapter rules, and runs as a prefill lane whose units are
+    // its state chunks, branch passes and long-branch chunks; it never joins a decode batch. Once
+    // advance_prefill_lane reports it complete, take_decision_lane returns its probabilities and
+    // leaves the state [0, state_tokens) retained when the plan allows reuse. A retained decision
+    // state is continued only by a later decision of the same adapter.
+    [[nodiscard]] RequestBasePlan<Variant>
+    plan_decision_base(const DecisionPrompt& prompt,
+                       const runtime::ResolvedDecisionOptions& options);
+    [[nodiscard]] RequestPlan<Variant> plan_decision_for_lane(std::uint32_t lane,
+                                                              const DecisionPrompt& prompt,
+                                                              const RequestBasePlan<Variant>& base);
+    [[nodiscard]] runtime::PrefillStepResult start_decision_lane(std::uint32_t lane,
+                                                                 DecisionPrompt&& prompt,
+                                                                 RequestPlan<Variant>&& plan);
+    [[nodiscard]] DecisionOutcome take_decision_lane(std::uint32_t lane);
+    [[nodiscard]] bool retained_lane_holds_decision(std::uint32_t lane) const noexcept;
+    // Continuation image kind `decision_state`: a retained decision state, its text KV and GDN
+    // slot only. It is named by the alias of its exact state row (empty for a state that cannot be
+    // named; the caller scopes it by adapter like every alias) and restored only for a decision of
+    // exactly that state and adapter; continuing a shorter retained state stays L1 lane planning.
+    // These calls mirror the chat continuation calls below. A decision call never accepts a chat
+    // image and a chat call never accepts a decision image. The export follows
+    // `fence_lane_for_export` under the same contract as `export_continuation_lane_background`.
+    [[nodiscard]] std::optional<std::string> decision_state_alias(const DecisionPrompt& prompt) const;
+    [[nodiscard]] cache::ContinuationImage
+    export_decision_state_background(std::uint32_t lane) const;
+    [[nodiscard]] std::uint32_t
+    preflight_decision_state_metadata(const cache::SessionCandidateDescriptor& candidate,
+                                      const DecisionPrompt& prompt) const noexcept;
+    // The state extent when the image is exactly the decision's state under `adapter`, else zero.
+    [[nodiscard]] std::uint32_t
+    preflight_decision_state(const cache::ContinuationImage& image, const DecisionPrompt& prompt,
+                             std::int32_t adapter,
+                             std::uint32_t* divergence_tokens = nullptr) const noexcept;
+    [[nodiscard]] std::shared_ptr<DecodedContinuation>
+    decode_decision_state(const cache::ContinuationImage& image) const;
+    // Leaves the lane holding the retained decision state that completing this decision cold
+    // would have left, reserved for the decision's planned `entitlement`.
+    [[nodiscard]] ContinuationRestoreFailure
+    import_decision_state_lane(std::uint32_t lane, const cache::ContinuationImage& image,
+                               const DecodedContinuation& decoded, const DecisionPrompt& prompt,
+                               std::int32_t adapter, runtime::KvPageFootprint entitlement) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);

@@ -736,6 +736,20 @@ release:
 Slot 和 device table rows 随后可以复用。Network response lifetime 不延长 KV ownership。
 Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改 in-flight round mappings。
 
+### 9.6 System One decision
+
+Decision（`concurrent-inference-architecture.md` §4.5）只使用 Main Text pool，不使用 backend pool。
+Admission 一次性 reserve `ceil((Ls + scratch) / P_main)` pages，`scratch = max(min(短 branch 总长,
+pass 列数), 最长的长 branch)`；超过 Engine context capacity 时以 `ContextLengthExceeded` 拒绝。
+
+- State `[0,Ls)` 与普通 prompt prefill 相同，按 chunk 推进 frontier。
+- Branch KV 是 `Ls` 之上的 scratch，位于该 lane 自己的 pages 中：packed pass 的第 `i` 列写入 position
+  `Ls + i`，因此 segment `s` 占 `[Ls + c_s, Ls + c_s + T_s)`；长 branch 的连续 chunks 从 `Ls` 起写入。
+  Scratch 只在写入它的 unit 内被读取，从不成为 committed frontier。Branches 彼此不可见；state pages
+  不跨 lane 共享（§1.1）。
+- 完成时按 §9.4 truncate 到 `Ls`（host page-map 更新，不复制 payload），取消剩余 reservation；
+  `allow_prefix_reuse` 时 bundle 作为 retained decision state 进入 Prefix Cache，否则 release。
+
 ---
 
 ## 10. Prefix reuse
@@ -1058,6 +1072,7 @@ storage/view boundary。
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
 | `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| `gqa_attention_segmented` | writable `PagedKVBatchLayerView` + `table_rows[1]` + host `prefix` | 把 `N` 个 columns 写到 `[prefix,prefix+N)`，再对 shared prefix 执行一次 segment-causal Attention；其余 rows 不变 |
 | `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
 | `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
 | `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
@@ -1089,6 +1104,12 @@ RoPE/MRoPE coordinate。对 row `b` 的 query position `p`，causal visible doma
 
 `gqa_attention_cached` 和 `gqa_kv_append` 保留 single-sequence `[D,H,T]` tensor domain，用于 prefill
 拆分路径，不构成第二套 growing-cache storage contract。
+
+`gqa_attention_segmented` 只注册 27B group-6 geometry：Q/Out BF16 `[256,24,N]`、K/V BF16
+`[256,4,N]`、`segments` I32 `[2,S]`（`(c_s,T_s)` 按序铺满 `[0,N)`）、`table_rows` I32 `[1]`，以及 host
+`prefix`。属于 segment `s` 的 column `i` 可见 `[0,prefix) ∪ [prefix+c_s,prefix+i]`，segments 之间互不可见；
+自身 columns 与 prefix 一样读取 codec 编码后的 cache 值。Workspace capacity 只由 `N` 上界决定，与
+`prefix` 无关。
 
 DFlash full-context entry 使用 `[D,H,W,B]` query block、per-row `context_lengths[B]`、
 `valid_columns[B]` 和 `table_rows[B]`。每行只读取自己 allocation 的 context `[0,Lb)`，再加该行完整

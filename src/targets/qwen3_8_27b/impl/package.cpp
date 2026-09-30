@@ -12,6 +12,8 @@
 
 namespace ninfer::targets::qwen3_8_27b::detail {
 
+static_assert(Package::supports_decisions == Variant::supports_decisions);
+
 class LoadPlan::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan)
@@ -120,8 +122,17 @@ LoraAttachment Package::attach_lora(LoadedModel& model, const EngineOptions& opt
     data.runtime.lora = bank.view();
 
     LoraAttachment attachment;
-    attachment.names.reserve(bank.pool().size());
-    for (const detail::LoraPoolEntry& entry : bank.pool()) { attachment.names.push_back(entry.name); }
+    attachment.adapters.reserve(bank.pool().size());
+    for (const detail::LoraPoolEntry& entry : bank.pool()) {
+        LoraAdapterInfo info{.name = entry.name, .kind = entry.kind, .rank = entry.rank};
+        if (entry.kind == LoraAdapterKind::Decision) {
+            info.temperature  = entry.decision.temperature;
+            info.pointer_dim  = static_cast<std::uint32_t>(detail::DecisionConfig::pointer_dim);
+            info.description  = entry.decision.description;
+            info.release_date = entry.decision.release_date;
+        }
+        attachment.adapters.push_back(std::move(info));
+    }
     attachment.rank         = bank.profile().rank;
     attachment.slots        = bank.slots();
     attachment.device_bytes = bank.device_bytes();

@@ -117,7 +117,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N] "
            "[--default-max-tokens N] "
-           "[--lora-dir DIR] [--lora-slots N] [--lora-rank N] "
+           "[--lora-dir DIR] [--lora-slots N] [--lora-rank N] [--systemone-default NAME] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--prefix-checkpoint-policy stable-turn|rolling-tool] "
            "[--continuation-cache off|l1|l1-l2|l1-l2-l3] "
@@ -164,7 +164,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --lora-dir discovers every .ninfer adapter in DIR; each is served as model\n"
            "         id <model>-<name>, where name strips .ninfer and a trailing .lora from the\n"
            "         filename. --lora-slots sets how many stay device-resident\n"
-           "         (default 2); the engine swaps the rest in on demand\n"
+           "         (default 2); the engine swaps the rest in on demand. A decision adapter is\n"
+           "         instead a System One model under /systemone (POST /systemone/v1/systemone,\n"
+           "         GET /systemone/v1/models), named by its filename\n"
+           "       --systemone-default binds the System One SDK default model jev-latest to a\n"
+           "         decision adapter; without it jev-latest answers with the only one\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -324,6 +328,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.lora.directory = std::filesystem::path(require_value("--lora-dir"));
             if (options.lora.directory.empty()) {
                 throw std::invalid_argument("--lora-dir must name a directory");
+            }
+        } else if (arg == "--systemone-default") {
+            options.systemone_default = require_value("--systemone-default");
+            if (options.systemone_default.empty()) {
+                throw std::invalid_argument("--systemone-default must name a decision adapter");
             }
         } else if (arg == "--lora-slots") {
             const int val = parse_nonnegative_int(require_value("--lora-slots"), "lora-slots");

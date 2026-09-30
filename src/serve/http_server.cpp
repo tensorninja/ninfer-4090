@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "product/systemone/answers.h"
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
@@ -87,7 +88,7 @@ nlohmann::json gpu_json(const GpuTelemetry& gpu, const ServerEnergyTotals& energ
             {"throttle_reasons", gpu.throttle_reasons}};
 }
 
-// One SSE frame carrying a complete schema-20 record. The record's own `event` field names the
+// One SSE frame carrying a complete schema-21 record. The record's own `event` field names the
 // frame so a browser can attach one listener per record type.
 std::string event_frame(std::string_view event, std::string_view payload) {
     std::string frame;
@@ -103,12 +104,51 @@ std::string event_frame(std::string_view event, std::string_view payload) {
 // Paths owned by the API. Everything else, under --web-dir, belongs to the dashboard's own
 // client-side router and resolves to the application shell.
 bool is_api_path(const std::string& path) {
-    static constexpr std::string_view kPrefixes[] = {"/v1/",     "/slots",     "/metrics",
-                                                     "/health",  "/telemetry", "/events"};
+    static constexpr std::string_view kPrefixes[] = {"/v1/",      "/systemone/", "/slots",
+                                                     "/metrics",  "/health",     "/telemetry",
+                                                     "/events"};
     for (const std::string_view prefix : kPrefixes) {
         if (path.rfind(prefix, 0) == 0) { return true; }
     }
     return false;
+}
+
+// The System One base path. Every response under it, errors included, speaks FastAPI's
+// {"detail": ...} shape and carries x-typesafe-request-id.
+bool is_systemone_path(const std::string& path) { return path.rfind("/systemone/", 0) == 0; }
+
+void ensure_typesafe_request_id(const httplib::Request& req, httplib::Response& res) {
+    if (!is_systemone_path(req.path) || res.has_header("x-typesafe-request-id")) { return; }
+    const std::string incoming = req.get_header_value("x-typesafe-request-id");
+    res.set_header("x-typesafe-request-id",
+                   incoming.empty() ? new_typesafe_request_id() : incoming);
+}
+
+// A System One failure as FastAPI renders an HTTPException. The TypeSafe SDK retries 408, 429 and
+// 5xx and reads retry-after-ms and retry-after.
+void write_systemone_error(httplib::Response& res, int status,
+                           const nlohmann::ordered_json& detail) {
+    std::string body;
+    try {
+        body = product::systemone::error_body(detail);
+    } catch (const std::exception&) {
+        // A validation error echoing a non-finite number: FastAPI fails rendering it too.
+        status = 500;
+        body   = product::systemone::error_body("Internal Server Error");
+    }
+    res.status = status;
+    if (status == 429 || status == 503) {
+        res.set_header("Retry-After", "1");
+        res.set_header("retry-after-ms", "1000");
+    }
+    res.set_content(std::move(body), "application/json");
+}
+
+// The detail of a status the server answers without a route, as Starlette words it ("Not Found"
+// for an unknown path).
+std::string systemone_status_detail(int status) {
+    if (status == 413) { return "request body exceeds the configured payload limit"; }
+    return httplib::status_message(status);
 }
 
 std::string_view record_event_name(const std::string& record) {
@@ -461,6 +501,28 @@ void HttpServer::log_request_error(const RequestLogContext& context, const std::
     metrics_.end_request(context.id);
 }
 
+void HttpServer::log_decision_start(const DecisionLogContext& context) {
+    log_line(format_decision_start(context));
+    events_.emit_decision_start(context);
+    metrics_.begin_request(context.id, static_cast<int>(context.summary.input_tokens()));
+}
+
+void HttpServer::log_decision_done(const DecisionLogContext& context,
+                                   const ninfer::DecisionResult& result,
+                                   std::uint32_t output_tokens) {
+    log_line(format_decision_done(context, result, output_tokens));
+    events_.emit_decision_done(context, result, output_tokens);
+    metrics_.end_request(context.id);
+    metrics_.record_decision(result);
+}
+
+void HttpServer::log_decision_error(const DecisionLogContext& context, int status,
+                                    const std::string& message) {
+    log_line(format_decision_error(context, status, message));
+    events_.emit_decision_error(context, status, message);
+    metrics_.end_request(context.id);
+}
+
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
     events_.emit_throughput(report);
@@ -573,6 +635,14 @@ void HttpServer::stop_stats_reporter() {
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_request_id(res);
+        ensure_typesafe_request_id(req, res);
+        // A status no System One route answered itself (an unknown path, an oversized body).
+        if (is_systemone_path(req.path)) {
+            if (res.body.empty()) {
+                write_systemone_error(res, res.status, systemone_status_detail(res.status));
+            }
+            return;
+        }
         // Single-page dashboard fallback. Registered API routes are matched before mount points,
         // so a 404 on a GET that is not an API path is a client-side route: serve the shell and
         // let the app resolve it. Reached only when --web-dir is configured.
@@ -613,7 +683,8 @@ void HttpServer::register_routes() {
               "X-Stainless-OS, X-Stainless-Package-Version, X-Stainless-Retry-Count, "
               "X-Stainless-Runtime, X-Stainless-Runtime-Version"},
              {"Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"},
-             {"Access-Control-Expose-Headers", "x-request-id, Retry-After"},
+             {"Access-Control-Expose-Headers",
+              "x-request-id, x-typesafe-request-id, Retry-After, retry-after-ms"},
              {"Access-Control-Max-Age", "86400"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -623,6 +694,7 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_request_id(res);
+        ensure_typesafe_request_id(req, res);
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -633,6 +705,12 @@ void HttpServer::register_routes() {
             req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
         const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
         if (!bearer_ok && !x_api_key_ok) {
+            if (is_systemone_path(req.path)) {
+                res.set_header("www-authenticate", "Bearer");
+                write_systemone_error(
+                    res, 401, "missing or invalid API key; send Authorization: Bearer <key>");
+                return httplib::Server::HandlerResponse::Handled;
+            }
             ApiError error;
             error.status  = 401;
             error.type    = "invalid_request_error";
@@ -648,12 +726,28 @@ void HttpServer::register_routes() {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
-    server_.set_post_routing_handler(
-        [](const httplib::Request&, httplib::Response& res) { ensure_request_id(res); });
+    server_.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        ensure_request_id(res);
+        ensure_typesafe_request_id(req, res);
+    });
 
     server_.set_exception_handler(
-        [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+        [](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
             ensure_request_id(res);
+            ensure_typesafe_request_id(req, res);
+            if (is_systemone_path(req.path)) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    write_console_log(ConsoleLogLevel::Error,
+                                      "unhandled System One exception: " + std::string(e.what()));
+                } catch (...) {
+                    write_console_log(ConsoleLogLevel::Error,
+                                      "unhandled non-standard System One exception");
+                }
+                write_systemone_error(res, 500, systemone_status_detail(500));
+                return;
+            }
             try {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {
@@ -682,7 +776,7 @@ void HttpServer::register_routes() {
     server_.Get("/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
         handle_telemetry(req, res);
     });
-    // The schema-20 record stream, identical to what --request-log-jsonl appends, as named SSE
+    // The schema-21 record stream, identical to what --request-log-jsonl appends, as named SSE
     // events. A new reader is replayed the retained server_start record and the recent ring
     // before live delivery begins.
     server_.Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -775,6 +869,16 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+    // System One (TypeSafe) under its own base path: SDK clients set
+    // base_url=http://host:port/systemone, and the root /v1/models stays OpenAI's.
+    server_.Get("/systemone/v1/models",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_systemone_models(req, res);
+                });
+    server_.Post("/systemone/v1/systemone",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_systemone(req, res);
+                 });
 
     // Mount points are consulted only after every route above misses, so serving the dashboard
     // cannot shadow an API path. Hashed asset filenames are immutable; the shell is not.
@@ -1006,6 +1110,43 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     res.set_content(
         make_model_object(id, unix_time_now(), options_.max_context, options_.enable_vision),
         "application/json");
+}
+
+void HttpServer::handle_systemone_models(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(systemone_->models_body(), "application/json");
+}
+
+void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response& res) {
+    std::optional<PreparedSystemOne> prepared;
+    try {
+        prepared.emplace(systemone_->prepare(req.body));
+    } catch (const SystemOneError& error) {
+        write_systemone_error(res, error.status(), error.detail());
+        return;
+    }
+
+    DecisionLogContext log_context;
+    log_context.id                 = ++request_seq_;
+    log_context.x_request_id       = res.get_header_value("x-typesafe-request-id");
+    log_context.model              = prepared->model;
+    log_context.adapter            = prepared->adapter;
+    log_context.summary            = prepared->decision.summary;
+    log_context.allow_prefix_reuse = options_.allow_prefix_reuse;
+    log_context.prepare_seconds    = prepared->decision.prepare_seconds;
+    log_decision_start(log_context);
+    try {
+        SystemOneOutcome outcome = systemone_->run(*prepared, [&req] {
+            return req.is_connection_alive && !req.is_connection_alive();
+        });
+        log_decision_done(log_context, outcome.result, outcome.output_tokens);
+        set_owned_content(res, std::move(outcome.body), prepared->decision.lifetime);
+    } catch (const SystemOneError& error) {
+        log_decision_error(log_context, error.status(), error.what());
+        write_systemone_error(res, error.status(), error.detail());
+    } catch (const std::exception& error) {
+        log_decision_error(log_context, 500, error.what());
+        throw;
+    }
 }
 
 void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Response& res) {
@@ -1439,12 +1580,16 @@ void HttpServer::attach(GenerationService& service) {
     }
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
-    adapter_names_                 = load.lora_adapter_names;
+    // Only generative adapters are OpenAI/Anthropic models; decision adapters are System One
+    // models and are served under the `/systemone` prefix.
+    adapter_names_.clear();
     adapter_model_ids_.clear();
-    adapter_model_ids_.reserve(adapter_names_.size());
-    for (const std::string& name : adapter_names_) {
-        adapter_model_ids_.push_back(public_model_id_ + "-" + name);
+    for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+        if (adapter.kind != ninfer::LoraAdapterKind::Generative) { continue; }
+        adapter_names_.push_back(adapter.name);
+        adapter_model_ids_.push_back(public_model_id_ + "-" + adapter.name);
     }
+    systemone_.emplace(service, options_, public_model_id_);
     service_                       = &service;
     events_.emit_server_start(options_, service.sampling_defaults(), public_model_id_, load,
                               service.memory_summary());

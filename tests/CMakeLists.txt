@@ -130,6 +130,13 @@ target_include_directories(ninfer_qwen3_8_tokenizer_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export
   ${PROJECT_SOURCE_DIR}/src)
 set_tests_properties(ninfer_qwen3_8_tokenizer_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_decision_layout_real_test
+  SOURCES targets/qwen3_8/test_decision_layout_real.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core ninfer_sha256)
+target_include_directories(ninfer_qwen3_8_decision_layout_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_8/export)
+set_tests_properties(ninfer_qwen3_8_decision_layout_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_runtime_mechanisms_test
   SOURCES targets/qwen3_8/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -144,6 +151,10 @@ ninfer_add_test(ninfer_qwen3_8_27b_lora_real_test
   SOURCES targets/qwen3_8_27b/test_engine_lora_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_lora_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_decision_real_test
+  SOURCES targets/qwen3_8_27b/test_engine_decision_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_decision_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_load_plan_test
   SOURCES targets/qwen3_8_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -217,6 +228,10 @@ ninfer_add_test(ninfer_slot_files_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_systemone_product_test
+  SOURCES test_systemone_product.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_product_systemone)
 if(NINFER_BUILD_QWEN3_8_27B)
   ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp

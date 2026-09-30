@@ -83,6 +83,15 @@ struct DFlashConfig {
     static constexpr int kv_size        = 0;
 };
 
+// System One decisions (docs/maintainer/qwen3.8-27b-model.md). A decision adapter's pointer head
+// projects final-norm readouts to `pointer_dim` and scores each option key against its question's
+// decide query. The head rides in the adapter's LoRA slot, so decisions need the LoRA pool.
+struct DecisionConfig {
+    static constexpr bool supported    = true;
+    static constexpr int pointer_dim   = 256;
+    static constexpr int hidden        = TextConfig::hidden;
+};
+
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;

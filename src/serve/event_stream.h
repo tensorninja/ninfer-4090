@@ -2,7 +2,7 @@
 
 // The structured record funnel: one schema instance, two transports.
 //
-// `request_log.cpp` owns the record format (schema 20). This class owns the live instance of it -
+// `request_log.cpp` owns the record format (schema 21). This class owns the live instance of it -
 // the per-process `server_instance_id`, the timestamp, and the fan-out - so a record is formatted
 // exactly once and delivered to both the optional `--request-log-jsonl` file and every connected
 // GET /events subscriber. Adding the stream therefore does not duplicate the schema, and a
@@ -75,6 +75,11 @@ public:
     void emit_request_start(const RequestLogContext& context);
     void emit_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void emit_request_error(const RequestLogContext& context, const std::string& message);
+    void emit_decision_start(const DecisionLogContext& context);
+    void emit_decision_done(const DecisionLogContext& context, const ninfer::DecisionResult& result,
+                            std::uint32_t output_tokens);
+    void emit_decision_error(const DecisionLogContext& context, int status,
+                             const std::string& message);
     void emit_throughput(const ThroughputReport& report);
 
     // Registers a reader and hands back the retained `server_start` record followed by the replay

@@ -1,4 +1,5 @@
 #include "product/load_progress/load_progress.h"
+#include "product/systemone/request.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -13,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
 #include <utility>
 
 namespace {
@@ -84,17 +86,31 @@ int main(int argc, char** argv) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
         const ninfer::LoadSummary load = service.load_summary();
-        if (!load.lora_adapter_names.empty()) {
+        if (!load.lora_adapters.empty()) {
             std::ostringstream adapters;
-            adapters << "LoRA pool: " << load.lora_adapter_names.size() << " adapters, "
+            adapters << "LoRA pool: " << load.lora_adapters.size() << " adapters, "
                      << load.lora_slots << " resident slots, rank " << load.lora_rank << ", "
                      << format_bytes(load.lora_device_bytes) << " VRAM";
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, adapters.str());
-            for (const std::string& name : load.lora_adapter_names) {
+            bool decision_adapters = false;
+            for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+                const bool decision = adapter.kind == ninfer::LoraAdapterKind::Decision;
+                decision_adapters   = decision_adapters || decision;
                 ninfer::serve::write_console_log(
                     ninfer::serve::ConsoleLogLevel::Info,
-                    "LoRA adapter: " + name + " (model id: " + server.public_model_id() + '-' +
-                        name + ')');
+                    decision ? "LoRA adapter: " + adapter.name + " (System One model: " +
+                                   adapter.name + ')'
+                             : "LoRA adapter: " + adapter.name + " (model id: " +
+                                   server.public_model_id() + '-' + adapter.name + ')');
+            }
+            if (decision_adapters) {
+                const std::string binding = server.systemone_alias_binding();
+                ninfer::serve::write_console_log(
+                    ninfer::serve::ConsoleLogLevel::Info,
+                    "System One: POST /systemone/v1/systemone, default model " +
+                        std::string(ninfer::product::systemone::kDefaultModel) + " -> " +
+                        (binding.empty() ? std::string("unbound (pass --systemone-default)")
+                                         : binding));
             }
         }
 

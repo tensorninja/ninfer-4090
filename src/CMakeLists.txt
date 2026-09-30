@@ -358,6 +358,18 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
+
+  # Host-only System One (TypeSafe) request/answer translation, bit-exact with kev's Python.
+  add_library(ninfer_product_systemone STATIC
+    product/systemone/render.cpp
+    product/systemone/request.cpp
+    product/systemone/answers.cpp
+    product/systemone/models.cpp)
+  ninfer_internal_includes(ninfer_product_systemone)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Python rounds every float operation separately; contracting them into FMAs breaks parity.
+    target_compile_options(ninfer_product_systemone PRIVATE -ffp-contract=off)
+  endif()
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
@@ -406,13 +418,14 @@ if(NINFER_BUILD_SERVE)
     serve/http_server.cpp
     serve/responses_http.cpp
     serve/serve_metrics.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    serve/systemone_service.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   # NVML is part of the driver this engine already requires; GET /telemetry reads board
   # utilization, temperature, power and clocks from it.
   target_link_libraries(ninfer_serve
-    PUBLIC ninfer_engine Threads::Threads
+    PUBLIC ninfer_engine ninfer_product_systemone Threads::Threads
     PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET} CUDA::nvml)
 endif()

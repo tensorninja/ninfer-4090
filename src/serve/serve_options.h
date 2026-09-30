@@ -54,6 +54,10 @@ struct ServeOptions {
     // Startup-discovered LoRA pool and its bounded device residency. Each filename-derived name
     // is served as an additional model id `<public model id>-<name>`.
     LoraOptions lora;
+    // The decision adapter the System One SDK-default model name (`jev-latest`) answers with.
+    // Empty binds the pool's only decision adapter, or leaves the alias unbound when there are
+    // several.
+    std::string systemone_default;
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

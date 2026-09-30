@@ -21,6 +21,7 @@
 #include <functional>
 #include <initializer_list>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS::schedule {
@@ -137,6 +138,14 @@ struct PrefillChunkResult {
     bool finalized                 = false;
 };
 
+// One segment of a System One branch pass (decision.h): the pass columns
+// [column, column + length), which continue the resident prefix on their own at positions
+// prefix, prefix + 1, ...
+struct DecisionSegment {
+    std::int32_t column = 0;
+    std::int32_t length = 0;
+};
+
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
     using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
@@ -193,6 +202,15 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // The phase prefill-shaped calls (prefill chunks and decision passes) run their leaves in:
+    // Prefill, or Decision for every unit of a System One decision.
+    void set_prefill_phase(Phase phase) {
+        if (phase == Phase::Verify) {
+            throw std::invalid_argument("a prefill-shaped call cannot run in the Verify phase");
+        }
+        prefill_phase_ = phase;
+    }
+
     // LoRA bank selection for the calls that follow. `set_adapter` records a uniform choice for
     // routes that carry one sequence (prefill and the single-sequence schedules); -1 keeps the
     // base weights and suppresses every LoRA launch. `set_active_adapters` binds a device-resident
@@ -222,6 +240,14 @@ public:
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_8::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+    // One System One branch pass: `ids` holds `segments` back to back, and each segment continues
+    // the resident prefix [0, prefix) on its own at RoPE positions prefix, prefix + 1, ... Its
+    // attention sees the prefix and its own causal past; its GDN convolution and recurrence start
+    // from the current state slot, which the segmented mixers only read. Column i's K/V land in
+    // the lane's pages at prefix + i. The final-norm hidden of every column lands in
+    // prefill_hidden; no lm_head runs and nothing is sampled.
+    void decision_pass(std::span<const int> ids, std::span<const DecisionSegment> segments,
+                       std::uint32_t prefix);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
@@ -340,6 +366,11 @@ private:
     std::int64_t prefill_turn_checkpoint_frontier_        = -1;
     Tensor* turn_checkpoint_hidden_output_                = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+    Phase prefill_phase_                                  = Phase::Prefill;
+    // The device segment table of the decision pass in flight and the prefix its segments
+    // continue; null for every other call.
+    const Tensor* active_segment_table_ = nullptr;
+    std::uint32_t segment_prefix_       = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

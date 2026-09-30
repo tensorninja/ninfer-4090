@@ -14,6 +14,9 @@
 //
 // All three produce plausible output when wrong, so a text-level check cannot see them. This test
 // needs the adapters and about one slab of device memory; it never loads the base model.
+//
+// With a decision adapter it also gates the pointer-head region: planned only for a pool holding
+// a decision adapter, verbatim head bytes for a decision occupant, zeros for a generative one.
 #include "targets/qwen3_8_27b/impl/load/lora_bindings.h"
 
 #include "artifact/reader.h"
@@ -23,6 +26,8 @@
 
 #include <unistd.h> // getpid, for a per-process temporary pool directory
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -201,15 +206,122 @@ void verify_staged_slab(const LoraBank& bank, std::size_t pool_index,
     }
 }
 
+// The pointer head of a staged slot: verbatim artifact bytes for a decision occupant, exact zeros
+// for a generative one.
+void verify_staged_head(const LoraBank& bank, std::size_t pool_index,
+                        const std::vector<unsigned char>& slab) {
+    const LoraPoolEntry& entry = bank.pool()[pool_index];
+    const DecisionHeadPlan& head = *bank.profile().decision_head;
+    constexpr std::size_t kWeightBytes = 256U * 5120U * 2U;
+    constexpr std::size_t kBiasBytes   = 256U * 2U;
+    const struct {
+        const char* name;
+        std::uint64_t offset;
+        std::size_t bytes;
+    } objects[] = {{"decision/head/query/weight", head.query_weight, kWeightBytes},
+                   {"decision/head/query/bias", head.query_bias, kBiasBytes},
+                   {"decision/head/key/weight", head.key_weight, kWeightBytes},
+                   {"decision/head/key/bias", head.key_bias, kBiasBytes}};
+    if (entry.kind != ninfer::LoraAdapterKind::Decision) {
+        for (const auto& object : objects) {
+            check(all_zero(slab.data() + object.offset, object.bytes),
+                  entry.name + ": a generative occupant leaves " + object.name + " nonzero");
+        }
+        return;
+    }
+    ninfer::artifact::Reader reader(entry.path, {}, {});
+    for (const auto& object : objects) {
+        const ninfer::artifact::PayloadSpan payload = reader.payload(object.name);
+        check(payload.data.size() == object.bytes,
+              entry.name + ": " + object.name + " has the registered size");
+        check(std::memcmp(slab.data() + object.offset, payload.data.data(), object.bytes) == 0,
+              entry.name + ": " + object.name + " does not match the artifact");
+    }
+}
+
+// A generative and a decision adapter share one slot. The head region exists because the pool
+// holds a decision adapter; it carries the head only while the decision adapter occupies the slot,
+// and restaging either occupant reproduces its slab byte for byte.
+void check_decision_pool(const char* generative, const char* decision) {
+    PoolDirectory pool("decision");
+    pool.add("decider", decision).add("writer", generative);
+
+    ninfer::LoraOptions options;
+    options.directory = pool.path();
+    options.slots     = 1;
+
+    LoraDiscovery discovery = discover_lora_pool(options, {});
+    check(discovery.rejected.empty(), "no decision-pool fixture was rejected");
+    check(discovery.pool.size() == 2, "both decision-pool fixtures entered the pool");
+    if (discovery.pool.size() != 2) { return; }
+    const LoraPoolEntry& decider = discovery.pool[0];
+    check(decider.kind == ninfer::LoraAdapterKind::Decision,
+          "the head-carrying adapter is a decision adapter");
+    check(discovery.pool[1].kind == ninfer::LoraAdapterKind::Generative,
+          "the factor-only adapter is generative");
+    check(std::isfinite(decider.decision.temperature) && decider.decision.temperature > 0.0F,
+          "the decision temperature is a positive finite value");
+    check(decider.decision.release_date.size() == 10, "the release date is YYYY-MM-DD");
+    check(discovery.profile.decision_head.has_value(), "a decision pool plans the head region");
+    if (!discovery.profile.decision_head) { return; }
+
+    const DecisionHeadPlan head = *discovery.profile.decision_head;
+    const std::uint64_t slab    = discovery.profile.slab_bytes;
+    const std::uint64_t head_end =
+        std::max({head.query_weight + 256U * 5120U * 2U, head.key_weight + 256U * 5120U * 2U,
+                  head.query_bias + 512U, head.key_bias + 512U});
+    check(head_end <= slab, "the head region lies inside the slab");
+    std::cout << "  decision pool: slab " << slab / (1024 * 1024) << " MiB, temperature "
+              << decider.decision.temperature << '\n';
+
+    ninfer::DeviceContext device(0);
+    LoraBank bank(std::move(discovery), 1, device);
+    check(bank.view().kinds.size() == 2 &&
+              bank.view().kinds[0] == ninfer::LoraAdapterKind::Decision &&
+              bank.view().kinds[1] == ninfer::LoraAdapterKind::Generative,
+          "the bank view carries each adapter's kind");
+    check(bank.view().decision_temperatures.size() == 2 &&
+              bank.view().decision_temperatures[0] == bank.pool()[0].decision.temperature,
+          "the bank view carries the decision temperature");
+    check(bank.view().decision_head.query_weight.data != nullptr &&
+              bank.view().decision_head.slot_stride == bank.profile().slab_bytes,
+          "the bank view binds the head region per slot");
+
+    bank.stage(0, 0, device);
+    const std::vector<unsigned char> decision_first = read_slot(bank, 0, device);
+    verify_staged_slab(bank, 0, decision_first);
+    verify_staged_head(bank, 0, decision_first);
+
+    bank.stage(0, 1, device);
+    const std::vector<unsigned char> generative_slab = read_slot(bank, 0, device);
+    verify_staged_slab(bank, 1, generative_slab);
+    verify_staged_head(bank, 1, generative_slab);
+
+    bank.stage(0, 0, device);
+    const std::vector<unsigned char> decision_again = read_slot(bank, 0, device);
+    check(decision_again == decision_first,
+          "restaging the decision adapter leaves no residue of the generative occupant");
+}
+
 } // namespace
 
 int main() {
-    const char* wide   = env_or_null("NINFER_QWEN3_8_27B_LORA_ZERO");
-    const char* narrow = env_or_null("NINFER_QWEN3_8_27B_LORA_GDN_ONLY");
-    if (wide == nullptr || narrow == nullptr) {
-        std::cout << "skip: NINFER_QWEN3_8_27B_LORA_ZERO and NINFER_QWEN3_8_27B_LORA_GDN_ONLY "
-                     "are required\n";
+    const char* wide     = env_or_null("NINFER_QWEN3_8_27B_LORA_ZERO");
+    const char* narrow   = env_or_null("NINFER_QWEN3_8_27B_LORA_GDN_ONLY");
+    const char* decision = env_or_null("NINFER_QWEN3_8_27B_LORA_DECISION");
+    if (wide == nullptr || (narrow == nullptr && decision == nullptr)) {
+        std::cout << "skip: NINFER_QWEN3_8_27B_LORA_ZERO and NINFER_QWEN3_8_27B_LORA_GDN_ONLY or "
+                     "NINFER_QWEN3_8_27B_LORA_DECISION are required\n";
         return 77;
+    }
+    if (decision != nullptr) { check_decision_pool(wide, decision); }
+    if (narrow == nullptr) {
+        if (failures != 0) {
+            std::cerr << failures << " check(s) failed\n";
+            return 1;
+        }
+        std::cout << "ok\n";
+        return 0;
     }
 
     // A seven-site adapter and a one-site adapter in one pool. The profile must be their union,

@@ -35,6 +35,7 @@ enum class GdnWorkspacePath : std::uint8_t {
     Prefill,
     Snapshot,
     ReplayRecord,
+    Segmented,
 };
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
@@ -225,6 +226,18 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.turn_checkpoint_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "turn checkpoint hidden");
+    // Decisions need a decision adapter, so the LoRA pool is their precondition. Whether the pool
+    // holds one is decided later at discovery; these keys cost 255 KiB per lane either way.
+    if constexpr (Variant::supports_decisions) {
+        if (plan.features.lora()) {
+            out.decision_keys = add_tensor(
+                builder, DType::FP32,
+                {Variant::DecisionConfig::pointer_dim,
+                 static_cast<std::int32_t>(kMaximumDecisionOptions),
+                 static_cast<std::int32_t>(plan.max_concurrency)},
+                "decision long-branch keys");
+        }
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -271,17 +284,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, qwen3_8::TextPhase phase,
-                                     std::int32_t batch_size, std::int32_t min_width,
-                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+                                     std::size_t attention_scratch) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         scratch(layout, lora_scratch(4, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width));
+        scratch(layout, attention_scratch);
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
         scratch(layout, lora_scratch(1, first, last));
@@ -310,6 +320,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout,
                     ops::gated_delta_net_workspace_capacity_bytes(
                         TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true, first, last));
+        } else if (path == GdnWorkspacePath::Segmented) {
+            scratch(layout, ops::gated_delta_net_segmented_workspace_capacity_bytes(
+                                TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true, last));
         }
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
@@ -336,7 +349,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, qwen3_8::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
-        attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
+        attention_stage(layout, first, last, phase,
+                        ops::gqa_attention_workspace_capacity_bytes(TextConfig::query_heads,
+                                                                    plan.kv_dtype, envelope,
+                                                                    batch_size, min_width,
+                                                                    max_width));
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
     };
@@ -563,8 +580,45 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             merged, std::min(merged, kFrontendSegmentLimit));
     }
 
+    if constexpr (Variant::supports_decisions) {
+        if (plan.features.lora()) {
+            // State chunks and long-branch chunks are Decision-phase prefill chunks. A branch pass
+            // holds its segment table after the roots and takes the segmented mixers.
+            WorkspaceLayoutBuilder chunked;
+            text_common_root(chunked, chunk);
+            target_body(chunked, 1, chunk, qwen3_8::TextPhase::Decision, GdnWorkspacePath::Prefill,
+                        1, 1, chunk, text_envelope);
+            WorkspaceLayoutBuilder pass;
+            text_common_root(pass, chunk);
+            (void)workspace_recipe::decision_segment_table(pass, chunk);
+            attention_stage(pass, 1, chunk, qwen3_8::TextPhase::Decision,
+                            ops::gqa_attention_segmented_workspace_capacity_bytes(chunk));
+            gdn_stage(pass, 1, chunk, qwen3_8::TextPhase::Decision, GdnWorkspacePath::Segmented, 1,
+                      1, chunk);
+            post_mixer_stage(pass, 1, chunk, qwen3_8::TextPhase::Decision);
+            out.decision_pass = std::max(finish(chunked), finish(pass));
+
+            // In ProgramImplCore::decision_head's allocation order. A pass holds at most `chunk`
+            // readout columns; a long branch's final unit scores up to 255 keys.
+            constexpr std::int32_t pointer = Variant::DecisionConfig::pointer_dim;
+            const std::int32_t keys =
+                std::max(chunk, static_cast<std::int32_t>(kMaximumDecisionOptions));
+            WorkspaceLayoutBuilder head;
+            matrix(head, DType::I32, 1, chunk);
+            matrix(head, DType::I32, 1, keys);
+            matrix(head, DType::I32, 3, chunk);
+            matrix(head, DType::BF16, TextConfig::hidden, chunk);
+            matrix(head, DType::BF16, TextConfig::hidden, keys);
+            matrix(head, DType::FP32, pointer, chunk);
+            matrix(head, DType::FP32, pointer, keys);
+            matrix(head, DType::FP32, 1, keys);
+            out.decision_head = finish(head);
+        }
+    }
+
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                             out.dflash_context, out.dflash_round, out.vision_encode});
+                             out.dflash_context, out.dflash_round, out.vision_encode,
+                             out.decision_pass, out.decision_head});
     return out;
 }
 

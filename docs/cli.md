@@ -14,7 +14,7 @@ The default build contains Qwen3.8-27B. Commands using Qwen3.6-35B-A3B require c
   --max-new 256
 ```
 
-Exactly one of `--prompt` and `--messages` is required.
+Exactly one of `--prompt`, `--messages`, and `--systemone` is required.
 
 Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
 canonical `weights_id`), timings, throughput, board energy, GPU memory, and speculative-decoding
@@ -106,6 +106,26 @@ selected.
 
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
 long-decode, and long-context inputs.
+
+## System One decisions
+
+`--systemone FILE` answers TypeSafe System One request bodies with the decision adapters of the
+`--lora-dir` pool, exactly as the server's
+[`POST /systemone/v1/systemone`](serving.md#system-one-decisions) does. `-` reads stdin, and
+`--systemone-jsonl` treats each nonblank line as one request:
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
+  --lora-dir lora --systemone requests.jsonl --systemone-jsonl --max-context 16384
+```
+
+Each response body, or `{"detail": ...}` for a failed request, is printed on its own stdout line,
+and the process exits nonzero when any request failed. `jev-latest` answers with
+`--systemone-default NAME`, or with the pool's only decision adapter. `--systemone-cold` computes
+every state from zero without restoring or retaining one. For parity tooling,
+`--systemone-probabilities` prints `{"status", "response", ...}` lines that add the unrounded
+probabilities and the engine's accounting, and `--systemone-dump-prepared FILE` writes each
+decision's token layout.
 
 ## Speculative decoding
 

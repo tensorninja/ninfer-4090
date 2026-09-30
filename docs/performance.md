@@ -712,6 +712,69 @@ round. The remaining cost is the two launches' latency chains, which a fused sin
 reduction could roughly halve again; that is the next LoRA step if adapter decode matters more
 than the batched-decode route above.
 
+### System One decision latency
+
+Decisions were measured on the same card and toolchain with the decision adapter
+`systemone-decision-v7` (rank 16 on the six registered modules, plus its pointer head). The KV
+cache was BF16, the configuration decisions are qualified on
+([System One fidelity](serving.md#system-one-fidelity)), with one lane and a 73,728-token context.
+`scripts/decision_probe.py` drives `/systemone/v1/systemone` and reads every decision's
+`decision_done` record. Latency is the response's `latency_ms`: the restore of a cached state, if
+any, plus execution, which splits into state and branch time. A point is a state of pseudo-text
+calibrated to a token count, and Q questions that cycle `noul`, a four-option `choice`, and a
+three-option `score`. Q = 1, 6 and 16 give 2, 18 and 47 options over 17, 126 and 334 branch tokens,
+each in one pass. Each point is warmed once and measured five times. The tables give medians; p90
+is within 1% of the median except where noted. The SM clock held 2,625-2,715 MHz. The cold 8k and
+65k states reached the 480 W power limit.
+
+```bash
+./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer --lora-dir lora --kv-dtype bf16 \
+  --max-context 73728 --kv-capacity 73728 --max-concurrency 1 \
+  --continuation-cache-l1-mib 8192 --request-log-jsonl decisions.jsonl
+python3 scripts/decision_probe.py --url http://127.0.0.1:8080 --model <decision adapter> \
+  --log decisions.jsonl --mode cached
+```
+
+With a cached state, the state is computed once and every repeat continues it, so only the branches
+run:
+
+| State tokens | Q = 1 | Q = 6 | Q = 16 |
+|---:|---:|---:|---:|
+| 301 | 24.8 ms | 97.4 ms | 191.3 ms |
+| 8,205 | 25.7 ms | 101.0 ms | 199.6 ms |
+| 64,991 | 29.9 ms | 123.9 ms | 260.3 ms |
+
+Branch time follows the branch tokens, not the state. A pass streams the weights once over all of
+its columns, so one question's 17 tokens sit at the weight-streaming floor of about 25 ms, and more
+questions add BF16 compute. A 65k-token state adds only 5-69 ms over a 301-token one.
+
+Before the segmented mixer Ops, a pass ran attention, the convolution and the GDN recurrence once
+per question. The 64,991-token row then measured 95.5, 519.9 and 1,319.3 ms, so the segmented Ops
+make it 3.2x, 4.2x and 5.1x faster. In isolation, one layer's segmented attention over a
+65,535-token BF16 state with six 40-token questions takes 3.31 ms, against 26.6 ms for the
+per-question loop.
+
+The 64,991-token row keeps its state in L1 only because of `--continuation-cache-l1-mib 8192`. At the
+default 768 MiB, the state's 4.1 GiB of BF16 KV and GDN state exceeds the L1 budget as soon as its
+lane goes idle. Every repeat then restores the published image from L2 in 2.85-2.96 s, including
+the verification every import performs, and adds the same branch time. That gives 2.88, 3.08 and
+3.20 s for Q = 1, 6 and 16, with a p90 of 3.35 s at Q = 1. Size the L1 budget to the decision
+states that should stay resident.
+
+A cold state (`--continuation-cache off --no-prefix-reuse`), with Q = 1:
+
+| State tokens | Latency | State prefill | State rate |
+|---:|---:|---:|---:|
+| 301 | 206.9 ms | 181.7 ms | 1,657 tok/s |
+| 8,205 | 3.78 s | 3.75 s | 2,186 tok/s |
+| 65,006 | 34.77 s | 34.74 s | 1,871 tok/s |
+
+With more questions, a cold decision adds the cached branch time from the first table. Its state
+prefill uses the BF16-activation routes, because `TextPhase::Decision` admits no INT8 activation
+route. Those are the routes the prefill ladder above starts from (1,739 tok/s at 115k tokens),
+not the INT8 routes that take chat prefill to 2,496 tok/s. Decisions give up that throughput to
+stay within kev's per-question tolerance.
+
 ### Energy measurement
 
 Energy per token is reported alongside throughput. A watt-second is a joule, so tokens per

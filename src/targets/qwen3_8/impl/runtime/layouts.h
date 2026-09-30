@@ -43,6 +43,9 @@ struct PersistentLayout {
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
     TensorLayout turn_checkpoint_hidden;
+    // FP32 [pointer_dim, kMaximumDecisionOptions, lanes]: the option keys of each lane's long
+    // decision branch in flight. Present when the target serves decisions and LoRA is enabled.
+    std::optional<TensorLayout> decision_keys;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
@@ -55,6 +58,11 @@ struct WorkspacePlan {
     std::size_t dflash_context = 0;
     std::size_t dflash_round   = 0;
     std::size_t vision_encode  = 0;
+    // One decision unit's model body (state chunk, packed branch pass or long-branch chunk) in
+    // the Decision phase, and its pointer head: gathered readouts, their projections, the
+    // question table and the probabilities. Both zero unless decisions can run.
+    std::size_t decision_pass  = 0;
+    std::size_t decision_head  = 0;
     std::size_t capacity       = 0;
 };
 

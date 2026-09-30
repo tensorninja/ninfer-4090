@@ -70,6 +70,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
         turn_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*turn_checkpoint_capture_frontier)
             : -1);
+    card.set_prefill_phase(state.phase);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -100,6 +101,20 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
             ? static_cast<std::int64_t>(*turn_checkpoint_capture_frontier)
             : -1);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
+}
+
+void decision_pass(PrefillContext& state, std::span<const TokenId> ids,
+                   std::span<const DecisionSegment> segments) {
+    if (state.dflash != nullptr || state.mtp_kv.valid() || state.mtp_cache != nullptr) {
+        throw std::logic_error("a decision pass carries no speculative backend");
+    }
+    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, qwen3_8::PagedKVCacheView(), &state.text_cache, nullptr);
+    configure_text_card(card, state.execution, nullptr, state.current_state_slot,
+                        state.turn_checkpoint_state_slot, 0, state.adapter);
+    card.decision_pass(std::span<const int>(ids.data(), ids.size()), segments, state.text_kv_base);
 }
 
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,

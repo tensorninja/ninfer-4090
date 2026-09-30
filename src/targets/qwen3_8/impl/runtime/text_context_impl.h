@@ -870,7 +870,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    if (active_gqa_envelope_ == nullptr) {
+    // Every route but a decision pass's segmented attention takes an execution envelope.
+    if (active_gqa_envelope_ == nullptr && active_segment_table_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
@@ -925,6 +926,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                            *active_gqa_envelope_, work_, a_batch, s);
+    } else if (active_segment_table_ != nullptr) {
+        // A decision pass: every segment sees the resident prefix and its own causal past, and
+        // column i's K/V land at cache position prefix + i.
+        ops::gqa_attention_segmented(qn, kn, v, *active_segment_table_, kv_table_rows,
+                                     static_cast<std::int32_t>(segment_prefix_), kAttnScale,
+                                     batch_text_kv_->batch_layer_view(fidx), work_, a, s);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
@@ -991,7 +998,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        if (active_segment_table_ != nullptr) {
+            // A decision pass: every segment restarts from the resident window, which it only
+            // reads.
+            ops::causal_conv1d_silu_segmented(qkv, *w.conv1d, conv_state, *active_segment_table_,
+                                              qkv_c, s);
+        } else {
+            ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        }
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
@@ -1028,6 +1042,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                           *active_linear_state_slots_, *active_linear_state_slots_,
                                           out_batch, s);
         }
+    } else if (active_segment_table_ != nullptr) {
+        // A decision pass: every segment's recurrence starts from the resident state, which it
+        // only reads; no final state is kept.
+        const Tensor recurrent_state =
+            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        ops::gated_delta_net_segmented(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
+                                       /*normalize_qk=*/true, work_, recurrent_state,
+                                       *active_segment_table_, o, s);
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
@@ -1066,7 +1088,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    const bool prefill = ph == Phase::Prefill;
+    const bool prefill = ph != Phase::Verify;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1262,7 +1284,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
+            run_layers(x, prefill_phase_, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
@@ -1437,6 +1459,65 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_8::PreparedPromptData&
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
+}
+
+void TextContext::decision_pass(std::span<const int> ids, std::span<const DecisionSegment> segments,
+                                std::uint32_t prefix) {
+    if (ids.empty() || ids.size() > prefill_chunk_ || segments.empty()) {
+        throw std::invalid_argument("decision pass must hold 1 to prefill_chunk columns");
+    }
+    if (mtp_enabled() || prefill_hidden_.data == nullptr) {
+        throw std::logic_error("decision pass needs a Text-only card with prefill hidden storage");
+    }
+    const int T = static_cast<int>(ids.size());
+    if (static_cast<std::uint64_t>(prefix) + static_cast<std::uint64_t>(T) >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("decision pass position exceeds int32");
+    }
+    std::vector<std::int32_t> positions_host(ids.size());
+    std::vector<std::int32_t> table_host;
+    table_host.reserve(2 * segments.size());
+    std::int32_t column = 0;
+    for (const DecisionSegment& segment : segments) {
+        if (segment.column != column || segment.length <= 0 || segment.length > T - column) {
+            throw std::invalid_argument("decision pass segments must tile its columns in order");
+        }
+        for (std::int32_t j = 0; j < segment.length; ++j) {
+            positions_host[static_cast<std::size_t>(column + j)] =
+                static_cast<std::int32_t>(prefix) + j;
+        }
+        table_host.push_back(segment.column);
+        table_host.push_back(segment.length);
+        column += segment.length;
+    }
+    if (column != T) { throw std::invalid_argument("decision pass segments must cover its ids"); }
+
+    cudaStream_t s = ctx_.stream;
+    work_.reset();
+    bind_uniform_adapter(s);
+    nvtx::ScopedRange pass_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                 static_cast<std::uint64_t>(T));
+    {
+        const auto roots  = workspace_recipe::text_prefill_roots<TextConfig>(work_, T, 0, 0);
+        Tensor ids_device = roots.ids;
+        copy_i32(ids.data(), ids_device, s);
+        Tensor positions = roots.positions;
+        copy_i32(positions_host.data(), positions, s);
+        Tensor segment_table = workspace_recipe::decision_segment_table(
+            work_, static_cast<std::int32_t>(segments.size()));
+        copy_i32(table_host.data(), segment_table, s);
+        ScopedPositions scoped_cache(active_cache_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, positions);
+        ScopedValue<const Tensor*> scoped_segments(active_segment_table_, &segment_table);
+        ScopedValue<std::uint32_t> scoped_prefix(segment_prefix_, prefix);
+
+        Tensor x = roots.residual;
+        ops::embedding(ids_device, *embed_, x, s);
+        run_layers(x, Phase::Decision);
+        Tensor xf = matrix_window(prefill_hidden_, T);
+        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+    }
+    work_.reset();
 }
 
 } // namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS::schedule

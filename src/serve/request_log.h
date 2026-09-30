@@ -17,8 +17,12 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion = 20;
+// Schema 21 adds the System One decision records (decision_start, decision_done, decision_error).
+inline constexpr int kRequestLogSchemaVersion = 21;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
+
+// The --kv-dtype spelling of a KV storage.
+[[nodiscard]] const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept;
 
 struct RequestLogContext {
     std::uint64_t id = 0;
@@ -44,6 +48,20 @@ struct RequestLogContext {
     // digests are the same routed session, different digests are different sessions.
     std::string prompt_cache_key_digest;
     ninfer::ResolvedSamplingParameters sampling;
+};
+
+// A System One decision as submitted: the model it names, the decision adapter that answers it,
+// and its token layout.
+struct DecisionLogContext {
+    std::uint64_t id = 0;
+    // The x-typesafe-request-id the response carries.
+    std::string x_request_id;
+    std::string model;
+    std::string adapter;
+    ninfer::DecisionSummary summary;
+    bool allow_prefix_reuse = true;
+    // Receipt to submission: validation, rendering, the ingress reservation and the layout.
+    double prepare_seconds = 0.0;
 };
 
 struct ServerLogEnvironment {
@@ -110,6 +128,11 @@ std::string format_request_start(const RequestLogContext& context);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);
+std::string format_decision_start(const DecisionLogContext& context);
+std::string format_decision_done(const DecisionLogContext& context,
+                                 const ninfer::DecisionResult& result, std::uint32_t output_tokens);
+std::string format_decision_error(const DecisionLogContext& context, int status,
+                                  const std::string& message);
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
@@ -133,6 +156,18 @@ std::string format_request_error_json(const std::string& server_instance_id,
                                       const RequestLogContext& context, const std::string& message);
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
+std::string format_decision_start_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const DecisionLogContext& context);
+std::string format_decision_done_json(const std::string& server_instance_id,
+                                      std::uint64_t timestamp_unix_ms,
+                                      const DecisionLogContext& context,
+                                      const ninfer::DecisionResult& result,
+                                      std::uint32_t output_tokens);
+std::string format_decision_error_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const DecisionLogContext& context, int status,
+                                       const std::string& message);
 
 ServerLogEnvironment query_server_log_environment(int device);
 

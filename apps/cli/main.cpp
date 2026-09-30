@@ -1,4 +1,5 @@
 #include "options.h"
+#include "systemone.h"
 #include "core/power_meter.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
@@ -230,13 +231,16 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
-    if (!load.lora_adapter_names.empty()) {
+    if (!load.lora_adapters.empty()) {
         print_metric("LoRA pool",
-                     std::to_string(load.lora_adapter_names.size()) + " adapters / " +
+                     std::to_string(load.lora_adapters.size()) + " adapters / " +
                          std::to_string(load.lora_slots) + " resident slots / rank " +
                          std::to_string(load.lora_rank));
-        for (const std::string& name : load.lora_adapter_names) {
-            print_metric("LoRA adapter", name);
+        for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+            print_metric("LoRA adapter",
+                         adapter.name + (adapter.kind == ninfer::LoraAdapterKind::Decision
+                                             ? " (decision)"
+                                             : ""));
         }
     }
 }
@@ -358,20 +362,15 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        ninfer::PromptInput input =
-            cli.messages_path.empty()
-                ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
-                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
-                                                        cli.enable_vision);
-        input.options.reasoning_effort = cli.reasoning_effort;
-
-        ninfer::RequestOptions request;
-        request.execution.sampling                = cli.sampling;
-        request.execution.requested_output_tokens = cli.max_new;
-        if (!cli.adapter.empty()) { request.execution.adapter = cli.adapter; }
-        request.stop.token_ids                    = cli.stop_token_ids;
-        request.stop.strings                      = cli.stop_strings;
-        request.output.raw                        = cli.raw_output;
+        const bool systemone = !cli.systemone_path.empty();
+        std::optional<ninfer::PromptInput> input;
+        if (!systemone) {
+            input = cli.messages_path.empty()
+                        ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
+                        : ninfer::product::prompt_from_messages(
+                              cli.messages_path, cli.enable_thinking, cli.enable_vision);
+            input->options.reasoning_effort = cli.reasoning_effort;
+        }
 
         std::cerr << "phase       detail                      elapsed/progress\n";
         ninfer::product::LoadProgressRenderer load_progress(
@@ -398,8 +397,17 @@ int main(int argc, char** argv) {
         const double load_wall = std::chrono::duration<double>(Clock::now() - load_started).count();
         print_load_summary(engine.load_summary(), load_wall);
         engine.reset_memory_peaks();
+        if (systemone) { return ninfer::cli::run_systemone(engine, cli); }
 
-        ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
+        ninfer::RequestOptions request;
+        request.execution.sampling                = cli.sampling;
+        request.execution.requested_output_tokens = cli.max_new;
+        if (!cli.adapter.empty()) { request.execution.adapter = cli.adapter; }
+        request.stop.token_ids                    = cli.stop_token_ids;
+        request.stop.strings                      = cli.stop_strings;
+        request.output.raw                        = cli.raw_output;
+
+        ninfer::PreparedPrompt prompt = engine.prepare(std::move(*input));
 
         StreamingSink sink;
         // The cumulative energy counter costs milliseconds to read, which is why the engine never

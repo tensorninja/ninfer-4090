@@ -3,11 +3,14 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 
+#include <ninfer/targets/qwen3_8/decision.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_8 {
@@ -116,6 +119,10 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
+    // System One decision layout (see decision.h). Throws DecisionInputError for budget errors.
+    [[nodiscard]] DecisionPrompt prepare_decision(const DecisionInput& input) const;
+    // Tokens of plain text with added-token parsing and no template.
+    [[nodiscard]] std::uint32_t count_text_tokens(std::string_view text) const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;

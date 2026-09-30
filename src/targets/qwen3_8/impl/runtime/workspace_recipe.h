@@ -47,6 +47,13 @@ Tensor visual_scatter_indices(Allocator& allocator, std::int32_t tokens) {
     return vector(allocator, DType::I32, tokens);
 }
 
+// A decision pass's device segment table, I32 [2,S]: column s is (c_s,T_s), the first column and
+// length of segment s. It is held for the whole pass and read by every sequence mixer.
+template <class Allocator>
+Tensor decision_segment_table(Allocator& allocator, std::int32_t segments) {
+    return matrix(allocator, DType::I32, 2, segments);
+}
+
 struct TextAttentionProjectionRoots {
     Tensor hidden;
     Tensor query;

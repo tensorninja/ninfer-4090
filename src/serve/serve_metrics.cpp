@@ -63,6 +63,16 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
     last_completed_.cached_tokens = static_cast<int>(std::min(cached, prompt));
 }
 
+void ServeMetrics::record_decision(const ninfer::DecisionResult& result) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    decisions_total_ += 1;
+    decision_questions_total_ += result.summary.questions;
+    decision_state_tokens_total_ += result.summary.state_tokens;
+    decision_reused_state_tokens_total_ += result.reused_state_tokens;
+    decision_branch_tokens_total_ += result.summary.branch_tokens;
+    decision_execution_seconds_total_ += result.timings.execution_seconds;
+}
+
 ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
     const std::lock_guard<std::mutex> lock(mutex_);
     return last_completed_;
@@ -86,6 +96,16 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency, const ninfer::Ru
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);
+    // Answered System One decisions. State tokens include the reused ones; execution excludes the
+    // queue wait, as the response's latency_ms does.
+    append_counter(out, "ninfer:decisions_total", decisions_total_);
+    append_counter(out, "ninfer:decision_questions_total", decision_questions_total_);
+    append_counter(out, "ninfer:decision_state_tokens_total", decision_state_tokens_total_);
+    append_counter(out, "ninfer:decision_reused_state_tokens_total",
+                   decision_reused_state_tokens_total_);
+    append_counter(out, "ninfer:decision_branch_tokens_total", decision_branch_tokens_total_);
+    append_counter(out, "ninfer:decision_execution_seconds_total",
+                   decision_execution_seconds_total_);
     append_counter(out, "ninfer:continuation_lookup_hits_total", live.continuation_lookup_hits);
     append_counter(out, "ninfer:continuation_lookup_misses_total",
                    live.continuation_lookup_misses);

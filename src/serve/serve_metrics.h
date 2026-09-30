@@ -53,6 +53,9 @@ public:
     // request-done log line, so every protocol and both streaming modes count.
     void record(const GenerationOutcome& outcome);
 
+    // Accumulates one answered System One decision.
+    void record_decision(const ninfer::DecisionResult& result);
+
     // Prompt/cache sizes of the most recent completed request, retained for
     // /slots. llama.cpp keeps the last request's counts on an idle slot and
     // scrapers (the fleet dashboard) read them as the resident session
@@ -83,6 +86,12 @@ private:
     std::uint64_t prefix_cache_hit_tokens_total_     = 0;
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;
+    std::uint64_t decisions_total_                   = 0;
+    std::uint64_t decision_questions_total_          = 0;
+    std::uint64_t decision_state_tokens_total_       = 0;
+    std::uint64_t decision_reused_state_tokens_total_ = 0;
+    std::uint64_t decision_branch_tokens_total_      = 0;
+    double decision_execution_seconds_total_         = 0.0;
     LastCompleted last_completed_;
     std::map<std::uint64_t, int> active_;
 };

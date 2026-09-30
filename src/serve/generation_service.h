@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -99,6 +100,16 @@ struct PreparedRequest {
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
+// A System One decision submitted to the Engine FIFO. Like PreparedRequest it keeps its ingress
+// reservation until the HTTP response is released, and decide() consumes it exactly once.
+struct PreparedDecisionRequest {
+    ninfer::DecisionHandle decision;
+    ninfer::DecisionSummary summary;
+    // Admission to submission: the ingress reservation and the Engine's layout of the decision.
+    double prepare_seconds = 0.0;
+    std::shared_ptr<RequestLifetime> lifetime;
+};
+
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
@@ -142,9 +153,26 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    // System One decisions of the decision adapter `adapter`. They share generation's bounded
+    // ingress and pending deadline. The Engine's errors (ninfer::RequestError,
+    // ninfer::DecisionInputError) propagate unchanged, because the System One protocol renders
+    // them in its own shape.
+    [[nodiscard]] PreparedDecisionRequest prepare_decision(ninfer::DecisionInput input,
+                                                           std::string adapter) const;
+    // Consumes prepared.decision.
+    ninfer::DecisionResult decide(PreparedDecisionRequest& prepared,
+                                  std::function<bool()> is_cancelled = {});
+
+    // Tokens of plain text with added-token parsing and no template (System One output usage).
+    [[nodiscard]] std::uint32_t count_text_tokens(std::string_view text) const {
+        return engine_->count_text_tokens(text);
+    }
+
     void warmup();
 
 private:
+    // One place of the bounded ingress (lanes plus pending queue) that generation and decisions
+    // share. Throws ninfer::RequestError(Overloaded) when every place is taken.
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
     [[nodiscard]] HostInputLease
     acquire_media_input(std::chrono::steady_clock::time_point deadline,

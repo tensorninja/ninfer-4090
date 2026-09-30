@@ -782,6 +782,15 @@ std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) cons
     return bytes;
 }
 
+int Tokenizer::token_id(std::string_view content) const {
+    for (const AddedToken& token : added_tokens_) {
+        if (token.content == content) { return token.id; }
+    }
+    const auto found = vocab_token_to_id_.find(std::string(content));
+    if (found != vocab_token_to_id_.end()) { return found->second; }
+    throw std::out_of_range("tokenizer has no token '" + std::string(content) + "'");
+}
+
 bool Tokenizer::is_special_token(int id) const noexcept {
     return std::any_of(added_tokens_.begin(), added_tokens_.end(),
                        [id](const AddedToken& token) { return token.id == id && token.special; });

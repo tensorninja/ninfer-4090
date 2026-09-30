@@ -58,6 +58,8 @@ struct PrefillContext {
     // A prefill chunk carries exactly one sequence, so its LoRA selection is a scalar rather than
     // the per-row vector the batched decode paths bind. -1 selects the base weights.
     std::int32_t adapter = -1;
+    // Decision for every unit of a System One decision, which admits no INT8 activations.
+    qwen3_8::TextPhase phase = qwen3_8::TextPhase::Prefill;
 };
 
 struct OrdinaryBatchContext {
@@ -149,6 +151,11 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> turn_checkpoint_capture_frontier,
                          bool finalize_at_end);
+
+// One System One branch pass over the resident prefix [0, state.text_kv_base); see
+// TextContext::decision_pass. `state` carries no MTP or DFlash backend.
+void decision_pass(PrefillContext& state, std::span<const TokenId> ids,
+                   std::span<const DecisionSegment> segments);
 
 struct MtpBridgeInput {
     const Tensor* previous_hidden = nullptr;

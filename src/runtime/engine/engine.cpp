@@ -6,8 +6,10 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
@@ -26,35 +28,50 @@
 namespace ninfer {
 namespace {
 
+const char* adapter_kind_name(LoraAdapterKind kind) noexcept {
+    return kind == LoraAdapterKind::Decision ? "decision" : "generative";
+}
+
 // Resolves a requested adapter name to its pool index. Residency is not consulted: every
 // discovered adapter is selectable, and the engine stages it into a slot at admission. A name
-// outside the pool is a request error rather than a silent fall back to the base weights,
-// because the two produce different output and the caller asked for one of them specifically.
-std::int32_t resolve_adapter(const std::vector<std::string>& pool,
-                             const std::optional<std::string>& requested) {
-    if (!requested.has_value()) { return -1; }
-    for (std::size_t index = 0; index < pool.size(); ++index) {
-        if (pool[index] == *requested) { return static_cast<std::int32_t>(index); }
-    }
+// outside the pool, or an adapter of the other kind, is a request error rather than a silent
+// fall back to the base weights, because the two produce different output and the caller asked
+// for one of them specifically.
+std::int32_t resolve_adapter(const std::vector<LoraAdapterInfo>& pool, LoraAdapterKind kind,
+                             const std::string& requested) {
     std::string known;
-    for (const std::string& name : pool) {
+    for (std::size_t index = 0; index < pool.size(); ++index) {
+        const LoraAdapterInfo& adapter = pool[index];
+        if (adapter.name == requested) {
+            if (adapter.kind == kind) { return static_cast<std::int32_t>(index); }
+            throw RequestError(RequestErrorKind::UnknownAdapter,
+                               "LoRA adapter '" + requested + "' is a " +
+                                   adapter_kind_name(adapter.kind) + " adapter, not a " +
+                                   adapter_kind_name(kind) + " one");
+        }
+        if (adapter.kind != kind) { continue; }
         known += known.empty() ? "" : ", ";
-        known += name;
+        known += adapter.name;
     }
     throw RequestError(RequestErrorKind::UnknownAdapter,
-                       "LoRA adapter '" + *requested + "' is not in this engine's pool; " +
-                           (pool.empty() ? "this engine discovered no adapters"
-                                         : "available adapters are: " + known));
+                       "LoRA adapter '" + requested + "' is not in this engine's pool; " +
+                           (known.empty() ? std::string("this engine discovered no ") +
+                                                adapter_kind_name(kind) + " adapters"
+                                          : "available " + std::string(adapter_kind_name(kind)) +
+                                                " adapters are: " + known));
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options,
-                                                        const std::vector<std::string>& adapters) {
+                                                        const std::vector<LoraAdapterInfo>& adapters) {
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
-    resolved.execution.adapter        = resolve_adapter(adapters, options.execution.adapter);
+    resolved.execution.adapter =
+        options.execution.adapter.has_value()
+            ? resolve_adapter(adapters, LoraAdapterKind::Generative, *options.execution.adapter)
+            : -1;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.routing_hint                      = std::move(options.execution.routing_hint);
     resolved.stop                              = std::move(options.stop);
@@ -90,6 +107,37 @@ const PromptSummary& PreparedPrompt::summary() const noexcept {
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
+
+class PreparedDecision::Impl {
+public:
+    explicit Impl(targets::qwen3_8::DecisionPrompt prepared) : value(std::move(prepared)) {}
+
+    targets::qwen3_8::DecisionPrompt value;
+};
+
+PreparedDecision::PreparedDecision() noexcept                              = default;
+PreparedDecision::~PreparedDecision()                                      = default;
+PreparedDecision::PreparedDecision(PreparedDecision&&) noexcept            = default;
+PreparedDecision& PreparedDecision::operator=(PreparedDecision&&) noexcept = default;
+
+PreparedDecision::PreparedDecision(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+const DecisionSummary& PreparedDecision::summary() const noexcept {
+    static const DecisionSummary empty;
+    return impl_ != nullptr ? impl_->value.summary : empty;
+}
+
+PreparedDecision::operator bool() const noexcept { return impl_ != nullptr; }
+
+std::span<const TokenId> PreparedDecision::token_ids() const noexcept {
+    return impl_ != nullptr ? std::span<const TokenId>(impl_->value.tokens)
+                            : std::span<const TokenId>();
+}
+
+std::span<const DecisionBranch> PreparedDecision::branches() const noexcept {
+    return impl_ != nullptr ? std::span<const DecisionBranch>(impl_->value.branches)
+                            : std::span<const DecisionBranch>();
+}
 
 class GenerationHandle::Impl {
 public:
@@ -151,6 +199,55 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
     std::unique_ptr<Impl> impl = std::move(impl_);
     return impl->wait(sink, cancellation);
+}
+
+class DecisionHandle::Impl {
+public:
+    class Concept {
+    public:
+        virtual ~Concept()                                                 = default;
+        virtual DecisionResult wait(const CancellationView& cancellation) = 0;
+    };
+
+    template <class Submission>
+    class Model final : public Concept {
+    public:
+        Model(std::shared_ptr<void> keep_alive, Submission submission)
+            : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
+
+        DecisionResult wait(const CancellationView& cancellation) override {
+            return submission_.wait(cancellation);
+        }
+
+    private:
+        std::shared_ptr<void> keep_alive_;
+        Submission submission_;
+    };
+
+    template <class Submission>
+    Impl(std::shared_ptr<void> keep_alive, Submission submission)
+        : state_(std::make_unique<Model<Submission>>(std::move(keep_alive),
+                                                     std::move(submission))) {}
+
+    DecisionResult wait(const CancellationView& cancellation) { return state_->wait(cancellation); }
+
+private:
+    std::unique_ptr<Concept> state_;
+};
+
+DecisionHandle::DecisionHandle() noexcept                            = default;
+DecisionHandle::~DecisionHandle()                                    = default;
+DecisionHandle::DecisionHandle(DecisionHandle&&) noexcept            = default;
+DecisionHandle& DecisionHandle::operator=(DecisionHandle&&) noexcept = default;
+
+DecisionHandle::DecisionHandle(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+DecisionHandle::operator bool() const noexcept { return impl_ != nullptr; }
+
+DecisionResult DecisionHandle::wait(const CancellationView& cancellation) {
+    if (impl_ == nullptr) { throw std::logic_error("DecisionHandle is empty"); }
+    std::unique_ptr<Impl> impl = std::move(impl_);
+    return impl->wait(cancellation);
 }
 
 namespace {
@@ -375,6 +472,45 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
         impl_->active);
 }
 
+PreparedDecision Engine::prepare_decision(DecisionInput input) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (!impl_->load.decisions_supported) {
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "target '" + impl_->load.target + "' does not serve decisions");
+    }
+    return std::visit(
+        [&](const auto& target_ptr) -> PreparedDecision {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            targets::qwen3_8::DecisionPrompt prepared =
+                target_ptr->loaded->frontend.prepare_decision(input);
+            // A lane holds the state plus the branch scratch of one pass (or of its longest
+            // branch); the pass width is the Program's prefill chunk.
+            const std::uint32_t capacity = target_ptr->capacity;
+            const std::uint32_t pass     = std::min(impl_->options.prefill_chunk, capacity);
+            const std::uint64_t context =
+                static_cast<std::uint64_t>(prepared.state_tokens()) +
+                targets::qwen3_8::decision_scratch_extent(prepared, pass);
+            if (context > capacity) {
+                throw DecisionInputError(
+                    "decision needs " + std::to_string(context) + " tokens of context (a " +
+                    std::to_string(prepared.state_tokens()) + "-token state and its branch " +
+                    "scratch); this server's lanes hold " + std::to_string(capacity));
+            }
+            return PreparedDecision(std::make_unique<PreparedDecision::Impl>(std::move(prepared)));
+        },
+        impl_->active);
+}
+
+std::uint32_t Engine::count_text_tokens(std::string_view text) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.count_text_tokens(text);
+        },
+        impl_->active);
+}
+
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -410,7 +546,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
     runtime::ResolvedRequestOptions resolved_options =
         resolve_request_options(impl_->sampling_defaults, prompt.impl_->sampling_mode,
-                                std::move(options), impl_->load.lora_adapter_names);
+                                std::move(options), impl_->load.lora_adapters);
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
@@ -458,6 +594,40 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
     return submit(std::move(prompt), std::move(options)).wait(sink, cancellation);
+}
+
+DecisionHandle Engine::submit_decision(PreparedDecision decision, DecisionOptions options,
+                                       std::chrono::steady_clock::time_point pending_deadline) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (decision.impl_ == nullptr) { throw std::invalid_argument("PreparedDecision is empty"); }
+    if (!impl_->load.decisions_supported) {
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "target '" + impl_->load.target + "' does not serve decisions");
+    }
+    const runtime::ResolvedDecisionOptions resolved{
+        .adapter = resolve_adapter(impl_->load.lora_adapters, LoraAdapterKind::Decision,
+                                   options.adapter),
+        .allow_prefix_reuse = options.allow_prefix_reuse,
+    };
+    return std::visit(
+        [&](auto& executor) -> DecisionHandle {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                auto submission =
+                    executor->submit_decision(std::move(decision.impl_->value), resolved,
+                                              std::move(options.adapter), pending_deadline);
+                return DecisionHandle(
+                    std::make_unique<DecisionHandle::Impl>(impl_, std::move(submission)));
+            }
+        },
+        impl_->executor);
+}
+
+DecisionResult Engine::decide(PreparedDecision decision, DecisionOptions options,
+                              const CancellationView& cancellation) {
+    return submit_decision(std::move(decision), std::move(options)).wait(cancellation);
 }
 
 const EngineOptions& Engine::options() const {

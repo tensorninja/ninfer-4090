@@ -90,6 +90,13 @@ struct DFlashConfig {
                                                                            22, 27, 32, 37};
 };
 
+// System One decisions need a decision adapter, and this identity registers no LoRA site table.
+struct DecisionConfig {
+    static constexpr bool supported    = false;
+    static constexpr int pointer_dim   = 0;
+    static constexpr int hidden        = TextConfig::hidden;
+};
+
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;

@@ -25,21 +25,34 @@ inert rather than absent, and the artifact keeps the object count and slab size
 of its unmasked peers -- which is what lets a whole ablation series load into
 one adapter bank.  ``A`` is left as trained: the fused query/gate parent shares
 one ``A`` plane, so zeroing ``A`` would corrupt the unmasked twin.
+
+``--decision-head <dir>/decision_head.safetensors`` makes a System One decision
+adapter: the trainer's pointer head (FP32 or BF16 ``query``/``key`` Linear
+weights and biases) is rounded to BF16, and its safetensors metadata is
+validated against the registered decision contract and stored as the
+``decision/metadata`` resource.  ``--description`` and ``--release-date``
+override the model-card fields the head file carries.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import math
 import re
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from tools.artifact import ArtifactIdentity, ArtifactWriter
+from tools.artifact.container import RAW_BYTES_V1
+from tools.artifact.container import ResourceSpec as ArtifactResourceSpec
 from tools.artifact.container import TensorSpec as ArtifactTensorSpec
 from tools.artifact.layouts import encode_direct
 from tools.convert.qwen3_8.common import conversion as family_conversion
@@ -50,6 +63,17 @@ TARGET_KEY = "qwen3_8_27b"
 
 _ADAPTER_CONFIG = "adapter_config.json"
 _ADAPTER_WEIGHTS = "adapter_model.safetensors"
+_DECISION_HEAD_FILE = "decision_head.safetensors"
+
+# The trainer's hand-off: safetensors keys of the pointer head and the object each becomes.
+_HEAD_FORMAT = "systemone-pointer-head"
+_HEAD_FORMAT_VERSION = "1"
+_HEAD_OBJECTS = {
+    "query.weight": "decision/head/query/weight",
+    "query.bias": "decision/head/query/bias",
+    "key.weight": "decision/head/key/weight",
+    "key.bias": "decision/head/key/bias",
+}
 
 # PEFT stores `base_model.model.<module path>.lora_{A,B}.weight`. The module
 # path differs between the multimodal wrapper and a text-only load, so the
@@ -294,8 +318,125 @@ def build_site_tensors(
     return a.to(torch.bfloat16).contiguous(), b.to(torch.bfloat16).contiguous()
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionHead:
+    """A validated pointer head: BF16 tensors by object name and the metadata resource."""
+
+    tensors: dict[str, torch.Tensor]
+    metadata: dict[str, object]
+    source: Path
+    source_dtype: str
+
+    def metadata_bytes(self) -> bytes:
+        return json.dumps(
+            self.metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+
+
+def _float32(value: float) -> float:
+    """The nearest FP32 value, as the Python float that represents it exactly."""
+
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _release_date(value: str, source: str) -> str:
+    try:
+        parsed = datetime.date.fromisoformat(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.isoformat() != value:
+        _reject(f"{source} release date {value!r} is not a YYYY-MM-DD calendar date")
+    return value
+
+
+def load_decision_head(
+    path: Path, description: str | None = None, release_date: str | None = None
+) -> DecisionHead:
+    """Read and validate the trainer's ``decision_head.safetensors`` hand-off."""
+
+    if path.name != _DECISION_HEAD_FILE:
+        _reject(f"--decision-head must name a {_DECISION_HEAD_FILE} file, not {path.name!r}")
+    if not path.is_file():
+        _reject(f"{path} is missing")
+    with safe_open(str(path), framework="pt") as handle:
+        header = dict(handle.metadata() or {})
+        stored = {key: handle.get_tensor(key) for key in handle.keys()}
+
+    if set(stored) != set(_HEAD_OBJECTS):
+        _reject(f"{path} holds tensors {sorted(stored)}; a pointer head holds exactly "
+                f"{sorted(_HEAD_OBJECTS)}")
+
+    def field(name: str) -> str:
+        if name not in header:
+            _reject(f"{path} metadata lacks {name!r}")
+        return header[name]
+
+    if field("format") != _HEAD_FORMAT or field("format_version") != _HEAD_FORMAT_VERSION:
+        _reject(f"{path} is not a {_HEAD_FORMAT} version {_HEAD_FORMAT_VERSION} file")
+    if int(field("pointer_dim")) != inventory.DECISION_POINTER_DIM:
+        _reject(f"pointer_dim {field('pointer_dim')} is not {inventory.DECISION_POINTER_DIM}")
+    if int(field("hidden_size")) != inventory.HIDDEN:
+        _reject(f"hidden_size {field('hidden_size')} is not {inventory.HIDDEN}")
+    if float(field("logit_scale")) != inventory.DECISION_LOGIT_SCALE:
+        _reject(f"logit_scale {field('logit_scale')} is not 1/sqrt(pointer_dim)")
+    if field("readout") != inventory.DECISION_READOUT:
+        _reject(f"readout {field('readout')!r} is not {inventory.DECISION_READOUT!r}")
+    if field("escape") != inventory.DECISION_ESCAPE:
+        _reject(f"escape {field('escape')!r} is not {inventory.DECISION_ESCAPE!r}")
+    delimiters = json.loads(field("delimiters"))
+    if delimiters != inventory.DECISION_DELIMITERS:
+        _reject(f"delimiters {delimiters} are not the registered {inventory.DECISION_DELIMITERS}")
+    if "delimiter_ids" in header:
+        ids = json.loads(header["delimiter_ids"])
+        if ids != inventory.DECISION_DELIMITER_IDS:
+            _reject(f"delimiter ids {ids} are not the base vocabulary's "
+                    f"{inventory.DECISION_DELIMITER_IDS}")
+
+    temperature = _float32(float(field("temperature")))
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        _reject(f"temperature {field('temperature')} is not a positive finite FP32 number")
+    date = release_date if release_date is not None else header.get("release_date", "")
+    if not date:
+        date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    metadata: dict[str, object] = {
+        "format": inventory.DECISION_FORMAT,
+        "format_version": inventory.DECISION_FORMAT_VERSION,
+        "pointer_dim": inventory.DECISION_POINTER_DIM,
+        "hidden_size": inventory.HIDDEN,
+        "logit_scale": inventory.DECISION_LOGIT_SCALE,
+        "temperature": temperature,
+        "readout": inventory.DECISION_READOUT,
+        "escape": inventory.DECISION_ESCAPE,
+        "delimiters": dict(inventory.DECISION_DELIMITERS),
+        "description": description if description is not None else header.get("description", ""),
+        "release_date": _release_date(date, "the decision head"),
+        "base_model": header.get("base_model", ""),
+    }
+    if set(metadata) != inventory.DECISION_METADATA_KEYS:
+        raise AssertionError("decision metadata disagrees with the registered member set")
+
+    shapes = dict(inventory.DECISION_HEAD_TENSORS)
+    dtypes = {str(tensor.dtype).removeprefix("torch.") for tensor in stored.values()}
+    tensors: dict[str, torch.Tensor] = {}
+    for key, name in _HEAD_OBJECTS.items():
+        tensor = stored[key]
+        if tensor.dtype not in (torch.float32, torch.bfloat16):
+            _reject(f"{key} is {tensor.dtype}; the pointer head converts from FP32 or BF16")
+        if tuple(tensor.shape) != shapes[name]:
+            _reject(f"{key} has shape {tuple(tensor.shape)}, expected {shapes[name]}")
+        if not bool(torch.isfinite(tensor).all()):
+            _reject(f"{key} holds a non-finite value")
+        tensors[name] = tensor.to(torch.bfloat16).contiguous()
+    return DecisionHead(
+        tensors=tensors, metadata=metadata, source=path, source_dtype=",".join(sorted(dtypes))
+    )
+
+
 def convert(
-    adapter_dir: Path, out_path: Path, zero_sites: frozenset[str] = frozenset()
+    adapter_dir: Path,
+    out_path: Path,
+    zero_sites: frozenset[str] = frozenset(),
+    decision_head: DecisionHead | None = None,
 ) -> dict[str, object]:
     started = time.perf_counter()
     config = load_adapter_config(adapter_dir)
@@ -316,9 +457,18 @@ def convert(
             )
 
     specs = inventory.build_tensor_specs(config.rank, site_keys)
-    container_specs = tuple(
+    if decision_head is not None:
+        specs += inventory.decision_head_specs()
+    container_specs: tuple[ArtifactTensorSpec | ArtifactResourceSpec, ...] = tuple(
         ArtifactTensorSpec(spec.name, spec.shape, spec.format, spec.layout) for spec in specs
     )
+    metadata_bytes = decision_head.metadata_bytes() if decision_head is not None else b""
+    if decision_head is not None:
+        container_specs += (
+            ArtifactResourceSpec(
+                inventory.DECISION_METADATA_OBJECT, RAW_BYTES_V1, len(metadata_bytes)
+            ),
+        )
     identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = ArtifactWriter(out_path, identity, container_specs)
@@ -336,6 +486,10 @@ def convert(
                 writer.write(a_name, encode_direct(a, "BF16"))
                 emitted.add(a_name)
             writer.write(inventory.b_object_name(layer, site), encode_direct(b, "BF16"))
+    if decision_head is not None:
+        for name, _shape in inventory.DECISION_HEAD_TENSORS:
+            writer.write(name, encode_direct(decision_head.tensors[name], "BF16"))
+        writer.write(inventory.DECISION_METADATA_OBJECT, metadata_bytes)
     writer.finish()  # raises unless every planned payload was written
 
     statistics = family_conversion.object_statistics(writer.objects)
@@ -363,6 +517,16 @@ def convert(
                 inventory.parameter_count(config.rank, live_sites) if live_sites else 0
             ),
         },
+        "kind": "decision" if decision_head is not None else "generative",
+        "decision": (
+            {
+                **decision_head.metadata,
+                "head_source": str(decision_head.source),
+                "head_source_dtype": decision_head.source_dtype,
+            }
+            if decision_head is not None
+            else None
+        ),
         "converter": {
             "revision": family_conversion.converter_revision(Path(__file__).resolve().parents[3]),
             "environment": family_conversion.environment(torch.device("cpu")),
@@ -388,12 +552,40 @@ def main() -> None:
         help="registered sites to write as an all-zero B plane. The site keeps its full "
              "inventory, so the result stays loadable in one bank alongside its unmasked peers.",
     )
+    parser.add_argument(
+        "--decision-head",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=f"the trainer's {_DECISION_HEAD_FILE}; makes a System One decision adapter",
+    )
+    parser.add_argument(
+        "--description", default=None, help="decision model-card description (overrides the head)"
+    )
+    parser.add_argument(
+        "--release-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="decision model-card release date (overrides the head; default: the head's, "
+             "else today in UTC)",
+    )
     args = parser.parse_args()
+    if args.decision_head is None and (args.description is not None or args.release_date):
+        parser.error("--description and --release-date apply only with --decision-head")
 
-    report = convert(args.adapter, args.out, frozenset(args.zero_sites))
+    head = (
+        load_decision_head(args.decision_head, args.description, args.release_date)
+        if args.decision_head is not None
+        else None
+    )
+    report = convert(args.adapter, args.out, frozenset(args.zero_sites), head)
     adapter = report["adapter"]
     objects = report["objects"]
     print(f"wrote {report['artifact']['path']}")
+    if head is not None:
+        decision = report["decision"]
+        print(f"  decision adapter  temperature {decision['temperature']}  "
+              f"release {decision['release_date']}")
     print(f"  rank {adapter['rank']}  alpha {adapter['lora_alpha']}  scale {adapter['folded_scale']}")
     print(f"  sites {', '.join(adapter['sites'])}")
     if adapter["zeroed_sites"]:

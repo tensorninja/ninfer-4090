@@ -176,35 +176,109 @@ public:
         friend class ConcurrentExecutor;
     };
 
+    // A decision's handle. Destroying it unconsumed cancels the decision.
+    class DecisionSubmission {
+    public:
+        DecisionSubmission() noexcept = default;
+
+        ~DecisionSubmission() { reset(); }
+
+        DecisionSubmission(DecisionSubmission&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)), request_(std::move(other.request_)) {}
+
+        DecisionSubmission& operator=(DecisionSubmission&& other) noexcept {
+            if (this != &other) {
+                reset();
+                owner_   = std::exchange(other.owner_, nullptr);
+                request_ = std::move(other.request_);
+            }
+            return *this;
+        }
+
+        DecisionSubmission(const DecisionSubmission&)            = delete;
+        DecisionSubmission& operator=(const DecisionSubmission&) = delete;
+
+        DecisionResult wait(const CancellationView& cancellation) {
+            if (owner_ == nullptr || request_ == nullptr) {
+                throw std::logic_error("decision submission is empty");
+            }
+            ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
+            return owner->wait_for_decision(std::exchange(request_, nullptr), cancellation);
+        }
+
+    private:
+        DecisionSubmission(ConcurrentExecutor& owner, std::shared_ptr<Request> request) noexcept
+            : owner_(&owner), request_(std::move(request)) {}
+
+        void reset() noexcept {
+            if (owner_ != nullptr && request_ != nullptr) {
+                owner_->abandon_request(std::move(request_));
+            }
+            owner_ = nullptr;
+        }
+
+        ConcurrentExecutor* owner_ = nullptr;
+        std::shared_ptr<Request> request_;
+
+        friend class ConcurrentExecutor;
+    };
+
+    // A System One decision joins the same bounded FIFO as a generation and is admitted under the
+    // same lane, KV and adapter-slot rules. `adapter_name` is echoed in the result.
+    DecisionSubmission submit_decision(targets::qwen3_8::DecisionPrompt prompt,
+                                       ResolvedDecisionOptions options, std::string adapter_name,
+                                       Clock::time_point pending_deadline = {}) {
+        const Clock::time_point submitted = Clock::now();
+        pending_deadline                  = resolve_pending_deadline(submitted, pending_deadline);
+        const std::uint64_t request_id    = claim_outstanding();
+        std::shared_ptr<Request> request;
+        try {
+            // The exact state is the decision's only cacheable unit. Its alias is namespaced by the
+            // adapter like every chat alias, since the state encodes the adapter's weights, and the
+            // lookup is descriptors only, as for a prompt boundary.
+            std::string state_alias;
+            CachedContinuation state_continuation;
+            if (continuation_lookup_enabled(static_cast<bool>(continuation_cache_),
+                                            options.allow_prefix_reuse)) {
+                if (std::optional<std::string> alias =
+                        instance_.program->decision_state_alias(prompt)) {
+                    state_alias = adapter_scoped_alias(
+                        instance_.program->adapter_scope(options.adapter), *alias);
+                    state_continuation = lookup_continuation(
+                        state_alias, ContinuationAliasKind::StablePrefix, false, true);
+                }
+            }
+            // Published at completion only when the alias names no usable image, so a state reused
+            // from L1 is republished only if its alias lapsed. An unavailable entry counts as
+            // lapsed: a cold recomputation is bit-identical and so re-stores the same content.
+            const bool publish_state =
+                !state_alias.empty() && !state_continuation.image &&
+                std::ranges::none_of(state_continuation.candidates, [](const auto& item) {
+                    return item.status == cache::CacheLookupStatus::Hit;
+                });
+            request = std::make_shared<Request>(
+                request_id,
+                DecisionWork{.summary       = prompt.summary,
+                             .prompt        = std::move(prompt),
+                             .options       = options,
+                             .adapter       = std::move(adapter_name),
+                             .state_alias   = std::move(state_alias),
+                             .publish_state = publish_state},
+                pending_deadline, submitted, std::move(state_continuation));
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
+        }
+        enqueue_pending(request);
+        return DecisionSubmission(*this, std::move(request));
+    }
+
     Submission submit(targets::qwen3_8::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
         const Clock::time_point submitted = Clock::now();
-        if (pending_deadline == Clock::time_point{}) {
-            pending_deadline = submitted + pending_timeout_;
-        }
-        if (submitted >= pending_deadline) {
-            // A refused request never reaches the request log, so ingress rejection is only
-            // visible if it is counted here.
-            continuation_stats_.rejected_queue_timeout.fetch_add(1, std::memory_order_relaxed);
-            throw RequestError(RequestErrorKind::QueueTimeout,
-                               "inference request expired before submission");
-        }
-
-        std::uint64_t request_id = 0;
-        {
-            std::lock_guard lock(queue_mutex_);
-            if (stopping_ || failed_) {
-                throw RequestError(RequestErrorKind::Unavailable,
-                                   "inference engine is unavailable");
-            }
-            if (outstanding_ >= max_outstanding_) {
-                continuation_stats_.rejected_overloaded.fetch_add(1, std::memory_order_relaxed);
-                throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
-            }
-            ++outstanding_;
-            request_id = next_request_id_++;
-        }
+        pending_deadline                  = resolve_pending_deadline(submitted, pending_deadline);
+        const std::uint64_t request_id    = claim_outstanding();
 
         // A continuation produced under one adapter encodes that adapter's weights in its KV and
         // GDN recurrent state, so every cache alias is namespaced by the selected adapter. This
@@ -276,18 +350,7 @@ public:
             release_reserved_capacity();
             throw;
         }
-
-        {
-            std::lock_guard lock(queue_mutex_);
-            if (stopping_ || failed_) {
-                --outstanding_;
-                release_stable_builders(request);
-                throw RequestError(RequestErrorKind::Unavailable,
-                                   "inference engine is unavailable");
-            }
-            pending_.push_back(request);
-        }
-        queue_cv_.notify_one();
+        enqueue_pending(request);
         return Submission(*this, std::move(request));
     }
 
@@ -614,6 +677,8 @@ private:
     // then publishes the image under `boundary_alias` (stable prefix, when non-empty) and under
     // `session` (session alias, when non-empty). The session part of an export job can be
     // superseded by a newer snapshot of the same session while queued; the boundary part cannot.
+    // A `decision_state` export job exports the lane's retained decision state instead, whose
+    // alias names its whole state (`boundary_depth` is the image frontier), and has no session.
     struct Publication {
         cache::ContinuationImage image;
         std::string session;
@@ -626,6 +691,7 @@ private:
         std::optional<std::uint32_t> export_lane;
         std::string boundary_alias;
         std::uint32_t boundary_depth = 0;
+        bool decision_state          = false;
     };
 
     struct PendingSessionPublication {
@@ -1053,8 +1119,11 @@ private:
                 // waits on the pending flag before reusing or releasing it.
                 const auto export_started = Clock::now();
                 try {
-                    item.image =
-                        instance_.program->export_continuation_lane_background(*item.export_lane);
+                    item.image = item.decision_state
+                                     ? instance_.program->export_decision_state_background(
+                                           *item.export_lane)
+                                     : instance_.program->export_continuation_lane_background(
+                                           *item.export_lane);
                 } catch (...) { export_failed = true; }
                 continuation_stats_.export_operations.fetch_add(1, std::memory_order_relaxed);
                 continuation_stats_.export_microseconds.fetch_add(
@@ -1078,8 +1147,12 @@ private:
             if (!item.boundary_alias.empty()) {
                 // The cache is content-addressed over the serialized image, parent included, so
                 // the boundary copy carries the session's parent too: both aliases then resolve
-                // to one L2 payload instead of storing the same state twice.
-                if (export_failed || item.image.boundary_tokens != item.boundary_depth) {
+                // to one L2 payload instead of storing the same state twice. A chat image serves
+                // its boundary alias at its turn checkpoint, a decision state at its frontier.
+                const std::uint64_t alias_depth = item.decision_state
+                                                      ? item.image.frontier_tokens
+                                                      : item.image.boundary_tokens;
+                if (export_failed || alias_depth != item.boundary_depth) {
                     threw = true;
                 } else {
                     boundary_status = run_publication(
@@ -1397,7 +1470,89 @@ private:
         }
     }
 
+    DecisionResult wait_for_decision(std::shared_ptr<Request> request,
+                                     const CancellationView& cancellation) {
+        struct ConsumerGuard {
+            ConcurrentExecutor* owner;
+            std::shared_ptr<Request> request;
+
+            ~ConsumerGuard() { owner->release_consumer(request); }
+        } guard{this, request};
+
+        std::exception_ptr caller_error;
+        for (;;) {
+            bool done = false;
+            {
+                std::unique_lock lock(request->mutex);
+                request->cv.wait_for(lock, std::chrono::milliseconds(10),
+                                     [&] { return request->done; });
+                done = request->done;
+            }
+            if (caller_error == nullptr) {
+                try {
+                    if (cancellation.requested()) {
+                        request->cancelled.store(true, std::memory_order_release);
+                        queue_cv_.notify_one();
+                    }
+                } catch (...) {
+                    caller_error = std::current_exception();
+                    request->cancelled.store(true, std::memory_order_release);
+                    queue_cv_.notify_one();
+                }
+            }
+            if (!done) { continue; }
+
+            if (caller_error != nullptr) { std::rethrow_exception(caller_error); }
+            std::lock_guard lock(request->mutex);
+            if (request->error != nullptr) { std::rethrow_exception(request->error); }
+            return std::move(request->decision->result);
+        }
+    }
+
+    // What a System One decision carries through the queue instead of a prompt, an output session
+    // and a budget. `prompt` moves into the Program at admission; `summary` stays for the result.
+    struct DecisionWork {
+        DecisionSummary summary;
+        targets::qwen3_8::DecisionPrompt prompt;
+        ResolvedDecisionOptions options;
+        std::string adapter;
+        // Adapter-scoped alias of the exact state row, empty when the cache is not consulted. The
+        // retained state is published under it at completion when submission found it unused.
+        std::string state_alias;
+        bool publish_state = false;
+        DecisionResult result;
+    };
+
     struct Request {
+        // A System One decision. It has no routing hint, prompt boundaries or output session. Its
+        // state candidates are a lane that retained the same adapter's decision state, planned per
+        // lane, and the cached image of exactly its state, looked up under `state_alias` and
+        // carried as the stable candidate pool.
+        Request(std::uint64_t request_identity, DecisionWork work, Clock::time_point limit,
+                Clock::time_point submit_time, CachedContinuation state_continuation)
+            : id(request_identity),
+              prompt_summary{.prompt_tokens = work.summary.input_tokens(), .has_media = false},
+              prepare_seconds(work.prompt.prepare_seconds), deadline(limit),
+              submitted(submit_time), stable_continuation(std::move(state_continuation)),
+              decision(std::move(work)) {
+            options.execution.adapter            = decision->options.adapter;
+            options.execution.allow_prefix_reuse = decision->options.allow_prefix_reuse;
+            continuation.lookup_microseconds     = stable_continuation.lookup_microseconds;
+            if (!decision->options.allow_prefix_reuse) {
+                continuation.final_miss_reason = ContinuationMissReason::Disabled;
+            } else {
+                if (!decision->state_alias.empty()) {
+                    continuation.alias_kind = ContinuationAliasKind::StablePrefix;
+                }
+                continuation.final_miss_reason =
+                    stable_continuation.status == cache::CacheLookupStatus::UnavailableOrCorrupt
+                        ? ContinuationMissReason::EntryUnavailableOrCorrupt
+                        : (!stable_continuation.image && stable_continuation.candidates.empty()
+                               ? ContinuationMissReason::NoAlias
+                               : ContinuationMissReason::NotAttempted);
+            }
+        }
+
         Request(std::uint64_t request_identity, targets::qwen3_8::PreparedPrompt input,
                 targets::qwen3_8::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
@@ -1498,6 +1653,8 @@ private:
         std::uint64_t continuation_l3_restore_microseconds = 0;
         std::uint64_t continuation_l3_restore_operations = 0;
         ContinuationDiagnostics continuation;
+        // Set for a System One decision, whose prompt/output/budget fields stay empty.
+        std::optional<DecisionWork> decision;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -1566,6 +1723,51 @@ private:
             }
         }
         request->cv.notify_one();
+    }
+
+    // Defaults an unset pending deadline to the Engine timeout and refuses one already past.
+    [[nodiscard]] Clock::time_point resolve_pending_deadline(Clock::time_point submitted,
+                                                             Clock::time_point pending_deadline) {
+        if (pending_deadline == Clock::time_point{}) {
+            pending_deadline = submitted + pending_timeout_;
+        }
+        if (submitted >= pending_deadline) {
+            // A refused request never reaches the request log, so ingress rejection is only
+            // visible if it is counted here.
+            continuation_stats_.rejected_queue_timeout.fetch_add(1, std::memory_order_relaxed);
+            throw RequestError(RequestErrorKind::QueueTimeout,
+                               "inference request expired before submission");
+        }
+        return pending_deadline;
+    }
+
+    // Claims one place of the bounded ingress and returns the new request's id.
+    [[nodiscard]] std::uint64_t claim_outstanding() {
+        std::lock_guard lock(queue_mutex_);
+        if (stopping_ || failed_) {
+            throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
+        }
+        if (outstanding_ >= max_outstanding_) {
+            continuation_stats_.rejected_overloaded.fetch_add(1, std::memory_order_relaxed);
+            throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
+        }
+        ++outstanding_;
+        return next_request_id_++;
+    }
+
+    // Queues a request holding an ingress place; a stopped Engine takes the place back.
+    void enqueue_pending(const std::shared_ptr<Request>& request) {
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) {
+                --outstanding_;
+                release_stable_builders(request);
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "inference engine is unavailable");
+            }
+            pending_.push_back(request);
+        }
+        queue_cv_.notify_one();
     }
 
     void release_reserved_capacity() noexcept {
@@ -1739,15 +1941,42 @@ private:
             retained_checkpoints_cache_[*request->lane] =
                 instance_.program->retained_lane_checkpoints(*request->lane);
         }
-        if (request->continuation.source != ContinuationSource::None) {
-            request->continuation.final_miss_reason = ContinuationMissReason::None;
+        account_continuation(*request);
+        result.continuation = request->continuation;
+        if (request->first_token) {
+            result.timings.first_token_seconds =
+                request->prepare_seconds +
+                std::chrono::duration<double>(*request->first_token - request->submitted).count();
+        }
+        result.timings.prepare_seconds = request->prepare_seconds;
+        result.timings.queue_seconds   = queue_seconds;
+        result.timings.publish_seconds = request->publish_seconds;
+        result.timings.total_seconds =
+            request->prepare_seconds +
+            std::chrono::duration<double>(Clock::now() - request->submitted).count();
+        {
+            std::lock_guard lock(request->mutex);
+            if (request->done) { return; }
+            request->result = std::move(result);
+            request->done   = true;
+        }
+        if (mark_completed(request)) { release_reserved_capacity(); }
+        request->cv.notify_one();
+    }
+
+    // Folds one completed request's continuation outcome into the cumulative metrics: the tier a
+    // restored state came from, or why none was, and the request's preflight and restore costs.
+    // A generation and a decision are accounted alike.
+    void account_continuation(Request& request) {
+        if (request.continuation.source != ContinuationSource::None) {
+            request.continuation.final_miss_reason = ContinuationMissReason::None;
             auto add_tier = [&](std::uint64_t& successes, std::uint64_t& tokens,
                                 std::uint64_t& bytes) {
                 ++successes;
-                tokens += request->continuation.restored_tokens;
-                bytes += request->continuation.restored_bytes;
+                tokens += request.continuation.restored_tokens;
+                bytes += request.continuation.restored_bytes;
             };
-            switch (request->continuation.source) {
+            switch (request.continuation.source) {
             case ContinuationSource::L1:
                 add_tier(cumulative_stats_.continuation_l1_restore_successes,
                          cumulative_stats_.continuation_l1_restored_tokens,
@@ -1765,13 +1994,13 @@ private:
                 break;
             case ContinuationSource::None: break;
             }
-            if (request->continuation.alias_kind == ContinuationAliasKind::Session) {
+            if (request.continuation.alias_kind == ContinuationAliasKind::Session) {
                 ++cumulative_stats_.continuation_session_restores;
-            } else if (request->continuation.alias_kind == ContinuationAliasKind::StablePrefix) {
+            } else if (request.continuation.alias_kind == ContinuationAliasKind::StablePrefix) {
                 ++cumulative_stats_.continuation_stable_prefix_restores;
             }
         } else {
-            switch (request->continuation.final_miss_reason) {
+            switch (request.continuation.final_miss_reason) {
             case ContinuationMissReason::Disabled:
                 ++cumulative_stats_.continuation_miss_disabled;
                 break;
@@ -1802,43 +2031,29 @@ private:
             case ContinuationMissReason::None: break;
             }
         }
-        if (request->continuation_preflight_operations != 0) {
+        if (request.continuation_preflight_operations != 0) {
             cumulative_stats_.continuation_preflight_operations +=
-                request->continuation_preflight_operations;
+                request.continuation_preflight_operations;
             cumulative_stats_.continuation_preflight_microseconds +=
-                request->continuation.preflight_microseconds;
+                request.continuation.preflight_microseconds;
         }
         cumulative_stats_.continuation_l2_restore_operations +=
-            request->continuation_l2_restore_operations;
+            request.continuation_l2_restore_operations;
         cumulative_stats_.continuation_l2_restore_microseconds +=
-            request->continuation_l2_restore_microseconds;
+            request.continuation_l2_restore_microseconds;
         cumulative_stats_.continuation_l3_restore_operations +=
-            request->continuation_l3_restore_operations;
+            request.continuation_l3_restore_operations;
         cumulative_stats_.continuation_l3_restore_microseconds +=
-            request->continuation_l3_restore_microseconds;
-        result.continuation = request->continuation;
-        if (request->first_token) {
-            result.timings.first_token_seconds =
-                request->prepare_seconds +
-                std::chrono::duration<double>(*request->first_token - request->submitted).count();
-        }
-        result.timings.prepare_seconds = request->prepare_seconds;
-        result.timings.queue_seconds   = queue_seconds;
-        result.timings.publish_seconds = request->publish_seconds;
-        result.timings.total_seconds =
-            request->prepare_seconds +
-            std::chrono::duration<double>(Clock::now() - request->submitted).count();
-        {
-            std::lock_guard lock(request->mutex);
-            if (request->done) { return; }
-            request->result = std::move(result);
-            request->done   = true;
-        }
-        if (mark_completed(request)) { release_reserved_capacity(); }
-        request->cv.notify_one();
+            request.continuation_l3_restore_microseconds;
     }
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
+        if (request->decision) {
+            complete_error(request, std::make_exception_ptr(RequestError(
+                                        RequestErrorKind::Cancelled,
+                                        "decision was cancelled before it completed")));
+            return;
+        }
         (void)request->output.preview_terminal(FinishReason::Cancelled);
         append_output(request, request->output.commit_preview());
         complete_success(request, FinishReason::Cancelled);
@@ -2307,8 +2522,132 @@ private:
         return active;
     }
 
+    // One decision unit ran. A decision ends in its own completion rather than a licensed token:
+    // the lane hands back the probabilities and keeps the state [0, Ls) as a retained decision
+    // state for the next decision of the same adapter.
+    void resolve_decision_step(const std::shared_ptr<Request>& request,
+                               const PrefillStepResult& step, bool cancel_at_boundary) {
+        if (!request->lane) { throw std::logic_error("decision step has no request lane"); }
+        const std::uint32_t lane = *request->lane;
+        cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->prefill_processed.fetch_add(step.processed_prompt_tokens,
+                                             std::memory_order_relaxed);
+        request->prefill_reused.store(step.summary.reused_prompt_tokens,
+                                      std::memory_order_relaxed);
+        consume_service_work(request, 1);
+        if (!step.complete) {
+            if (cancel_at_boundary) {
+                leave_prefill(lane);
+                instance_.program->abort_lane(lane);
+                lane_sessions_[lane].reset();
+                complete_cancelled(request);
+                remove_completed_slot(lane);
+            }
+            return;
+        }
+
+        leave_prefill(lane);
+        request->begin = step.summary;
+        targets::qwen3_8::DecisionOutcome outcome = instance_.program->take_decision_lane(lane);
+        const Clock::time_point completed         = Clock::now();
+        DecisionWork& work                        = *request->decision;
+        DecisionResult& result                    = work.result;
+        result.probabilities                      = std::move(outcome.probabilities);
+        result.summary                            = work.summary;
+        result.reused_state_tokens                = outcome.reused_state_tokens;
+        // Admission classified a resident state as L1 unless a restore had already named the tier
+        // it imported the state from.
+        result.state_source = outcome.reused_state_tokens == 0 ? ContinuationSource::None
+                              : request->continuation.source != ContinuationSource::None
+                                  ? request->continuation.source
+                                  : ContinuationSource::L1;
+        result.branch_passes     = outcome.branch_passes;
+        result.long_branch_chunks = outcome.long_branch_chunks;
+        result.adapter           = work.adapter;
+        result.slot              = static_cast<std::int32_t>(lane);
+        const Clock::time_point admitted = request->admitted.value_or(request->submitted);
+        result.timings = DecisionTimings{
+            .prepare_seconds = request->prepare_seconds,
+            .queue_seconds   = std::chrono::duration<double>(admitted - request->submitted).count(),
+            .restore_seconds =
+                static_cast<double>(request->continuation.restore_microseconds) / 1e6,
+            .state_seconds   = outcome.state_seconds,
+            .branch_seconds  = outcome.branch_seconds,
+            .execution_seconds = std::chrono::duration<double>(completed - admitted).count(),
+            .total_seconds =
+                request->prepare_seconds +
+                std::chrono::duration<double>(completed - request->submitted).count(),
+        };
+        lane_sessions_[lane].reset();
+        if (instance_.program->has_retained_lane(lane)) {
+            retained_last_used_[lane]     = completed;
+            retained_digest_cache_[lane]  = instance_.program->retained_lane_digest(lane);
+            retained_checkpoints_cache_[lane].clear();
+            publish_decision_state(request, lane);
+        } else {
+            retained_digest_cache_[lane].clear();
+            retained_checkpoints_cache_[lane].clear();
+        }
+        account_continuation(*request);
+        remove_completed_slot(lane);
+        (void)enforce_l1_retention();
+        publish_runtime_stats();
+        complete_decision(request);
+    }
+
+    // The decision counterpart of publish_retained_completion's boundary part. The retained state
+    // is published under its exact-state alias when submission found that alias unused, so a
+    // state reused from L1 or restored from L2/L3 is republished only if its alias had lapsed.
+    // The execution thread fences the lane and queues the export; the publication worker copies
+    // it out, and every path that reuses or releases the lane first waits on wait_lane_export.
+    void publish_decision_state(const std::shared_ptr<Request>& request,
+                                std::uint32_t lane) noexcept {
+        const DecisionWork& work = *request->decision;
+        lane_provenance_[lane]   = completion_publication_provenance(
+            lane_provenance_[lane], work.state_alias.empty() ? ContinuationAliasKind::None
+                                                             : ContinuationAliasKind::StablePrefix);
+        if (!continuation_cache_ || !request->options.execution.allow_prefix_reuse ||
+            !work.publish_state || !instance_.program->retained_lane_holds_decision(lane)) {
+            return;
+        }
+        const auto publish_started = Clock::now();
+        try {
+            Publication job;
+            job.export_lane    = lane;
+            job.decision_state = true;
+            job.boundary_alias = work.state_alias;
+            job.boundary_depth = work.summary.state_tokens;
+            instance_.program->fence_lane_for_export(lane);
+            if (enqueue_publication(std::move(job))) {
+                request->deepest_published_depth = work.summary.state_tokens;
+                request->continuation.completion_publication_queued = true;
+            }
+        } catch (...) {
+            // The cached state is an optimization; the decision has already completed.
+        }
+        const double publish_seconds =
+            std::chrono::duration<double>(Clock::now() - publish_started).count();
+        request->publish_seconds += publish_seconds;
+        cumulative_stats_.worker_publish_seconds += publish_seconds;
+    }
+
+    void complete_decision(const std::shared_ptr<Request>& request) {
+        release_planning_state(request);
+        {
+            std::lock_guard lock(request->mutex);
+            if (request->done) { return; }
+            request->done = true;
+        }
+        if (mark_completed(request)) { release_reserved_capacity(); }
+        request->cv.notify_one();
+    }
+
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
+        if (request->decision) {
+            resolve_decision_step(request, step, cancel_at_boundary);
+            return;
+        }
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         request->prefill_processed.fetch_add(step.processed_prompt_tokens,
                                              std::memory_order_relaxed);
@@ -2520,7 +2859,11 @@ private:
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
             request->base_plan.emplace(
-                instance_.program->plan_request_base(request->prompt, request->options.execution));
+                request->decision
+                    ? instance_.program->plan_decision_base(request->decision->prompt,
+                                                            request->decision->options)
+                    : instance_.program->plan_request_base(request->prompt,
+                                                           request->options.execution));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.admission.active_lanes != 1 || summary.service_work_quanta == 0) {
@@ -2535,8 +2878,13 @@ private:
             return;
         }
         request->lane_plans[lane].reset();
-        request->lane_plans[lane].emplace(instance_.program->plan_request_for_lane(
-            lane, request->prompt, *request->base_plan, capture_depths(*request)));
+        request->lane_plans[lane].emplace(
+            request->decision
+                ? instance_.program->plan_decision_for_lane(lane, request->decision->prompt,
+                                                            *request->base_plan)
+                : instance_.program->plan_request_for_lane(lane, request->prompt,
+                                                           *request->base_plan,
+                                                           capture_depths(*request)));
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
@@ -2562,6 +2910,10 @@ private:
         if (request->continuation_restore_attempted && !request->continuation_restore_deferred_kv) {
             return;
         }
+        // A decision runs the stable-candidate path below with its cached exact state as the only
+        // candidate: it has no routed session, and lane planning ranks its retained L1 states, so
+        // an image is restored only when no idle lane already holds the whole state. The target
+        // calls it makes are the decision-state kind's.
         if (request->continuation_restore_deferred_kv) {
             // Re-resolving a candidate costs a lookup and a preflight, so only pay it once the
             // reservation could actually be satisfied. The restore reserves exactly the pages a
@@ -2648,7 +3000,12 @@ private:
                 ++request->continuation_preflight_operations;
                 std::uint32_t divergence = 0;
                 const std::uint32_t depth =
-                    instance_.program->preflight_continuation(image, request->prompt, &divergence);
+                    request->decision
+                        ? instance_.program->preflight_decision_state(
+                              image, request->decision->prompt, request->options.execution.adapter,
+                              &divergence)
+                        : instance_.program->preflight_continuation(image, request->prompt,
+                                                                    &divergence);
                 request->continuation.preflight_microseconds += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started)
                         .count());
@@ -2674,7 +3031,11 @@ private:
                 const auto started = Clock::now();
                 ++request->continuation_preflight_operations;
                 const std::uint32_t depth =
-                    instance_.program->preflight_continuation_metadata(item, request->prompt);
+                    request->decision
+                        ? instance_.program->preflight_decision_state_metadata(
+                              item, request->decision->prompt)
+                        : instance_.program->preflight_continuation_metadata(item,
+                                                                             request->prompt);
                 request->continuation.preflight_microseconds += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started)
                         .count());
@@ -2751,12 +3112,18 @@ private:
                     take_prepared_continuation(candidate.id);
                 if (!decoded) {
                     continuation_preparation_inline_.fetch_add(1, std::memory_order_relaxed);
-                    decoded = instance_.program->decode_continuation(*candidate.image);
+                    decoded = request->decision
+                                  ? instance_.program->decode_decision_state(*candidate.image)
+                                  : instance_.program->decode_continuation(*candidate.image);
                 }
                 const ContinuationRestoreFailure failure =
-                    instance_.program->import_continuation_lane(
-                        lane, *candidate.image, *decoded, request->prompt,
-                        request->options.execution.adapter, required);
+                    request->decision
+                        ? instance_.program->import_decision_state_lane(
+                              lane, *candidate.image, *decoded, request->decision->prompt,
+                              request->options.execution.adapter, required)
+                        : instance_.program->import_continuation_lane(
+                              lane, *candidate.image, *decoded, request->prompt,
+                              request->options.execution.adapter, required);
                 const bool restored = failure == ContinuationRestoreFailure::None;
                 const std::uint64_t restore_microseconds = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
@@ -3135,13 +3502,16 @@ private:
             lane_session_path_[lane].clear();
         }
 
+        // A decision always has branch units left after its reusable state.
         const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
         bool target_started      = false;
         try {
-            request->budget.emplace(summary.effective_output_tokens,
-                                    summary.effective_limit_reason);
-            if (repetition_guard_.enabled) { request->repetition.emplace(repetition_guard_); }
-            request->generated.reserve(summary.effective_output_tokens);
+            if (!request->decision) {
+                request->budget.emplace(summary.effective_output_tokens,
+                                        summary.effective_limit_reason);
+                if (repetition_guard_.enabled) { request->repetition.emplace(repetition_guard_); }
+                request->generated.reserve(summary.effective_output_tokens);
+            }
             const auto admitted_at          = Clock::now();
             request->lane                   = lane;
             request->admitted               = admitted_at;
@@ -3171,8 +3541,12 @@ private:
             target_started                = true;
             const auto unit_started       = Clock::now();
             const auto opening_watts      = sample_board_watts();
-            const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+            const PrefillStepResult first =
+                request->decision
+                    ? instance_.program->start_decision_lane(
+                          lane, std::move(request->decision->prompt), std::move(selected_plan))
+                    : instance_.program->start_prefill_lane(lane, std::move(request->prompt),
+                                                            std::move(selected_plan), transient);
             const auto unit_ended    = Clock::now();
             const auto closing_watts = sample_board_watts();
             cumulative_stats_.prefill_seconds_total +=

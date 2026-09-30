@@ -196,6 +196,79 @@ runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t 
 }
 
 template <>
+RequestBasePlan<Variant>
+Program<Variant>::plan_decision_base(const DecisionPrompt& prompt,
+                                     const runtime::ResolvedDecisionOptions& options) {
+    return impl_->plan_decision_base(prompt, options);
+}
+
+template <>
+RequestPlan<Variant> Program<Variant>::plan_decision_for_lane(std::uint32_t lane,
+                                                              const DecisionPrompt& prompt,
+                                                              const RequestBasePlan<Variant>& base) {
+    return impl_->plan_decision_for_lane(lane, prompt, base);
+}
+
+template <>
+runtime::PrefillStepResult Program<Variant>::start_decision_lane(std::uint32_t lane,
+                                                                 DecisionPrompt&& prompt,
+                                                                 RequestPlan<Variant>&& plan) {
+    return impl_->start_decision_lane(lane, std::move(prompt), std::move(plan));
+}
+
+template <>
+DecisionOutcome Program<Variant>::take_decision_lane(std::uint32_t lane) {
+    return impl_->take_decision_lane(lane);
+}
+
+template <>
+bool Program<Variant>::retained_lane_holds_decision(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_holds_decision(lane);
+}
+
+template <>
+std::optional<std::string>
+Program<Variant>::decision_state_alias(const DecisionPrompt& prompt) const {
+    return impl_->decision_state_alias(prompt);
+}
+
+template <>
+cache::ContinuationImage
+Program<Variant>::export_decision_state_background(std::uint32_t lane) const {
+    return impl_->export_decision_state_background(lane);
+}
+
+template <>
+std::uint32_t Program<Variant>::preflight_decision_state_metadata(
+    const cache::SessionCandidateDescriptor& candidate,
+    const DecisionPrompt& prompt) const noexcept {
+    return impl_->preflight_decision_state_metadata(candidate, prompt);
+}
+
+template <>
+std::uint32_t Program<Variant>::preflight_decision_state(const cache::ContinuationImage& image,
+                                                         const DecisionPrompt& prompt,
+                                                         std::int32_t adapter,
+                                                         std::uint32_t* divergence_tokens) const
+    noexcept {
+    return impl_->preflight_decision_state(image, prompt, adapter, divergence_tokens);
+}
+
+template <>
+std::shared_ptr<DecodedContinuation>
+Program<Variant>::decode_decision_state(const cache::ContinuationImage& image) const {
+    return impl_->decode_decision_state(image);
+}
+
+template <>
+ContinuationRestoreFailure Program<Variant>::import_decision_state_lane(
+    std::uint32_t lane, const cache::ContinuationImage& image, const DecodedContinuation& decoded,
+    const DecisionPrompt& prompt, std::int32_t adapter,
+    runtime::KvPageFootprint entitlement) noexcept {
+    return impl_->import_decision_state_lane(lane, image, decoded, prompt, adapter, entitlement);
+}
+
+template <>
 runtime::BatchedGeneratedRound
 Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
                                std::span<const runtime::RoundBudget> budgets) {

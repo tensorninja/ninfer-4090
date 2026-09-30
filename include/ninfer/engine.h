@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer {
@@ -56,6 +58,57 @@ private:
     friend class Engine;
 };
 
+// An escaped, tokenized and laid-out decision, ready to submit.
+class PreparedDecision {
+public:
+    PreparedDecision() noexcept;
+    ~PreparedDecision();
+
+    PreparedDecision(PreparedDecision&&) noexcept;
+    PreparedDecision& operator=(PreparedDecision&&) noexcept;
+
+    PreparedDecision(const PreparedDecision&)            = delete;
+    PreparedDecision& operator=(const PreparedDecision&) = delete;
+
+    [[nodiscard]] const DecisionSummary& summary() const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept;
+
+    // The laid-out tokens (the state row, then every branch in request order) and each
+    // question's branch, retained for parity tools. Empty when the decision is empty.
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
+    [[nodiscard]] std::span<const DecisionBranch> branches() const noexcept;
+
+private:
+    class Impl;
+    explicit PreparedDecision(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend class Engine;
+};
+
+class DecisionHandle {
+public:
+    DecisionHandle() noexcept;
+    ~DecisionHandle();
+
+    DecisionHandle(DecisionHandle&&) noexcept;
+    DecisionHandle& operator=(DecisionHandle&&) noexcept;
+
+    DecisionHandle(const DecisionHandle&)            = delete;
+    DecisionHandle& operator=(const DecisionHandle&) = delete;
+
+    [[nodiscard]] explicit operator bool() const noexcept;
+
+    DecisionResult wait(const CancellationView& cancellation = {});
+
+private:
+    class Impl;
+    explicit DecisionHandle(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend class Engine;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -87,6 +140,21 @@ public:
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
+
+    // System One decisions. prepare_decision escapes, tokenizes and lays out the rendered input
+    // and throws DecisionInputError when it does not fit its budgets; submit_decision joins the
+    // same bounded FIFO as generation. Both throw RequestError(Unavailable) on a target without
+    // decision support; submit_decision throws RequestError(UnknownAdapter) unless the options
+    // name a decision adapter.
+    [[nodiscard]] PreparedDecision prepare_decision(DecisionInput input) const;
+    [[nodiscard]] DecisionHandle
+    submit_decision(PreparedDecision decision, DecisionOptions options,
+                    std::chrono::steady_clock::time_point pending_deadline = {});
+    DecisionResult decide(PreparedDecision decision, DecisionOptions options,
+                          const CancellationView& cancellation = {});
+
+    // Tokens of plain text encoded with added-token parsing and no template.
+    [[nodiscard]] std::uint32_t count_text_tokens(std::string_view text) const;
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;

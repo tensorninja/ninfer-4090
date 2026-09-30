@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include "targets/qwen3_8/impl/frontend/chat_template.h"
+#include "targets/qwen3_8/impl/frontend/decision_template.h"
 #include "targets/qwen3_8/impl/frontend/processor.h"
 #include "targets/qwen3_8/impl/frontend/test_access.h"
 #include "targets/qwen3_8/impl/frontend/tokenizer.h"
@@ -651,12 +652,20 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        // Every registered family tokenizer carries the decision delimiters; a component test
+        // tokenizer may not, and then only decisions are unavailable.
+        try {
+            decision_delimiters = fi::resolve_decision_delimiters(*tokenizer);
+        } catch (const std::out_of_range&) {
+            if (registered_checkpoint) { throw; }
+        }
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
+    std::optional<DecisionDelimiters> decision_delimiters;
     bool vision_enabled                             = true;
     PrefixCheckpointPolicy prefix_checkpoint_policy = PrefixCheckpointPolicy::RollingTool;
 };
@@ -990,6 +999,24 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
+}
+
+DecisionPrompt Frontend::prepare_decision(const DecisionInput& input) const {
+    const auto start = Clock::now();
+    if (!impl_->decision_delimiters.has_value()) {
+        throw std::logic_error("this tokenizer has no System One decision delimiters");
+    }
+    DecisionPrompt prompt = fi::layout_decision(*impl_->tokenizer, *impl_->decision_delimiters, input);
+    prompt.prepare_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    return prompt;
+}
+
+std::uint32_t Frontend::count_text_tokens(std::string_view text) const {
+    const std::size_t count = impl_->tokenizer->encode(text).size();
+    if (count > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("text exceeds 4294967295 tokens");
+    }
+    return static_cast<std::uint32_t>(count);
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,

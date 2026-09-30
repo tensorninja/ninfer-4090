@@ -142,12 +142,33 @@ struct LoraOptions {
     std::int32_t rank_ceiling = 0;
 };
 
+// What an adapter serves. A generative adapter is a chat model of the OpenAI/Anthropic surface;
+// a decision adapter carries a System One pointer head and is served only through decisions.
+enum class LoraAdapterKind : std::uint8_t {
+    Generative,
+    Decision,
+};
+
+// Host metadata of one discovered adapter.
+struct LoraAdapterInfo {
+    std::string name;
+    LoraAdapterKind kind = LoraAdapterKind::Generative;
+    // The adapter's own rank before bank padding.
+    std::int32_t rank = 0;
+    // Decision adapters only: the calibrated temperature the pointer logits are divided by, the
+    // pointer dimension, and the model-card description and release date (YYYY-MM-DD).
+    float temperature         = 1.0F;
+    std::uint32_t pointer_dim = 0;
+    std::string description;
+    std::string release_date;
+};
+
 // What a target package committed when it attached the adapter pool. Returned by
 // `Package::attach_lora` so the loader publishes the pool and the resident bank's cost once, at
 // the point that knows it, instead of discarding it and leaving the bytes unattributable later.
 struct LoraAttachment {
-    // Discovered adapter names in pool order; empty when no adapter was discovered.
-    std::vector<std::string> names;
+    // Discovered adapters in pool order; empty when no adapter was discovered.
+    std::vector<LoraAdapterInfo> adapters;
     // Bank rank. Every pool adapter executes at this rank; a lower-rank adapter is zero-padded
     // into it, which is exact because the padded factors contribute nothing.
     std::int32_t rank = 0;
@@ -423,6 +444,9 @@ enum class RequestErrorKind : std::uint8_t {
     Unavailable,
     // The request named a LoRA adapter that was not registered at startup.
     UnknownAdapter,
+    // A decision was cancelled before it produced its result. A cancelled generation instead
+    // finishes with FinishReason::Cancelled and keeps what it had produced.
+    Cancelled,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -675,6 +699,100 @@ struct GenerationResult {
     // identifying digest (see SlotState) - the handle a client needs for /slots operations.
     std::int32_t slot = -1;
     std::string session_digest;
+};
+
+// System One decisions. A decision is a prefill-only request of a decision adapter: the state,
+// then one branch per question whose option and decide readouts feed the adapter's pointer head.
+// It never samples, decodes or drafts.
+//
+// One question after product-side rendering: its instruction text and its option texts in option
+// order (1 to kMaximumDecisionOptions). The engine escapes, tokenizes and lays the texts out; it
+// never interprets question types.
+inline constexpr std::uint32_t kMaximumDecisionOptions = 255;
+
+struct DecisionQuestion {
+    std::string instructions;
+    std::vector<std::string> options;
+};
+
+// The rendered state and at least one question, in request order.
+struct DecisionInput {
+    std::string state;
+    std::vector<DecisionQuestion> questions;
+};
+
+// Token accounting of one prepared decision.
+struct DecisionSummary {
+    // The state including its delimiter (the branch position origin).
+    std::uint32_t state_tokens = 0;
+    // Every question branch, and the longest one.
+    std::uint32_t branch_tokens  = 0;
+    std::uint32_t longest_branch = 0;
+    std::uint32_t questions      = 0;
+    std::uint32_t options        = 0;
+    // The state text encoded to more tokens than a state holds and was cut to its head.
+    bool state_truncated = false;
+
+    [[nodiscard]] std::uint32_t input_tokens() const noexcept {
+        return state_tokens + branch_tokens;
+    }
+};
+
+// One question's branch in a prepared decision's token layout (kev model.encode): the state row
+// [<|fim_prefix|>, state...] is followed, per question in request order, by the branch
+// [<|fim_middle|>, instructions..., (<|box_start|>, option..., <|box_end|>)..., <|fim_suffix|>].
+struct DecisionBranch {
+    // Offset of the branch's first token in the layout, and its length.
+    std::uint32_t begin  = 0;
+    std::uint32_t length = 0;
+    // Branch-relative offsets of each option's closing delimiter, in option order. The decide
+    // readout is the branch's last token.
+    std::vector<std::uint32_t> option_readouts;
+};
+
+// A decision that does not fit its token budgets. `what()` is the client-visible detail.
+class DecisionInputError final : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
+struct DecisionOptions {
+    // The decision adapter to answer with. Required.
+    std::string adapter;
+    // Restore a cached state and retain/publish this one. Off computes the state cold.
+    bool allow_prefix_reuse = true;
+};
+
+struct DecisionTimings {
+    double prepare_seconds = 0.0; // Escape, tokenize and lay out (host, before submission).
+    // Submission to admission. It includes restore_seconds: a cached image is imported into the
+    // lane just before admission.
+    double queue_seconds   = 0.0;
+    double restore_seconds = 0.0; // Import of an L2/L3 state image; zero for L1 or a cold state.
+    double state_seconds   = 0.0; // State prefill.
+    double branch_seconds  = 0.0; // Branch passes, long-branch chunks, readout and head.
+    double execution_seconds = 0.0; // Admission to result.
+    double total_seconds     = 0.0; // Submission to result.
+
+    // The engine's time on this decision without its queue wait: the restore plus execution.
+    // System One reports it as `latency_ms`.
+    [[nodiscard]] double engine_seconds() const noexcept {
+        return restore_seconds + execution_seconds;
+    }
+};
+
+struct DecisionResult {
+    // Per question in request order, the option probabilities in option order.
+    std::vector<std::vector<float>> probabilities;
+    DecisionSummary summary;
+    // State tokens restored instead of computed, and where they came from.
+    std::uint32_t reused_state_tokens = 0;
+    ContinuationSource state_source   = ContinuationSource::None;
+    std::uint32_t branch_passes       = 0;
+    std::uint32_t long_branch_chunks  = 0;
+    DecisionTimings timings;
+    std::string adapter;
+    std::int32_t slot = -1;
 };
 
 struct ArenaMemorySummary {
@@ -946,9 +1064,11 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
-    // Discovered adapter names in pool order; empty when no adapter was discovered. Every name
-    // here is selectable by a request regardless of what is currently resident.
-    std::vector<std::string> lora_adapter_names;
+    // Discovered adapters in pool order; empty when no adapter was discovered. Every adapter
+    // here is selectable by a request of its kind regardless of what is currently resident.
+    std::vector<LoraAdapterInfo> lora_adapters;
+    // The loaded target serves System One decisions (a compile-time trait of its package).
+    bool decisions_supported = false;
     // Bank rank, resident slot count, the device bytes the bank cost, and the disk bytes the
     // whole pool occupies. A lower-rank pool adapter is zero-padded into the bank rank.
     std::int32_t lora_rank             = 0;

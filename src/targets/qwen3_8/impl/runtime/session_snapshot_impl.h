@@ -347,6 +347,9 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     if (!sequence.retained || !sequence.kv) {
         throw std::invalid_argument("lane holds no retained session");
     }
+    if (sequence.decision_state) {
+        throw std::invalid_argument("lane holds a System One decision state, not a chat session");
+    }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         throw std::invalid_argument("session persistence does not support the DFlash backend");
     }

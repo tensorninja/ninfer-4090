@@ -57,36 +57,45 @@ ops::LinearPolicy text_policy(const Weight& weight) {
     return weight.qtype == QType::NVFP4 ? kNvfp4TextPolicy : ops::LinearPolicy::A16Only;
 }
 
-// The permitted activation-compute profile is per-Op: an Op admits AllowA8 only
-// where it has a qualified INT8 route. See docs/maintainer/op-development.md
-// section 2.1 for what that profile means and where it may be registered.
-ops::LinearPolicy text_swiglu_policy(const Weight& weight) {
-    if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
-    return weight.qtype == QType::Q4G64_F16S ? ops::LinearPolicy::AllowA8
-                                             : ops::LinearPolicy::A16Only;
+// The permitted activation-compute profile is per-Op and per phase: an Op admits AllowA8 only
+// where it has a qualified INT8 route (docs/maintainer/op-development.md section 2.1), and only
+// in Prefill. Verify carries the committed decode path, whose numerics stay bit-identical to the
+// A16 catalog, and is the phase that CUDA Graphs capture; its widths (at most 8 x 6 columns) never
+// reach an INT8-only route either. Every unit of a System One decision, state chunks and branch
+// passes alike, runs in Decision: its probabilities are held to kev's serving tolerance against the
+// BF16 evaluation path, which group-64 activation quantization alone exceeds.
+//
+// The projection pairs feed the attention scores and the FP32 GDN recurrence, so A8 there does
+// move greedy output. That is an accepted property of the Prefill profile, not a defect: prefix
+// reuse reproduces the input semantics of full prefill, not its arithmetic.
+bool admits_a8(qwen3_8::TextPhase phase) {
+    return phase == qwen3_8::TextPhase::Prefill;
 }
 
-// The split Q4/Q5 projection pairs are named by their Q4 parent; both halves
-// take the same profile. INT8 activations are admitted in Prefill only: Verify
-// carries the committed decode path, whose numerics stay bit-identical to the
-// A16 catalog, and is the phase that CUDA Graphs capture.
-//
-// Unlike the MLP and residual Ops, these projections feed the attention scores
-// and the FP32 GDN recurrence, so A8 here does move greedy output. That is an
-// accepted property of the profile, not a defect: prefix reuse reproduces the
-// input semantics of full prefill, not its arithmetic.
+// The capacity a phase's routes need. Verify sizes against the A8 catalog, which coincides with
+// the A16 one over every Verify width and so covers it.
+ops::LinearPolicy capacity_policy(qwen3_8::TextPhase phase) {
+    return phase == qwen3_8::TextPhase::Decision ? ops::LinearPolicy::A16Only
+                                                 : ops::LinearPolicy::AllowA8;
+}
+
+ops::LinearPolicy text_swiglu_policy(const Weight& weight, qwen3_8::TextPhase phase) {
+    if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
+    return weight.qtype == QType::Q4G64_F16S && admits_a8(phase) ? ops::LinearPolicy::AllowA8
+                                                                 : ops::LinearPolicy::A16Only;
+}
+
+// The split Q4/Q5 projection pairs are named by their Q4 parent; both halves take the same profile.
 ops::LinearPolicy text_proj_pair_policy(const Weight& weight, qwen3_8::TextPhase phase) {
     if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
-    if (weight.qtype != QType::Q4G64_F16S || phase != qwen3_8::TextPhase::Prefill) {
-        return ops::LinearPolicy::A16Only;
-    }
-    return ops::LinearPolicy::AllowA8;
+    return weight.qtype == QType::Q4G64_F16S && admits_a8(phase) ? ops::LinearPolicy::AllowA8
+                                                                 : ops::LinearPolicy::A16Only;
 }
 
-ops::LinearPolicy text_linear_add_policy(const Weight& weight) {
+ops::LinearPolicy text_linear_add_policy(const Weight& weight, qwen3_8::TextPhase phase) {
     if (weight.qtype == QType::NVFP4) { return kNvfp4TextPolicy; }
-    return weight.qtype == QType::Q5G64_F16S ? ops::LinearPolicy::AllowA8
-                                             : ops::LinearPolicy::A16Only;
+    return weight.qtype == QType::Q5G64_F16S && admits_a8(phase) ? ops::LinearPolicy::AllowA8
+                                                                 : ops::LinearPolicy::A16Only;
 }
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
@@ -165,9 +174,10 @@ void Variant::attention_projection(const Tensor& hidden,
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_8::TextPhase,
+                                          Tensor& residual, qwen3_8::TextPhase phase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear_add(attention, weight, residual, text_linear_add_policy(weight), workspace, stream);
+    ops::linear_add(attention, weight, residual, text_linear_add_policy(weight, phase), workspace,
+                    stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -261,9 +271,10 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                    qwen3_8::TextPhase, WorkspaceArena& workspace,
+                                    qwen3_8::TextPhase phase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
-    ops::linear_add(hidden, weight, residual, text_linear_add_policy(weight), workspace, stream);
+    ops::linear_add(hidden, weight, residual, text_linear_add_policy(weight, phase), workspace,
+                    stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -276,13 +287,12 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_8::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         qwen3_8::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_swiglu_policy(weights.gate_up),
-                       workspace,
-                       stream);
-    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down),
+    ops::linear_swiglu(hidden, weights.gate_up, activation,
+                       text_swiglu_policy(weights.gate_up, phase), workspace, stream);
+    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down, phase),
                     workspace, stream);
 }
 
@@ -296,13 +306,13 @@ void Variant::post_mixer_lora(const Tensor& hidden, const PostMixerWeights& weig
     }
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_swiglu_policy(weights.gate_up),
-                       workspace, stream);
+    ops::linear_swiglu(hidden, weights.gate_up, activation,
+                       text_swiglu_policy(weights.gate_up, phase), workspace, stream);
 
     // The delta must be accumulated into the residual, so it is applied to the down projection's
     // output rather than folded into the fused linear_add. The fused op writes `down(activation)
     // + residual` first, then the correction adds `B * (A * activation)` to the same tensor.
-    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down),
+    ops::linear_add(activation, weights.down, residual, text_linear_add_policy(weights.down, phase),
                     workspace, stream);
 
     ops::LoraGroup group;
@@ -394,7 +404,7 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                   qwen3_8::TextPhase,
+                                                                   qwen3_8::TextPhase phase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
@@ -402,7 +412,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
+            TextConfig::hidden, capacity_policy(phase), first, last);
     case WeightsProfile::Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -411,14 +421,15 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_8::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, qwen3_8::TextPhase phase, std::int32_t first,
+    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
-                                                        ops::LinearPolicy::AllowA8, first, last);
+                                                        capacity_policy(phase), first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -428,7 +439,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                   qwen3_8::TextPhase,
+                                                                   qwen3_8::TextPhase phase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
@@ -436,7 +447,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::gdn_input_proj_workspace_capacity_bytes(
-            TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
+            TextConfig::hidden, capacity_policy(phase), first, last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -482,7 +493,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                    qwen3_8::TextPhase,
+                                                                    qwen3_8::TextPhase phase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
@@ -491,7 +502,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
-                                                        ops::LinearPolicy::AllowA8, first, last);
+                                                        capacity_policy(phase), first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
@@ -506,7 +517,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                         qwen3_8::TextPhase, std::int32_t first,
+                                                         qwen3_8::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     validate_token_interval(first, last);
     QType gate_up_qtype;
@@ -518,8 +529,8 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::GroupwiseIntW8Endpoints:
         gate_up_qtype  = QType::Q4G64_F16S;
         down_qtype     = QType::Q5G64_F16S;
-        gate_up_policy = ops::LinearPolicy::AllowA8;
-        down_policy    = ops::LinearPolicy::AllowA8;
+        gate_up_policy = capacity_policy(phase);
+        down_policy    = capacity_policy(phase);
         break;
     case WeightsProfile::Nvfp4:
         gate_up_qtype  = QType::NVFP4;

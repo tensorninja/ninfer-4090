@@ -225,6 +225,42 @@ SHA-256, manifest/image metadata agreement, and exact image preflight remain req
 or destructive history rollback. The corresponding complete-image framing is `NICIMG03`, with Qwen
 target image version `3`; old cache namespaces must be deleted rather than migrated.
 
+## System One decision states
+
+A [System One decision](serving.md#system-one-decisions) caches its state row, the `Ls` tokens
+`[<|fim_prefix|>, state...]` that every question branch continues, as a second Qwen image kind,
+`decision_state`. The image holds exactly the main-text KV `[0, Ls)` and the lane's current Gated
+DeltaNet state. It has no continuation hidden state, MTP or DFlash state, sampled token, or turn
+checkpoint, because a decision never samples, decodes, or drafts.
+
+- **Alias.** The image is published under one write-once alias derived from the exact state row and
+  namespaced by the decision adapter, like every other alias. A decision has no routed session,
+  no `prompt_cache_key`, and no boundary alias.
+- **Identity.** The decision-state compatibility key is derived from the chat continuation key, so
+  it carries the same artifact, KV codec, model-binding, and runtime-profile identity, and a chat
+  image and a decision image reject each other at the first comparison. Preflight also requires
+  the exact state row, the adapter's content fingerprint, and the exact segment inventory. Decisions
+  consume only `decision_state` images, and chat never does.
+- **Publication.** A decision that retains its state (`allow_prefix_reuse`) publishes it when it
+  completes. The execution thread fences the lane and queues the export; the publication worker
+  copies the state out and stores it. Publication happens only when the submit-time lookup found no
+  usable image under the alias, so a state continued in L1 is republished only if its alias lapsed,
+  and a state restored from L2 or L3 is not republished.
+- **Restore.** Submission looks the alias up as descriptors only. Admission restores the image only
+  when no idle lane already retains the whole state: the restore reserves the decision's planned
+  entitlement, imports the KV and GDN state into an idle lane, and the decision then runs only its
+  branches. The result reports `state_source` `l2` or `l3`, `reused_state_tokens` equal to `Ls`, and
+  `restore_seconds`. Restoring copies the published state byte for byte. A decision's outcome (L1
+  continuation, L2/L3 restore, or miss reason) counts in the continuation metrics like a chat
+  request's.
+- **Exact state only.** Continuing a shorter retained state as the prefix of a longer one remains L1
+  lane planning. L2 and L3 match only the exact state: a longer state derives a different alias, and
+  an image's GDN state exists only at its own frontier.
+- **Sizing.** A retained decision state counts against `--continuation-cache-l1-mib` like a chat
+  session. A 65k-token state is 4.1 GiB under BF16 KV, so at the default 768 MiB it leaves L1 as
+  soon as its lane goes idle and every repeat pays an L2 restore (about 3 s on an RTX 4090) instead
+  of running only its branches ([decision latency](performance.md#system-one-decision-latency)).
+
 ## OpenCode examples
 
 Start one server with durable tiers:
@@ -436,6 +472,7 @@ Implemented:
 - pointer-free complete Qwen continuation images and exact prefix/compatibility preflight;
 - retained-lane L1 policy, host L2 catalog, restore/demotion, bounded aliases, and history;
 - automatic stable-prefix aliases, private restores, and single-flight construction;
+- System One `decision_state` images: exact-state publication at completion and L2/L3 restore;
 - asynchronous coalesced L3 persistence, chunk deduplication, SHA-256 verification, atomic
   publication, startup discovery, quotas, TTL, and filesystem reserve;
 - Prometheus continuation, persistence, occupancy, and L1 counters.

@@ -109,7 +109,9 @@ std::size_t parse_cache_reserve_mib(const char* text) {
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
+           " <model.ninfer> (--prompt <text>|--messages <messages.json>|--systemone <file|->)\n"
+           "[--systemone-jsonl] [--systemone-default NAME] [--systemone-cold]\n"
+           "[--systemone-probabilities] [--systemone-dump-prepared FILE]\n"
            "[--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "[--device N]\n"
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
@@ -138,6 +140,10 @@ std::string usage_text(const char* argv0) {
            "[--continuation-cache-filesystem-reserve-mib N] [--prefix-checkpoint-history N]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
+           "--systemone answers TypeSafe System One request bodies (one per line with\n"
+           "--systemone-jsonl) with the decision adapter each `model` names; jev-latest binds\n"
+           "--systemone-default, else the pool's only decision adapter. Each response body is\n"
+           "printed on its own stdout line, an error as {\"detail\": ...}.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
@@ -185,6 +191,27 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
+        } else if (arg == "--systemone") {
+            options.systemone_path = value(arg);
+            if (options.systemone_path.empty()) {
+                throw std::invalid_argument("--systemone must name a file or -");
+            }
+        } else if (arg == "--systemone-jsonl") {
+            options.systemone_jsonl = true;
+        } else if (arg == "--systemone-default") {
+            options.systemone_default = value(arg);
+            if (options.systemone_default.empty()) {
+                throw std::invalid_argument("--systemone-default must name a decision adapter");
+            }
+        } else if (arg == "--systemone-cold") {
+            options.systemone_cold = true;
+        } else if (arg == "--systemone-probabilities") {
+            options.systemone_probabilities = true;
+        } else if (arg == "--systemone-dump-prepared") {
+            options.systemone_dump_prepared = value(arg);
+            if (options.systemone_dump_prepared.empty()) {
+                throw std::invalid_argument("--systemone-dump-prepared must name a file");
+            }
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
@@ -351,10 +378,19 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--continuation-cache-dir is required for l1-l2-l3");
     }
 
-    const bool has_prompt   = !options.prompt.empty();
-    const bool has_messages = !options.messages_path.empty();
-    if (has_prompt == has_messages) {
-        throw std::invalid_argument("pass exactly one of --prompt or --messages");
+    const bool has_prompt    = !options.prompt.empty();
+    const bool has_messages  = !options.messages_path.empty();
+    const bool has_systemone = !options.systemone_path.empty();
+    if (static_cast<int>(has_prompt) + static_cast<int>(has_messages) +
+            static_cast<int>(has_systemone) !=
+        1) {
+        throw std::invalid_argument("pass exactly one of --prompt, --messages or --systemone");
+    }
+    if (!has_systemone &&
+        (options.systemone_jsonl || !options.systemone_default.empty() ||
+         options.systemone_cold || options.systemone_probabilities ||
+         !options.systemone_dump_prepared.empty())) {
+        throw std::invalid_argument("--systemone-* options need --systemone");
     }
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");

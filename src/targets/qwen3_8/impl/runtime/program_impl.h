@@ -333,6 +333,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       continuation_compatibility_key(
           make_compatibility_key(plan, model_id, weights_id, artifact_fingerprint)),
+      decision_state_compatibility_key(
+          image::decision_state_compatibility_key(continuation_compatibility_key)),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId)), continuation_transfer(16U * 1024U * 1024U),
@@ -400,6 +402,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     sampling_config              = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store            = plan.persistent.tail_hidden.bind(backing);
     turn_checkpoint_hidden_store = plan.persistent.turn_checkpoint_hidden.bind(backing);
+    if (plan.persistent.decision_keys) {
+        decision_keys = plan.persistent.decision_keys->bind(backing);
+        decision_host.emplace(sizeof(float) *
+                              std::max<std::size_t>(prefill_chunk, kMaximumDecisionOptions));
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -761,9 +768,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                             : 0U,
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
-    request.lifecycle = Lifecycle::Empty;
-    sequence.adapter  = request_plan.adapter;
-    sequence.retained = false;
+    request.lifecycle       = Lifecycle::Empty;
+    sequence.adapter        = request_plan.adapter;
+    sequence.retained       = false;
+    sequence.decision_state = false;
     sequence.captured_continuations.clear();
     try {
         if (checkpoint_ring_capacity != 0) {
@@ -933,6 +941,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (requests[lane].decision) { return advance_decision(sequences[lane], requests[lane]); }
     return advance_prefill(sequences[lane], requests[lane]);
 }
 
@@ -1170,9 +1179,9 @@ bool ProgramImplCore::kv_reservation_fits(std::uint32_t text_pages,
                                            std::uint32_t backend_pages) const noexcept {
     if (text_pages == 0) { return false; }
     if (!decoder->text_kv.pool().can_reserve(text_pages)) { return false; }
+    if (backend_pages == 0) { return true; }
     const qwen3_8::PagedKVCache* backend = backend_kv_cache();
-    if ((backend != nullptr) != (backend_pages != 0)) { return false; }
-    return backend == nullptr || backend->pool().can_reserve(backend_pages);
+    return backend != nullptr && backend->pool().can_reserve(backend_pages);
 }
 
 bool ProgramImplCore::try_grow_decode_headroom(std::uint32_t lane) {
@@ -1263,8 +1272,11 @@ std::size_t ProgramImplCore::retained_lane_resident_bytes(std::uint32_t lane) co
     if (lane >= max_concurrency) { return 0; }
     const SequenceState& sequence = sequences[lane];
     const RequestControl& request = requests[lane];
+    // A retained chat session always holds its tail hidden state; a retained decision state holds
+    // only KV and the GDN slot.
     if (!sequence.retained || request.lifecycle != Lifecycle::Complete || request.prefill ||
-        request.pending.kind != PendingKind::None || !sequence.kv || !sequence.tail_hidden_valid ||
+        request.pending.kind != PendingKind::None || !sequence.kv ||
+        (!sequence.tail_hidden_valid && !sequence.decision_state) ||
         !sequence.kv->text.valid() ||
         !sequence.kv->text.belongs_to(decoder->text_kv.pool())) {
         return 0;
@@ -1328,7 +1340,8 @@ std::size_t ProgramImplCore::retained_lane_resident_bytes(std::uint32_t lane) co
 
     const auto text = paged_bytes(sequence.kv->text, decoder->text_kv.pool());
     const auto linear = linear_slot_bytes();
-    if (!text || !linear || !add(*text) || !add(*linear) || !add(sequence.tail_hidden.bytes())) {
+    if (!text || !linear || !add(*text) || !add(*linear) ||
+        (sequence.tail_hidden_valid && !add(sequence.tail_hidden.bytes()))) {
         return 0;
     }
     if (sequence.turn_checkpoint.valid &&
@@ -1420,15 +1433,17 @@ std::size_t ProgramImplCore::retained_lane_reused_bytes(
     const auto main_page = page_bytes(decoder->text_kv.pool());
     const auto linear = linear_bytes();
     if (!main_page || !linear) return 0;
-    auto current_state = add(*linear, sequence.tail_hidden.bytes());
+    // A decision state is the text KV and the GDN slot alone: no tail hidden or backend state.
+    const bool decision = sequence.decision_state;
+    auto current_state = add(*linear, decision ? std::size_t{0} : sequence.tail_hidden.bytes());
     auto checkpoint_state = add(*linear, sequence.turn_checkpoint_hidden.bytes());
     if (!current_state || !checkpoint_state) return 0;
 
     std::uint32_t backend_tokens = 0;
     std::size_t backend_page_bytes = 0;
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (!decision && speculative_backend == SpeculativeBackend::Mtp) {
         backend_tokens = plan.reuse_base - 1U;
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (!decision && speculative_backend == SpeculativeBackend::DFlash) {
         backend_tokens = plan.reuse_base;
         if (!dflash) return 0;
         const auto current_local = cyclic_bytes(dflash->local);
@@ -2088,6 +2103,8 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    request.decision.reset();
+    sequence.decision_state = false;
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     // A cleared lane holds no adapter-dependent state, so it must stop pinning the slot it used.
@@ -2277,7 +2294,9 @@ std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) c
 void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                                           std::uint32_t backend_pages) {
     if (sequence.kv) { throw std::logic_error("sequence already owns a KV allocation bundle"); }
-    if (text_pages == 0 || (backend_kv_cache() == nullptr) != (backend_pages == 0)) {
+    // A decision lane holds Text KV only, so a backend reservation is optional; one that the
+    // Program has no backend for is not.
+    if (text_pages == 0 || (backend_kv_cache() == nullptr && backend_pages != 0)) {
         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
     }
 
@@ -2287,7 +2306,8 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         .pool             = &decoder->text_kv.pool(),
         .page_entitlement = text_pages,
     };
-    if (qwen3_8::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+    if (qwen3_8::PagedKVCache* backend = backend_kv_cache();
+        backend != nullptr && backend_pages != 0) {
         reservations[count++] = PagedKVReservation{
             .pool             = &backend->pool(),
             .page_entitlement = backend_pages,
@@ -2351,6 +2371,25 @@ void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     if (sequence.kv->backend) { sequence.kv->backend->unbind_row(); }
     sequence.kv->text.unbind_row();
+}
+
+void ProgramImplCore::select_prefill_kv_rows(const SequenceState& sequence) {
+    if (!sequence.kv || sequence.kv->text.bound_row() < 0 ||
+        (sequence.kv->backend && sequence.kv->backend->bound_row() < 0)) {
+        throw std::logic_error("prefill lane holds no bound KV row");
+    }
+    set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
+    set_device_i32(io.backend_kv_table_row,
+                   sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+    if (speculative_backend == SpeculativeBackend::DFlash && sequence.kv->backend) {
+        if (!io.dflash_decode) { throw std::logic_error("DFlash prefill controls are unavailable"); }
+        *dflash_host_ingress                         = {};
+        dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
+        dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+        CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                   sizeof(qwen3_8::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
 }
 
 void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -2895,6 +2934,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        select_prefill_kv_rows(sequence);
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,

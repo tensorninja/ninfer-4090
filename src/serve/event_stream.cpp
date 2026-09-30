@@ -103,6 +103,25 @@ void EventStream::emit_request_error(const RequestLogContext& context,
             false);
 }
 
+void EventStream::emit_decision_start(const DecisionLogContext& context) {
+    publish(format_decision_start_json(server_instance_id_, unix_time_ms(), context), false);
+}
+
+void EventStream::emit_decision_done(const DecisionLogContext& context,
+                                     const ninfer::DecisionResult& result,
+                                     std::uint32_t output_tokens) {
+    publish(format_decision_done_json(server_instance_id_, unix_time_ms(), context, result,
+                                      output_tokens),
+            false);
+}
+
+void EventStream::emit_decision_error(const DecisionLogContext& context, int status,
+                                      const std::string& message) {
+    publish(format_decision_error_json(server_instance_id_, unix_time_ms(), context, status,
+                                       message),
+            false);
+}
+
 void EventStream::emit_throughput(const ThroughputReport& report) {
     publish(format_throughput_json(server_instance_id_, unix_time_ms(), report), false);
 }

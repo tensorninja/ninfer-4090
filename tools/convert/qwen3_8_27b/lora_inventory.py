@@ -1,9 +1,11 @@
 """Registered LoRA adapter object contract for the Qwen3.8-27B target.
 
-An adapter artifact is a normal ``.ninfer`` v2 container carrying only BF16
-``contiguous-le-v1`` rank-two tensors.  It introduces no numeric format, no
-storage layout, and no resource: the tokenizer, chat template and preprocessor
-configs belong to the base artifact, so an adapter never restates them.
+An adapter artifact is a normal ``.ninfer`` v2 container carrying BF16
+``contiguous-le-v1`` tensors.  It introduces no numeric format and no storage
+layout, and restates no frontend resource: the tokenizer, chat template and
+preprocessor configs belong to the base artifact.  A generative adapter
+carries only rank-two factors; a System One decision adapter additionally
+carries the pointer head and its ``decision/metadata`` resource (below).
 
 The registered site table below is the whole contract.  A site exists only
 where NInfer's schedule exposes a plain BF16 destination that a low-rank delta
@@ -297,8 +299,83 @@ def parameter_count(rank: int, site_keys: frozenset[str]) -> int:
 ALL_SITE_KEYS: frozenset[str] = frozenset(SITE_KEYS)
 
 
+# System One decision adapters.  A decision adapter is a generative adapter's
+# factors plus a pointer head (kev's ``PointerHead``) read from the final-norm
+# hidden states at each option's closing delimiter and at the decide delimiter:
+#
+#     q = Wq h_decide + bq,  k_i = Wk h_option_i + bk,
+#     p = softmax_i((k_i . q) * logit_scale / temperature)
+#
+# The head is four BF16 tensors; everything the engine publishes about the
+# model (temperature, description, release date) and the framing it must
+# reproduce (readout, escape rule, delimiters) is one JSON resource.  All five
+# objects are present together or not at all.
+DECISION_POINTER_DIM = 256
+DECISION_LOGIT_SCALE = 0.0625
+DECISION_FORMAT = "ninfer-decision-head"
+DECISION_FORMAT_VERSION = 1
+DECISION_READOUT = "final_norm"
+DECISION_ESCAPE = "kev-v1"
+DECISION_METADATA_OBJECT = "decision/metadata"
+DECISION_HEAD_TENSORS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("decision/head/query/weight", (DECISION_POINTER_DIM, HIDDEN)),
+    ("decision/head/query/bias", (DECISION_POINTER_DIM,)),
+    ("decision/head/key/weight", (DECISION_POINTER_DIM, HIDDEN)),
+    ("decision/head/key/bias", (DECISION_POINTER_DIM,)),
+)
+# Delimiters by role, in encoding order, and their ids in the registered base
+# vocabulary.  The engine resolves the names through the base tokenizer at load.
+DECISION_DELIMITERS: dict[str, str] = {
+    "state": "<|fim_prefix|>",
+    "question": "<|fim_middle|>",
+    "option_open": "<|box_start|>",
+    "option_close": "<|box_end|>",
+    "decide": "<|fim_suffix|>",
+}
+DECISION_DELIMITER_IDS: dict[str, int] = {
+    "state": 248060,
+    "question": 248061,
+    "option_open": 248049,
+    "option_close": 248050,
+    "decide": 248062,
+}
+DECISION_METADATA_KEYS = frozenset(
+    {
+        "format",
+        "format_version",
+        "pointer_dim",
+        "hidden_size",
+        "logit_scale",
+        "temperature",
+        "readout",
+        "escape",
+        "delimiters",
+        "description",
+        "release_date",
+        "base_model",
+    }
+)
+
+
+def decision_head_specs() -> tuple[TensorSpec, ...]:
+    """The pointer head's tensors, in the order a decision adapter stores them."""
+
+    return tuple(tensor_spec(name, shape, BF16) for name, shape in DECISION_HEAD_TENSORS)
+
+
 __all__ = [
     "ALL_SITE_KEYS",
+    "DECISION_DELIMITERS",
+    "DECISION_DELIMITER_IDS",
+    "DECISION_ESCAPE",
+    "DECISION_FORMAT",
+    "DECISION_FORMAT_VERSION",
+    "DECISION_HEAD_TENSORS",
+    "DECISION_LOGIT_SCALE",
+    "DECISION_METADATA_KEYS",
+    "DECISION_METADATA_OBJECT",
+    "DECISION_POINTER_DIM",
+    "DECISION_READOUT",
     "FULL_ATTENTION_LAYERS",
     "GDN_LAYERS",
     "LAYERS",
@@ -316,6 +393,7 @@ __all__ = [
     "a_object_name",
     "b_object_name",
     "build_tensor_specs",
+    "decision_head_specs",
     "parameter_count",
     "require_rank",
     "require_sites",

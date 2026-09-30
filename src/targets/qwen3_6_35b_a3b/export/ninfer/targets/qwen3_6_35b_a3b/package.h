@@ -80,6 +80,8 @@ private:
 struct Package {
     static constexpr std::string_view model_id   = "qwen3.6-35b-a3b";
     static constexpr std::string_view target_key = "qwen3_6_35b_a3b";
+    // Mirrors the package's `DecisionConfig::supported`.
+    static constexpr bool supports_decisions = false;
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

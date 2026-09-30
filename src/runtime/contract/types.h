@@ -30,6 +30,13 @@ struct ResolvedExecutionOptions {
     bool allow_prefix_reuse = true;
 };
 
+// A System One decision's execution options. `adapter` is the pool index of a decision adapter;
+// Engine has already rejected every other selection.
+struct ResolvedDecisionOptions {
+    std::int32_t adapter    = -1;
+    bool allow_prefix_reuse = true;
+};
+
 struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     // Untrusted scheduler/cache alias. Targets must still verify exact prepared-prefix identity.

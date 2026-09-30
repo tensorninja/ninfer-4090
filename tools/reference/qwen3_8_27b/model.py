@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 import torch
 
@@ -153,6 +153,15 @@ class RefModel:
         self.vision_stats = None
         self.prepare(capacity, compile_codec=self.active_compile_codec)
 
+    def clear(self) -> None:
+        """Drop the resident sequence; the prepared weights and capacity are kept."""
+        capacity = self._ready()[1].capacity
+        self.state = None
+        self.state = ModelState(self.device, capacity, self.kv_dtype)
+        self.last_hidden = None
+        self.last_mtp_hidden = None
+        self.last_draft = None
+
     def _ready(self) -> tuple[WeightStore, ModelState]:
         if self.weights is None or self.state is None:
             raise RuntimeError("call prepare(), prefill(), or generate() before model operations")
@@ -238,6 +247,66 @@ class RefModel:
             logits[row0:row1] = (last @ weight.t())[0]
         return logits
 
+    def _prefill_text_chunk(
+        self, part: list[int], chunk: int, tap
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Run one text-only chunk at the resident cursor with plain positions and advance it.
+
+        Returns the last layer's residual stream (before the final norm), the chunk's positions,
+        and its start position.
+        """
+        _, state = self._ready()
+        start = state.position
+        x = self.embed(part)
+        self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
+        positions = torch.arange(
+            start, start + len(part), device=self.device, dtype=torch.int32
+        )
+        x = run_text(
+            self,
+            x,
+            positions,
+            start,
+            phase="prefill",
+            step=0,
+            chunk=chunk,
+            tap=tap,
+        )
+        state.position += len(part)
+        state.kv.length = state.position
+        return x, positions, start
+
+    def prefill_hidden(self, ids: Iterable[int], rows: Sequence[int]) -> torch.Tensor:
+        """Append a text-only span and return its final-norm hidden states at `rows`.
+
+        `rows` are offsets into `ids`. The result is BF16 `[len(rows), hidden]` in `rows` order:
+        the values the output head would read. Neither the output head nor MTP runs, so the span
+        yields no next token and the MTP cache does not advance.
+        """
+        ids = list(ids)
+        if not ids:
+            raise ValueError("prefill ids must not be empty")
+        _, state = self._ready()
+        if state.position + len(ids) > state.capacity:
+            raise ValueError("prefill exceeds prepared context capacity")
+        if any(not 0 <= row < len(ids) for row in rows):
+            raise ValueError("hidden rows must lie inside the prefilled span")
+        hidden = torch.empty(len(rows), CFG.hidden, device=self.device, dtype=torch.bfloat16)
+        tap = NullTap()
+        for chunk, offset in enumerate(range(0, len(ids), self.prefill_chunk)):
+            part = ids[offset : offset + self.prefill_chunk]
+            x, _, _ = self._prefill_text_chunk(part, chunk, tap)
+            picked = [
+                (index, row - offset)
+                for index, row in enumerate(rows)
+                if offset <= row < offset + len(part)
+            ]
+            if picked:
+                source = torch.tensor([row for _, row in picked], device=self.device)
+                target = torch.tensor([index for index, _ in picked], device=self.device)
+                hidden[target] = self.final_hidden(x.index_select(0, source))
+        return hidden
+
     def prefill(
         self,
         ids: Iterable[int],
@@ -260,24 +329,7 @@ class RefModel:
         for chunk, offset in enumerate(range(0, len(ids), self.prefill_chunk)):
             last_chunk = chunk
             part = ids[offset : offset + self.prefill_chunk]
-            start = state.position
-            x = self.embed(part)
-            self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
-            positions = torch.arange(
-                start, start + len(part), device=self.device, dtype=torch.int32
-            )
-            x = run_text(
-                self,
-                x,
-                positions,
-                start,
-                phase="prefill",
-                step=0,
-                chunk=chunk,
-                tap=tap,
-            )
-            state.position += len(part)
-            state.kv.length = state.position
+            x, positions, start = self._prefill_text_chunk(part, chunk, tap)
             last_hidden = self.final_hidden(x)
             self._tap(
                 tap,

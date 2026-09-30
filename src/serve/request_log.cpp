@@ -42,6 +42,15 @@ std::string new_server_instance_id() {
            std::to_string(micros);
 }
 
+const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
+    if (storage == ninfer::KvCacheStorage::BFloat16) { return "bf16"; }
+    if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) { return "rk8v4"; }
+    if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) { return "rk4v4"; }
+    if (storage == ninfer::KvCacheStorage::RK4V4E8) { return "rk4v4-e8"; }
+    if (storage == ninfer::KvCacheStorage::RK2V4E8) { return "rk2v4-e8"; }
+    return "int8-group64";
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -162,15 +171,6 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    if (storage == ninfer::KvCacheStorage::BFloat16) { return "bf16"; }
-    if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) { return "rk8v4"; }
-    if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) { return "rk4v4"; }
-    if (storage == ninfer::KvCacheStorage::RK4V4E8) { return "rk4v4-e8"; }
-    if (storage == ninfer::KvCacheStorage::RK2V4E8) { return "rk2v4-e8"; }
-    return "int8-group64";
-}
-
 const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
@@ -257,6 +257,30 @@ Json request_json(const RequestLogContext& context) {
                 {"adapter", context.adapter},
                 {"prompt_cache_key_digest", context.prompt_cache_key_digest},
                 {"sampling", sampler_json(context.sampling)}};
+}
+
+Json decision_request_json(const DecisionLogContext& context) {
+    const ninfer::DecisionSummary& summary = context.summary;
+    return Json{{"request_id", context.id},
+                {"x_request_id", context.x_request_id},
+                {"protocol", "systemone"},
+                {"model", context.model},
+                {"adapter", context.adapter},
+                {"allow_prefix_reuse", context.allow_prefix_reuse},
+                {"questions", summary.questions},
+                {"options", summary.options},
+                {"state_tokens", summary.state_tokens},
+                {"state_truncated", summary.state_truncated},
+                {"branch_tokens", summary.branch_tokens},
+                {"longest_branch", summary.longest_branch},
+                {"input_tokens", summary.input_tokens()}};
+}
+
+// Tokens per second, or null when either side is zero: a phase that ran no tokens, or none
+// measurably, has no rate rather than a zero one.
+Json tokens_per_second(std::uint64_t tokens, double seconds) {
+    if (tokens == 0 || !(seconds > 0.0)) { return Json(nullptr); }
+    return static_cast<double>(tokens) / seconds;
 }
 
 Json arena_json(const ninfer::ArenaMemorySummary& arena) {
@@ -496,6 +520,49 @@ std::string format_request_error(const RequestLogContext& context, const std::st
     return out.str();
 }
 
+std::string format_decision_start(const DecisionLogContext& context) {
+    const ninfer::DecisionSummary& summary = context.summary;
+    std::ostringstream out;
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id
+        << "] systemone model=" << context.model << " adapter=" << context.adapter
+        << " questions=" << summary.questions << " options=" << summary.options
+        << " state=" << summary.state_tokens << (summary.state_truncated ? " (truncated)" : "")
+        << " branches=" << summary.branch_tokens << " longest_branch=" << summary.longest_branch
+        << " reuse=" << (context.allow_prefix_reuse ? "on" : "off") << " \xE2\x86\x92 submitted";
+    return out.str();
+}
+
+std::string format_decision_done(const DecisionLogContext& context,
+                                 const ninfer::DecisionResult& result,
+                                 std::uint32_t output_tokens) {
+    const ninfer::DecisionTimings& timings = result.timings;
+    const std::uint32_t computed_state =
+        result.summary.state_tokens - result.reused_state_tokens;
+    std::ostringstream out;
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id
+        << "] done decision questions=" << result.summary.questions
+        << " state=" << result.summary.state_tokens << " reused=" << result.reused_state_tokens
+        << " source=" << continuation_source_name(result.state_source)
+        << " branches=" << result.summary.branch_tokens << " passes=" << result.branch_passes
+        << " long_chunks=" << result.long_branch_chunks << " slot=" << result.slot
+        << " output_tokens=" << output_tokens << std::fixed << std::setprecision(1)
+        << " queue=" << timings.queue_seconds * 1000.0 << "ms"
+        << " state_prefill=" << rate(computed_state, timings.state_seconds)
+        << " branch_prefill=" << rate(result.summary.branch_tokens, timings.branch_seconds)
+        << " execution=" << timings.execution_seconds * 1000.0 << "ms"
+        << " wall="
+        << seconds_str(context.prepare_seconds + timings.total_seconds - timings.prepare_seconds);
+    return out.str();
+}
+
+std::string format_decision_error(const DecisionLogContext& context, int status,
+                                  const std::string& message) {
+    std::ostringstream out;
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] error "
+        << status << ' ' << message;
+    return out.str();
+}
+
 std::string format_throughput(const ThroughputReport& report) {
     const double prefill_rate =
         report.interval_seconds > 0.0
@@ -614,10 +681,20 @@ std::string format_server_start_json(
                               {"upload_seconds", load.upload_seconds}};
     // The discovered adapter pool, so a replayed log can name every selectable adapter even
     // when no request used one. `count` is the pool; `slots` is how many are resident at once.
-    Json adapter_names = Json::array();
-    for (const std::string& name : load.lora_adapter_names) { adapter_names.push_back(name); }
-    record["adapters"] = Json{{"count", load.lora_adapter_names.size()},
+    // `decision_names` are the System One models; `systemone_default` is the configured binding of
+    // the SDK-default model name (empty: the only decision adapter, if there is exactly one).
+    Json adapter_names  = Json::array();
+    Json decision_names = Json::array();
+    for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+        adapter_names.push_back(adapter.name);
+        if (adapter.kind == ninfer::LoraAdapterKind::Decision) {
+            decision_names.push_back(adapter.name);
+        }
+    }
+    record["adapters"] = Json{{"count", load.lora_adapters.size()},
                               {"names", std::move(adapter_names)},
+                              {"decision_names", std::move(decision_names)},
+                              {"systemone_default", options.systemone_default},
                               {"rank", load.lora_rank},
                               {"slots", load.lora_slots},
                               {"device_bytes", load.lora_device_bytes},
@@ -743,6 +820,55 @@ std::string format_request_error_json(const std::string& server_instance_id,
     Json record       = event_base(server_instance_id, timestamp, "request_error");
     record["request"] = request_json(context);
     record["error"]   = Json{{"message", message}};
+    return record.dump();
+}
+
+std::string format_decision_start_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp, const DecisionLogContext& context) {
+    Json record       = event_base(server_instance_id, timestamp, "decision_start");
+    record["request"] = decision_request_json(context);
+    return record.dump();
+}
+
+std::string format_decision_done_json(const std::string& server_instance_id,
+                                      std::uint64_t timestamp, const DecisionLogContext& context,
+                                      const ninfer::DecisionResult& result,
+                                      std::uint32_t output_tokens) {
+    const std::uint32_t computed_state =
+        result.summary.state_tokens - result.reused_state_tokens;
+    const ninfer::DecisionTimings& timings = result.timings;
+    Json record       = event_base(server_instance_id, timestamp, "decision_done");
+    record["request"] = decision_request_json(context);
+    record["result"]  = Json{{"output_tokens", output_tokens},
+                             {"reused_state_tokens", result.reused_state_tokens},
+                             {"computed_state_tokens", computed_state},
+                             {"state_source", continuation_source_name(result.state_source)},
+                             {"branch_passes", result.branch_passes},
+                             {"long_branch_chunks", result.long_branch_chunks},
+                             {"slot", result.slot}};
+    // prepare is the HTTP side (validation, rendering, layout); the rest is the Engine's, from
+    // submission. state + branch decompose execution, which is what latency_ms reports.
+    record["timings_seconds"] =
+        Json{{"prepare", context.prepare_seconds},
+             {"queue", timings.queue_seconds},
+             {"restore", timings.restore_seconds},
+             {"state", timings.state_seconds},
+             {"branch", timings.branch_seconds},
+             {"execution", timings.execution_seconds},
+             {"total", context.prepare_seconds + timings.total_seconds - timings.prepare_seconds}};
+    record["rates"] =
+        Json{{"state_tok_s", tokens_per_second(computed_state, timings.state_seconds)},
+             {"branch_tok_s", tokens_per_second(result.summary.branch_tokens,
+                                                timings.branch_seconds)}};
+    return record.dump();
+}
+
+std::string format_decision_error_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp, const DecisionLogContext& context,
+                                       int status, const std::string& message) {
+    Json record       = event_base(server_instance_id, timestamp, "decision_error");
+    record["request"] = decision_request_json(context);
+    record["error"]   = Json{{"status", status}, {"message", message}};
     return record.dump();
 }
 

@@ -124,6 +124,17 @@ target profiles, corpora and training reports belong to the separate `llm-datase
 Merging into base weights, rescanning the directory after startup, and adapters for
 `qwen3.6-35b-a3b` are outside the current product.
 
+The 27B target also answers System One decisions, TypeSafe's classification API, with kev's
+semantics. A decision adapter is a LoRA adapter plus a pointer head (converted with
+`--decision-head`); it lives in the same pool and slots as generative adapters and is selected per
+request by model name on the `/systemone/v1/*` surface, in the same process and weights as chat.
+A decision is a prefill-only request (the state, then one branch per question, each continuing the
+state alone) whose readouts feed the pointer head; it never samples, decodes or drafts. Decisions
+are qualified to kev's per-question serving tolerance on BF16 KV; the other codecs serve them with
+the measured deviation `docs/serving.md` publishes, and nothing enforces a codec. Decision
+training, its corpus and the engine-agnostic System One probe belong to `llm-datasets`; kev's
+`/permute` and `/separate` endpoints and decisions on `qwen3.6-35b-a3b` are outside the product.
+
 KV storage is selected at startup from BF16, INT8, and the rotated/E8-lattice codecs
 (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`). `rk4v4-e8` is the shipping default and serves the
 model's full native 262,144-token context on 24 GB.
@@ -173,7 +184,8 @@ routing map, not a mandatory reading list:
 - `README.md`, `Makefile`, and executable `--help`: delivered capabilities and exact commands;
 - `docs/README.md`: public documentation map;
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic HTTP behavior, prefix-reuse paths, and slot endpoints;
+- `docs/serving.md`: OpenAI/Anthropic/System One HTTP behavior, prefix-reuse paths, and slot
+  endpoints;
 - `docs/continuation-cache.md`: L1/L2/L3 tier semantics, session routing, stable-prefix aliases,
   persistence formats, identity gating, sizing, and metrics;
 - `docs/performance.md`: published performance methodology and results, including the `sm_89`
@@ -226,10 +238,10 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/targets/qwen3_8` owns only the Qwen3.8-family invariants shared by the 27B and 35B-A3B
   targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
   construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
-  Vision definitions, and the fixed
-  planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms. It has no target
-  identity, registry entry, artifact binder, target leaf
-  implementation, or storage for a live Program instance.
+  Vision definitions, the System One decision layout, and the fixed
+  planning/Program/Text/Vision/speculative/decision/state/workspace/CUDA-Graph algorithms. It has
+  no target identity, registry entry, artifact binder, target leaf implementation, or storage for a
+  live Program instance.
 - `src/targets/<package>` owns its registered checkpoint identities, storage profiles, binder,
   `LoadedModel`, configuration, populated family model-view values and private leaf payloads,
   diagnostics, graph frontier values, and exactly three execution-leaf families: attention
@@ -248,10 +260,14 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
   `src/product/media_acquire`, CLI, or serving and is not linked into a target.
 - `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
-- `tools/convert/qwen3_8_27b` owns LoRA adapter conversion, `src/ops/lora` owns the low-rank
-  correction Op, the adapter pool and its device slots are package-owned persistent state, and
-  serving owns the model-name route table. Slot residency policy belongs to the family Program;
-  the executor decides only when to ask for it.
+- `src/product/systemone` owns the System One protocol values: request validation with kev's error
+  shapes, state and question rendering, answers and confidences, and CPython `json.dumps`/`round`
+  parity. It holds no model semantics; the Engine receives rendered texts.
+- `tools/convert/qwen3_8_27b` owns LoRA adapter conversion, including a decision adapter's pointer
+  head; `src/ops/lora` owns the low-rank correction Op and `src/ops/pointer_head` the decision
+  readout Op; the adapter pool and its device slots are package-owned persistent state, and serving
+  owns the model-name route table. Slot residency policy belongs to the family Program; the
+  executor decides only when to ask for it.
 - `src/serve` owns protocol translation and transport. CLI, server, and benchmark call only the
   public Engine for inference.
 - `tools/convert/<target>`, `tools/reference/<target>`, and `tools/parity/<target>` remain
@@ -264,8 +280,9 @@ not preserve backward compatibility. When a task replaces project-owned behavior
 obsolete aliases, fallbacks, transition branches, and tests in the affected contract instead of
 maintaining two paths. Do not turn that rule into unrelated repository-wide cleanup.
 
-The advertised OpenAI and Anthropic protocol surfaces are real external contracts. A change to
-their behavior must update the affected schema tests and serving documentation together.
+The advertised OpenAI, Anthropic and System One (TypeSafe SDK 0.6 and 0.7) protocol surfaces are
+real external contracts. A change to their behavior must update the affected schema tests and
+serving documentation together.
 
 Integrate stable requirements into the existing active reference. Use a temporary dated plan only
 when active work genuinely needs one; a plan is not a substitute for the requested deliverable.
@@ -306,7 +323,10 @@ and speculative-verify numerics are unchanged and CUDA Graph capture is unaffect
 registered as one route over the whole token domain, so a token's output never depends on the
 width of the call or the column it occupied; that call invariance is what lets prefix reuse and
 continuation restore replay a cached prefix, and a token-count threshold that broke it would not be
-admissible even if it were faster.
+admissible even if it were faster. Every unit of a System One decision, state chunk and branch pass
+alike, runs in `TextPhase::Decision`, which admits no A8 route: decision probabilities are held to
+kev's serving tolerance against the BF16 evaluation path, and group-64 activation quantization
+alone exceeds it.
 
 Prefix reuse and continuation restore reproduce the input semantics of full prefill, not its
 arithmetic. They decompose a prompt into different prefill calls, so the FP32 GDN recurrence

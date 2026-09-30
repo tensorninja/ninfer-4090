@@ -83,6 +83,9 @@ private:
 struct Package {
     static constexpr std::string_view model_id   = "qwen3.8-27b";
     static constexpr std::string_view target_key = "qwen3_8_27b";
+    // Serves System One decisions through decision adapters of its LoRA pool. Mirrors the
+    // package's `DecisionConfig::supported`, which the family schedule reads.
+    static constexpr bool supports_decisions = true;
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

@@ -205,6 +205,12 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
         error.status = 404;
         error.code   = "model_not_found";
         break;
+    case ninfer::RequestErrorKind::Cancelled:
+        error.param.clear();
+        error.status = 499;
+        error.type   = "request_cancelled";
+        error.code   = "client_disconnected";
+        break;
     }
     throw ApiException(std::move(error));
 }
@@ -321,8 +327,8 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     {
         std::lock_guard lock(request_capacity_->mutex);
         if (request_capacity_->active >= request_capacity_->maximum) {
-            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
-                                                     "inference request queue is full"));
+            throw ninfer::RequestError(RequestErrorKind::Overloaded,
+                                       "inference request queue is full");
         }
         ++request_capacity_->active;
     }
@@ -400,13 +406,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
                                                  "request exceeds the 16-item media limit"));
     }
-    prepared.lifetime = acquire_request_lifetime();
     HostInputLease host_input;
-    if (request_has_media) {
-        host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
-    }
-
     try {
+        prepared.lifetime = acquire_request_lifetime();
+        if (request_has_media) {
+            host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
+        }
         std::size_t remaining_media_bytes = options_.max_request_bytes;
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
@@ -532,6 +537,29 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     return outcome;
 }
 
+PreparedDecisionRequest GenerationService::prepare_decision(ninfer::DecisionInput input,
+                                                           std::string adapter) const {
+    PreparedDecisionRequest prepared;
+    prepared.lifetime                  = acquire_request_lifetime();
+    ninfer::PreparedDecision decision = engine_->prepare_decision(std::move(input));
+    prepared.summary                   = decision.summary();
+    prepared.prepare_seconds =
+        std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+    prepared.decision = engine_->submit_decision(
+        std::move(decision),
+        ninfer::DecisionOptions{.adapter            = std::move(adapter),
+                                .allow_prefix_reuse = options_.allow_prefix_reuse},
+        prepared.lifetime->deadline);
+    return prepared;
+}
+
+ninfer::DecisionResult GenerationService::decide(PreparedDecisionRequest& prepared,
+                                                 std::function<bool()> is_cancelled) {
+    ninfer::CancellationView cancellation;
+    if (is_cancelled) { cancellation = ninfer::CancellationView(std::move(is_cancelled)); }
+    return prepared.decision.wait(cancellation);
+}
+
 void GenerationService::warmup() {
     try {
         GenerationRequest request;
@@ -550,6 +578,34 @@ void GenerationService::warmup() {
     } catch (const std::exception& exception) {
         write_console_log(ConsoleLogLevel::Warning,
                           std::string("warmup failed (continuing): ") + exception.what());
+    }
+
+    // A decision's branch passes reach prefill routes the short chat warmup never does: one pass
+    // per GEMM width class (up to 128, 129 to 256, and from 257 columns) plus the segmented
+    // mixers and the pointer head. One cold decision per class loads those modules here instead
+    // of inside the first request. The kernels do not depend on the adapter, so one suffices.
+    const ninfer::LoadSummary summary = load_summary();
+    const auto& adapters              = summary.lora_adapters;
+    const auto decision = std::find_if(adapters.begin(), adapters.end(), [](const auto& adapter) {
+        return adapter.kind == ninfer::LoraAdapterKind::Decision;
+    });
+    if (decision == adapters.end()) { return; }
+    try {
+        for (const std::size_t words : {56U, 184U, 504U}) {
+            ninfer::DecisionInput input;
+            input.state = "warmup";
+            ninfer::DecisionQuestion question;
+            question.instructions.reserve(2 * words);
+            for (std::size_t word = 0; word < words; ++word) { question.instructions += " a"; }
+            question.options = {"yes", "no"};
+            input.questions.push_back(std::move(question));
+            (void)engine_->decide(engine_->prepare_decision(std::move(input)),
+                                  ninfer::DecisionOptions{.adapter            = decision->name,
+                                                          .allow_prefix_reuse = false});
+        }
+    } catch (const std::exception& exception) {
+        write_console_log(ConsoleLogLevel::Warning,
+                          std::string("decision warmup failed (continuing): ") + exception.what());
     }
 }
 

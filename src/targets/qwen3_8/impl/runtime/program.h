@@ -9,12 +9,14 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "runtime/cache/continuation_cache.h"
+#include <ninfer/targets/qwen3_8/decision.h>
 #include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include "targets/qwen3_8/impl/runtime/layouts.h"
 #include "targets/qwen3_8/impl/runtime/dflash_context.h"
 #include "targets/qwen3_8/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_8/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_8/impl/runtime/schedule.h"
 #include "targets/qwen3_8/impl/runtime/text_context.h"
 #include "targets/qwen3_8/impl/runtime/vision_context.h"
 #include "targets/qwen3_8/impl/runtime/vision_prefill.h"
@@ -45,6 +47,34 @@ enum class MtpBridgeMode : std::uint8_t {
     None,
     BeforeSuffix,
     AfterExactHit,
+};
+
+// The unit sequence of one System One decision (decision.h), fixed when the request is planned.
+// The state prefills in `prefill_chunk` chunks. Short branches are packed first-fit in request
+// order into passes of at most `pass_columns`; each pass is one weight stream in which every
+// branch continues the state independently. A branch longer than a pass runs alone as a long
+// branch, chunk by chunk, over a copy of the state's GDN slot.
+struct DecisionPlan {
+    struct Pass {
+        // Branch indices in pass column order, and the columns they occupy together.
+        std::vector<std::uint32_t> branches;
+        std::uint32_t columns = 0;
+    };
+
+    std::vector<Pass> passes;
+    // Branch indices in request order.
+    std::vector<std::uint32_t> long_branches;
+    std::uint32_t state_tokens   = 0;
+    std::uint32_t input_tokens   = 0;
+    std::uint32_t pass_columns   = 0;
+    // KV tokens a lane holds above the state for branch execution; never interpreted afterwards.
+    std::uint32_t scratch_extent = 0;
+    // Passes plus long-branch chunks: every unit after the state.
+    std::uint64_t branch_units = 0;
+    // 1 / (sqrt(pointer_dim) * T): the pointer logit scale of the adapter's calibrated head.
+    float logit_scale = 0.0F;
+    // Keep the state [0, state_tokens) resident as a retained lane after the decision.
+    bool retain_state = false;
 };
 
 } // namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS
@@ -87,6 +117,9 @@ struct RequestBasePlanImpl<NINFER_QWEN38_VARIANT> {
     // reusable by the adapter that produced them.
     std::int32_t adapter    = -1;
     bool allow_prefix_reuse = false;
+    // Present for a System One decision, which prefills its state and branches and reads its
+    // pointer head instead of generating.
+    std::shared_ptr<const NINFER_QWEN38_RUNTIME_NS::DecisionPlan> decision;
 };
 
 template <>
@@ -112,6 +145,7 @@ struct RequestPlanImpl<NINFER_QWEN38_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     std::uint32_t text_kv_page_ceiling        = 0;
     std::uint32_t backend_kv_page_ceiling     = 0;
+    std::shared_ptr<const NINFER_QWEN38_RUNTIME_NS::DecisionPlan> decision;
 };
 
 } // namespace ninfer::targets::qwen3_8::detail
@@ -243,6 +277,10 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    // The retained state is a System One decision state [0, execution_frontier): no sampled
+    // token, tail hidden, backend KV or checkpoint. Only a later decision of the same adapter
+    // continues it; it is never a generation prefix.
+    bool decision_state = false;
     TurnCheckpoint turn_checkpoint;
     UserTurnAnchor user_turn_anchor;
     // Host ring of past turn checkpoints, ascending by frontier. Populated only when the
@@ -287,6 +325,26 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
+
+    // A System One decision in progress. Its lane stays Prefilling until every unit ran; it never
+    // licenses a token, samples or drafts.
+    struct Decision {
+        DecisionPrompt prompt;
+        std::shared_ptr<const DecisionPlan> plan;
+        std::uint32_t reused_state_tokens = 0;
+        std::uint32_t state_cursor        = 0;
+        std::size_t next_pass             = 0;
+        std::size_t next_long             = 0;
+        // Branch tokens of the current long branch already computed, its row (state then
+        // branch, the addressing prefill chunks use) and the option keys projected so far.
+        std::uint32_t long_cursor = 0;
+        std::vector<TokenId> long_row;
+        std::uint32_t long_keys = 0;
+        DecisionOutcome outcome;
+        bool complete = false;
+    };
+
+    std::optional<Decision> decision;
 };
 
 class ProgramImplCore {
@@ -303,6 +361,39 @@ public:
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base,
                                                     std::span<const std::uint32_t> capture_depths);
+    // System One decisions (decision_impl.h). A decision plans into the same base and lane plans
+    // as a generation; its lane runs through advance_prefill_lane and completes through
+    // take_decision_lane.
+    [[nodiscard]] RequestBasePlan plan_decision_base(const DecisionPrompt& prompt,
+                                                     const runtime::ResolvedDecisionOptions& options);
+    [[nodiscard]] RequestPlan plan_decision_for_lane(std::uint32_t lane, const DecisionPrompt& prompt,
+                                                     const RequestBasePlan& base);
+    [[nodiscard]] runtime::PrefillStepResult start_decision_lane(std::uint32_t lane,
+                                                                 DecisionPrompt&& prompt,
+                                                                 RequestPlan&& plan);
+    [[nodiscard]] DecisionOutcome take_decision_lane(std::uint32_t lane);
+    [[nodiscard]] bool retained_lane_holds_decision(std::uint32_t lane) const noexcept {
+        return lane < max_concurrency && sequences[lane].retained &&
+               sequences[lane].decision_state;
+    }
+    // Image kind `decision_state` (decision_impl.h): a retained decision state published to the
+    // continuation cache under the alias of its exact state row, and restored only by a decision
+    // of exactly that state and adapter.
+    [[nodiscard]] std::optional<std::string> decision_state_alias(const DecisionPrompt& prompt) const;
+    [[nodiscard]] cache::ContinuationImage export_decision_state_background(std::uint32_t lane) const;
+    [[nodiscard]] std::uint32_t
+    preflight_decision_state_metadata(const cache::SessionCandidateDescriptor& candidate,
+                                      const DecisionPrompt& prompt) const noexcept;
+    [[nodiscard]] std::uint32_t
+    preflight_decision_state(const cache::ContinuationImage& image, const DecisionPrompt& prompt,
+                             std::int32_t adapter,
+                             std::uint32_t* divergence_tokens = nullptr) const noexcept;
+    [[nodiscard]] std::shared_ptr<DecodedContinuation>
+    decode_decision_state(const cache::ContinuationImage& image) const;
+    [[nodiscard]] ContinuationRestoreFailure
+    import_decision_state_lane(std::uint32_t lane, const cache::ContinuationImage& image,
+                               const DecodedContinuation& decoded, const DecisionPrompt& prompt,
+                               std::int32_t adapter, runtime::KvPageFootprint entitlement) noexcept;
     // LoRA residency. `SequenceState::adapter` is a pool index - the adapter's identity, stable
     // for the process - while the device bank holds a bounded number of slots. This resolves one
     // to the other, staging the adapter over the least recently used slot that no generating
@@ -431,6 +522,7 @@ public:
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
     const cache::Bytes continuation_compatibility_key;
+    const cache::Bytes decision_state_compatibility_key;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -444,6 +536,11 @@ public:
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor turn_checkpoint_hidden_store;
+    // Per lane, the option keys of the long decision branch in flight (FP32
+    // [pointer_dim, kMaximumDecisionOptions, lanes]); empty for a target without decisions.
+    Tensor decision_keys;
+    // Pinned landing buffer of one decision unit's probabilities.
+    std::optional<PinnedHostBuffer> decision_host;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
@@ -526,6 +623,19 @@ private:
                                          std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
                                                              RequestControl& request);
+    // Several lanes prefill interleaved while every prefill chunk addresses its KV through the
+    // shared single-sequence row selectors, so each step re-selects its own lane's rows.
+    void select_prefill_kv_rows(const SequenceState& sequence);
+    [[nodiscard]] runtime::PrefillStepResult advance_decision(SequenceState& sequence,
+                                                              RequestControl& request);
+    [[nodiscard]] schedule::PrefillContext decision_prefill_context(SequenceState& sequence,
+                                                                    std::uint32_t base,
+                                                                    std::int32_t current_slot);
+    void decision_pass_unit(SequenceState& sequence, RequestControl::Decision& decision,
+                            const DecisionPlan::Pass& pass);
+    // One chunk of the current long branch; returns the branch tokens it computed.
+    [[nodiscard]] std::uint32_t decision_long_unit(SequenceState& sequence,
+                                                   RequestControl::Decision& decision);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

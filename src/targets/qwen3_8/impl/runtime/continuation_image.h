@@ -11,6 +11,7 @@
 
 #include <bit>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -358,6 +359,99 @@ inline std::vector<PromptBoundaryAlias> boundary_aliases(
             .alias            = std::move(*alias)});
     }
     return result;
+}
+
+// Image kind `decision_state`: one retained System One decision state, the main-text KV [0, Ls) and
+// the lane's current GDN slot of the state row [<|fim_prefix|>, state...]. It carries no MTP or
+// DFlash state, tail hidden state, sampled token or turn checkpoint, so it is a different state ABI
+// from a chat continuation over the same engine identity: its key extends the chat key and an image
+// of either kind fails the other kind's first identity comparison.
+inline cache::Bytes
+decision_state_compatibility_key(std::span<const std::uint8_t> continuation_key) {
+    Writer out;
+    write_header(out, "qwen-decision-state-abi");
+    out.blob(continuation_key);
+    return std::move(out).finish();
+}
+
+// A decision state is text at ordinal positions on every MRoPE axis - the identity a text prompt of
+// the same tokens has - and names no vision item.
+inline ResidentPrefixIdentitySnapshot ordinal_text_identity(std::size_t tokens) {
+    ResidentPrefixIdentitySnapshot out;
+    out.token_types.assign(tokens, 0);
+    for (auto& axis : out.positions) {
+        axis.resize(tokens);
+        for (std::size_t index = 0; index < tokens; ++index) {
+            axis[index] = static_cast<std::int32_t>(index);
+        }
+    }
+    return out;
+}
+
+// The canonical exact prefix of a decision state, and its SHA-256, the image's frontier digest.
+inline cache::Bytes decision_state_prefix(std::span<const TokenId> state) {
+    return encode_prefix(std::vector<TokenId>(state.begin(), state.end()),
+                         ordinal_text_identity(state.size()));
+}
+
+inline cache::Bytes decision_state_digest(std::span<const std::uint8_t> prefix) {
+    artifact::Sha256 hash;
+    hash.update(std::as_bytes(prefix));
+    const artifact::Sha256Digest digest = hash.finish();
+    return cache::Bytes(digest.begin(), digest.end());
+}
+
+// Content-addressed alias of a decision state: the exact state row under the decision-state key.
+// Only the whole state is named. A decision continuing a retained shorter state is an L1 lane
+// decision; a cached image serves exactly the state it holds.
+inline std::string decision_state_alias(std::span<const std::uint8_t> decision_key,
+                                        std::span<const TokenId> state) {
+    if (state.empty() || state.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("decision state alias needs a state row");
+    }
+    Writer canonical;
+    canonical.string("ninfer/qwen3.8/decision-state-alias");
+    canonical.u32(1);
+    canonical.blob(decision_key);
+    canonical.u32(static_cast<std::uint32_t>(state.size()));
+    canonical.blob(decision_state_prefix(state));
+    const cache::Bytes bytes = std::move(canonical).finish();
+    artifact::Sha256 hash;
+    hash.update(std::as_bytes(std::span(bytes)));
+    const artifact::Sha256Digest digest = hash.finish();
+    constexpr char hex[]                = "0123456789abcdef";
+    std::string alias("@decision/v1/");
+    alias.reserve(alias.size() + 64);
+    for (const std::uint8_t byte : digest) {
+        alias.push_back(hex[byte >> 4]);
+        alias.push_back(hex[byte & 0x0f]);
+    }
+    return alias;
+}
+
+// The `decision_state` frontier metadata: the state extent and the content fingerprint of the
+// decision adapter whose weights the KV and GDN state encode.
+struct DecisionStateMetadata {
+    std::uint32_t state_tokens = 0;
+    std::array<std::uint8_t, 32> adapter{};
+};
+
+inline cache::Bytes encode_decision_state(const DecisionStateMetadata& metadata) {
+    Writer out;
+    write_header(out, "qwen-decision-state");
+    out.u32(metadata.state_tokens);
+    out.raw(metadata.adapter);
+    return std::move(out).finish();
+}
+
+inline DecisionStateMetadata decode_decision_state(std::span<const std::uint8_t> bytes) {
+    Reader in(bytes);
+    read_header(in, "qwen-decision-state");
+    DecisionStateMetadata out;
+    out.state_tokens = in.u32();
+    for (std::uint8_t& byte : out.adapter) { byte = in.u8(); }
+    in.finish();
+    return out;
 }
 
 // The nearest frontier past the cursor among the lane's capture points, so every prefill chunk

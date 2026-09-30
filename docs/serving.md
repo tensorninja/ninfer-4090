@@ -1,7 +1,8 @@
 # HTTP serving
 
 `build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+Anthropic-compatible HTTP endpoints, plus TypeSafe System One decisions for Qwen3.8-27B decision
+adapters, over one resident NInfer Engine.
 
 ## Start the server
 
@@ -54,11 +55,13 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /systemone/v1/systemone` | [System One](#system-one-decisions) decision answered by a decision adapter |
+| `GET /systemone/v1/models` | System One model cards: each decision adapter, then the bound `jev-latest` alias |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
 | `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE stream of the schema-20 records `--request-log-jsonl` writes |
+| `GET /events` | SSE stream of the schema-21 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -92,7 +95,7 @@ reported apart from `restore_failures` because a deferral leaves the candidate l
 and a failure does not. The same counters appear on the throughput record as cumulative totals
 paired with interval deltas, so churn is readable from a replayed log as well as live.
 
-`GET /events` streams the same schema-20 records `--request-log-jsonl` appends, as named SSE
+`GET /events` streams the same schema-21 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
@@ -633,6 +636,119 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
   }'
 ```
 
+## System One decisions
+
+Qwen3.8-27B also serves TypeSafe's System One protocol: one state and a set of typed questions
+(`noul`, `choice`, `score`) in, calibrated option probabilities out. A System One model is a
+*decision adapter* in the `--lora-dir` pool: a LoRA adapter plus a pointer head, converted with
+`convert_lora.py --decision-head` (see the
+[adapter authority](maintainer/qwen3.8-27b-lora-adapters.md)). Decisions run in the same process as
+chat and share its weights, KV pool, lanes, and `--lora-slots` residency; they are prefill-only and
+never sample, decode, or draft. Qwen3.6-35B-A3B has no adapter pool and serves no System One model.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --lora-dir lora --systemone-default decider --max-context 16384
+```
+
+The routes live under their own base path, so the root `/v1/models` stays OpenAI's. Point the
+TypeSafe SDK at it with `base_url`; the SDK requires a key even for an open server:
+
+```python
+from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+
+client = TypeSafeClient(api_key="local", base_url="http://127.0.0.1:8080/systemone")
+result = client.system_one(
+    state="I was charged twice this month. Please refund one charge before Friday.",
+    questions={
+        "billing": Noul(instructions="Is this message about billing?"),
+        "tone": Choice(instructions="What is the tone?", criteria={"calm": None, "angry": None}),
+        "urgency": Score(instructions="How urgent is it?", criteria=["Can wait", "Today"]),
+    },
+)
+```
+
+Request validation, rendering, the token layout, answers, confidences, rounding, and usage follow
+kev's System One server exactly, including FastAPI's 422 error list for invalid bodies. `model`
+names a decision adapter by its pool name. `jev-latest`, the SDK's default and the value used when
+`model` is omitted, answers with `--systemone-default`, or with the pool's only decision adapter
+when the flag is unset; with several decision adapters and no flag it is unbound. The response
+`model` is the adapter that answered, not the alias. Generative adapters and the base model are not
+System One models, and decision adapters are not OpenAI or Anthropic models.
+
+`usage.input_tokens` counts the state and every question branch; `usage.output_tokens` is the token
+count of the answers' Python `json.dumps` text. `latency_ms` is the engine's time on the decision,
+to 0.1 ms: the restore of a cached state image, if any, plus execution from admission to result,
+excluding the queue wait. A state is cut to its first 65,536
+tokens, delimiter included. A question whose branch does not fit the 73,728-token row with its
+state, or a decision whose state plus branch scratch exceeds a lane's `--max-context`, is refused
+with 422 and a `detail` string.
+
+| Status | When |
+|---|---|
+| 400 | the body cannot be decoded: ill-formed UTF-8, a lone UTF-16 surrogate, an integer of more than 4,300 digits, or nesting deeper than 1,000 |
+| 401 | `--api-key` is set and the request carries no matching bearer or `x-api-key` key; also sends `www-authenticate: Bearer` |
+| 404 | no System One model answers to `model`, or the path is unknown (`{"detail": "Not Found"}`) |
+| 413 | the body exceeds `--max-request-mib` |
+| 422 | validation errors (FastAPI's list), or a decision beyond its token budgets |
+| 429 | the pending queue is full; sends `Retry-After: 1` and `retry-after-ms: 1000` |
+| 503 | the pending deadline passed; same retry headers |
+| 500 | an internal error, `{"detail": "Internal Server Error"}` |
+
+Every response under `/systemone/`, errors included, carries `x-typesafe-request-id`: the request's
+own value when it sends one, otherwise a fresh uuid4 hex. A repeated state is not recomputed: it
+continues from a lane that retained it or, once no lane does, is restored from the exact-state image
+its first decision published to the L2/L3 continuation tiers
+([decision states](continuation-cache.md#system-one-decision-states)); `--no-prefix-reuse` disables
+both. A decision that reuses its exact state, retained or restored, reads the bytes the cold
+decision computed and repeats its probabilities exactly. One that continues a shorter retained state
+reproduces the input semantics of a cold decision, not its arithmetic, so its probabilities agree
+within kev's 0.03 tolerance rather than bit for bit. kev's demo routes (`/permute`, `/separate`) are
+not served, and only `jev-latest` is an alias.
+
+The request log records each submitted decision as `decision_start` and `decision_done` or
+`decision_error` (see [Structured request log](#structured-request-log)). `/metrics` counts answered
+decisions in `ninfer:decisions_total`, `ninfer:decision_questions_total`,
+`ninfer:decision_state_tokens_total`, `ninfer:decision_reused_state_tokens_total`,
+`ninfer:decision_branch_tokens_total`, and `ninfer:decision_execution_seconds_total`; in-flight
+decisions count toward `llamacpp:requests_processing` and `llamacpp:requests_deferred`.
+
+### System One fidelity
+
+kev holds a served decision model to two bars (its Kev-27B model card): every question's
+probabilities within max |Δp| ≤ 0.03 of the evaluation path, with at most one changed answer per 280
+questions; and each question asked alone within the same bar of the full request.
+`tools/parity/qwen3_8_27b/decision.py gates` measures both over kev's sample, the first 200 clean
+decision-v7 development records (280 questions), plus three long cases with multi-chunk states and
+branches longer than a pass: 290 questions, every state computed cold. Its evaluation path is a
+PyTorch row-form reference: the trainer's PEFT adapter and head over the served artifact's own base
+weights, with BF16 KV.
+
+Every unit of a decision, state chunks and branch passes alike, runs BF16 activations: the INT8
+activation routes of chat prefill are never admitted. The KV codec is therefore the one lossy choice
+left to the operator. Measured on an RTX 4090, 2026-09-29, with `systemone-decision-v7`:
+
+| `--kv-dtype` | Served vs reference, max \|Δp\| (mean) | Changed answers / 290 | Alone vs full request, max \|Δp\| | kev's bars |
+|---|---:|---:|---:|---|
+| `bf16` | 0.029 (0.0025) | 0 | 0.006 | met |
+| `int8` | 0.026 (0.0029) | 0 | 0.009 | met |
+| `rk8v4` | 0.054 (0.0052) | 1 | 0.010 | missed |
+| `rk4v4-e8` | 0.205 (0.0100) | 2 | 0.021, one changed answer | missed |
+
+A repeated cold decision is bit-identical on every codec. At the task level the codec makes no
+measurable difference: over the development partition's 1,264 clean questions, probed before the
+segmented branch Ops, accuracy is 0.870–0.872, Brier 0.184–0.185 and ECE 0.024–0.031 for all four,
+against an accuracy standard error of about 0.009.
+
+`bf16`, the `ninfer-serve` default, is the qualified configuration for decisions. `int8` met both
+bars here, but measured 0.031 before the segmented branch Ops, so it sits at the bar rather than
+inside it. The rotated codecs keep task-level
+quality while moving individual probabilities beyond kev's tolerance; choose them for chat context
+capacity (`rk4v4-e8` stores about 3.8 times as many tokens per GiB as `bf16`) knowing that decisions
+served beside chat on them are not qualified to kev's bar. A trainer on another quantization of the
+base, such as the NF4 QLoRA base `llm-datasets` trains on, differs from any served codec by more than
+the codec does ([adapter authority](maintainer/qwen3.8-27b-lora-adapters.md#33-revisit-decision-adapters-use-only-these-six-modules)).
+
 ## Tool calls
 
 Chat Completions, Responses, and Messages use the same tool-call parser. NInfer renders function
@@ -710,9 +826,12 @@ curl http://127.0.0.1:8080/v1/models \
 ```
 
 Every HTTP response, including errors and SSE, carries `x-request-id`. HTTP 429 overload and HTTP
-503 queue-timeout responses also carry `Retry-After: 1`. `--cors` adds permissive browser headers,
+503 queue-timeout responses also carry `Retry-After: 1`. Under `/systemone/`, a missing or wrong
+key is answered in System One's shape (`{"detail": ...}` with `www-authenticate: Bearer`), and
+every response also carries `x-typesafe-request-id`. `--cors` adds permissive browser headers,
 allows unauthenticated `OPTIONS` preflight, permits SDK authentication/content headers, and exposes
-`x-request-id` and `Retry-After`; it is disabled by default.
+`x-request-id`, `x-typesafe-request-id`, `Retry-After`, and `retry-after-ms`; it is disabled by
+default.
 
 Response retrieval rejects unsupported query options explicitly. Input-Item retrieval supports
 `after`, `limit=1..100`, and `order=asc|desc`; duplicate, unknown, and invalid pagination parameters
@@ -747,6 +866,9 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--lora-dir DIR` | discover the adapter pool: each `NAME.lora.ninfer` is chat model `<model id>-NAME`, or System One model `NAME` for a decision adapter | unset |
+| `--lora-slots N` | device-resident adapter slabs; the rest swap in on admission | `2` |
+| `--systemone-default NAME` | decision adapter the System One default model `jev-latest` answers with | the only decision adapter |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -848,7 +970,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-20 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -859,6 +981,9 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call counts, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
+| `decision_start` | a submitted System One decision: `model`, the answering `adapter`, reuse flag, question/option counts, state/branch/longest-branch tokens, and state truncation |
+| `decision_done` | output tokens, reused and computed state tokens with their `state_source`, branch passes, long-branch chunks, slot, unrounded `prepare`/`queue`/`restore`/`state`/`branch`/`execution`/`total` seconds, and state/branch prefill rates |
+| `decision_error` | the submitted decision and the client-visible status and message |
 | `throughput` | interval token deltas and rates, board energy, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `queue`, `restore`, `publish`,
@@ -896,8 +1021,10 @@ replaces that value with `<redacted>`. The existing stderr summaries remain avai
 but are rounded and are not the aggregation source. Console lines use local
 `[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. Structured request events cover successfully
 prepared OpenAI Responses, OpenAI Chat, and Anthropic generation requests and errors during their
-generation; schema rejection
-and token-count-only calls are not measurement requests and do not receive request IDs.
+generation, and System One decisions once submitted; schema rejection
+and token-count-only calls are not measurement requests and do not receive request IDs. A decision
+record's `x_request_id` is its `x-typesafe-request-id`. `server_start.adapters` names the
+`decision_names` among the pool and the configured `systemone_default`.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts

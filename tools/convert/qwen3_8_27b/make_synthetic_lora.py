@@ -30,6 +30,11 @@ Four kinds, in the order they should be brought up:
 ``distinct``
     ``--variant a|b`` selects one of two canaries with different constants and
     different targets, for per-request routing and mixed-batch tests.
+
+``--decision-head`` adds a System One pointer head beside any kind: a seeded
+Gaussian FP32 ``decision_head.safetensors`` carrying the trainer's hand-off
+metadata, so ``convert_lora.py --decision-head`` makes a decision adapter whose
+probabilities are neither uniform nor saturated.
 """
 
 from __future__ import annotations
@@ -229,6 +234,45 @@ def build_adapter_config(
     }
 
 
+def build_decision_head(seed: int, sigma: float) -> dict[str, torch.Tensor]:
+    """Seeded Gaussian pointer head in the trainer's key names and FP32 dtype."""
+
+    generator = torch.Generator().manual_seed(seed + 0x5E1F)
+    tensors: dict[str, torch.Tensor] = {}
+    for name, shape in (
+        ("query.weight", (inventory.DECISION_POINTER_DIM, inventory.HIDDEN)),
+        ("query.bias", (inventory.DECISION_POINTER_DIM,)),
+        ("key.weight", (inventory.DECISION_POINTER_DIM, inventory.HIDDEN)),
+        ("key.bias", (inventory.DECISION_POINTER_DIM,)),
+    ):
+        tensors[name] = torch.empty(shape, dtype=torch.float32).normal_(
+            0.0, sigma, generator=generator
+        )
+    return tensors
+
+
+def write_decision_head(out_dir: Path, seed: int, sigma: float, temperature: float) -> None:
+    metadata = {
+        "format": "systemone-pointer-head",
+        "format_version": "1",
+        "pointer_dim": str(inventory.DECISION_POINTER_DIM),
+        "hidden_size": str(inventory.HIDDEN),
+        "logit_scale": repr(inventory.DECISION_LOGIT_SCALE),
+        "temperature": repr(float(temperature)),
+        "readout": inventory.DECISION_READOUT,
+        "escape": inventory.DECISION_ESCAPE,
+        "delimiters": json.dumps(inventory.DECISION_DELIMITERS),
+        "base_model": "synthetic/Qwen3.8-27B",
+        "description": f"synthetic decision adapter (seed {seed})",
+        "release_date": "2026-01-01",
+    }
+    save_file(
+        build_decision_head(seed, sigma),
+        str(out_dir / "decision_head.safetensors"),
+        metadata=metadata,
+    )
+
+
 def write_adapter(
     out_dir: Path,
     kind: str,
@@ -294,6 +338,13 @@ def main() -> None:
         default=None,
         help=f"registered site keys, default all: {list(inventory.SITE_KEYS)}",
     )
+    parser.add_argument(
+        "--decision-head",
+        action="store_true",
+        help="also write a seeded System One pointer head (decision_head.safetensors)",
+    )
+    parser.add_argument("--head-sigma", type=float, default=0.01, help="pointer head stddev")
+    parser.add_argument("--temperature", type=float, default=1.0, help="pointer head temperature")
     args = parser.parse_args()
 
     site_keys = frozenset(args.sites) if args.sites else inventory.ALL_SITE_KEYS
@@ -308,9 +359,13 @@ def main() -> None:
         sigma=args.sigma,
         use_rslora=args.use_rslora,
     )
+    if args.decision_head:
+        write_decision_head(args.out, args.seed, args.head_sigma, args.temperature)
     print(f"wrote {args.out}")
     print(f"  kind {manifest['kind']}  rank {manifest['rank']}  scale {manifest['folded_scale']}")
     print(f"  {manifest['tensors']} tensors, {manifest['parameters']} parameters")
+    if args.decision_head:
+        print(f"  decision head sigma {args.head_sigma}  temperature {args.temperature}")
 
 
 if __name__ == "__main__":

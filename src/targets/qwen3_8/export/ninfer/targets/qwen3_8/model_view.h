@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_8/vision.h>
 
 #include "core/tensor.h"
+#include "ninfer/types.h"
 
 #include <array>
 #include <cstddef>
@@ -104,6 +105,20 @@ struct LoraGdnLayerWeights {
     LoraSiteWeights down;
 };
 
+// The System One pointer head (decision.h) of every resident slot: BF16 [hidden, pointer_dim]
+// weights (pointer_dim rows of hidden) and [pointer_dim] biases of the query and key projections.
+// The planes are slot 0's; slot s is `slot_stride` bytes further. Absent unless the pool holds a
+// decision adapter. A slot whose occupant is generative holds zeros here that no decision reads.
+struct DecisionHeadWeights {
+    Tensor query_weight;
+    Tensor query_bias;
+    Tensor key_weight;
+    Tensor key_bias;
+    std::size_t slot_stride = 0;
+
+    [[nodiscard]] bool present() const noexcept { return query_weight.data != nullptr; }
+};
+
 // A startup-fixed bank of resident slots drawn from an unbounded adapter pool. The rank, the
 // site geometry and the per-site slot stride are frozen here and enter the captured graph as
 // constants; which slot a row selects is a device-resident value the graph re-reads on every
@@ -125,12 +140,17 @@ struct LoraWeights {
     // residency detail; neither survives a restart or a swap, so neither may key state that
     // outlives the request that produced it.
     std::vector<std::array<std::uint8_t, 32>> fingerprints;
+    // Kind of every pool adapter, in pool order, and for a decision adapter the calibrated
+    // temperature its pointer logits are divided by (1 for a generative adapter).
+    std::vector<LoraAdapterKind> kinds;
+    std::vector<float> decision_temperatures;
     // Device bytes the package committed for the whole bank. The bank is its own arena outside
     // the weights arena, so this is the only route by which the family's memory summary can
     // account for it instead of leaving it as unexplained missing free memory.
     std::uint64_t device_bytes = 0;
     std::array<LoraFullLayerWeights, FullAttentionLayers> full_layers;
     std::array<LoraGdnLayerWeights, GdnLayers> gdn_layers;
+    DecisionHeadWeights decision_head;
 };
 
 struct DFlashLayerWeights {

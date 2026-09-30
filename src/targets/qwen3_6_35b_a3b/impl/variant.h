@@ -17,6 +17,7 @@ struct Variant {
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
     using DFlashConfig                   = detail::DFlashConfig;
+    using DecisionConfig                 = detail::DecisionConfig;
     using ModelView                      = detail::RuntimeModelView;
     using FullAttentionProjectionWeights = detail::AttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;
@@ -33,6 +34,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr bool supports_decisions                   = DecisionConfig::supported;
     // No LoRA site table is registered for this identity: its post-mixer is a sparse MoE whose
     // down projection is per-expert, which the registered additive site contract does not cover.
     static constexpr bool supports_lora                        = false;
