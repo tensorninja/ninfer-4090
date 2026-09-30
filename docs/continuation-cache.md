@@ -223,7 +223,8 @@ by effective depth, and resolves a payload only while it can still improve the s
 stable-prefix, or routed candidate. A digest match is only a negative-filter pass: complete payload
 SHA-256, manifest/image metadata agreement, and exact image preflight remain required before import
 or destructive history rollback. The corresponding complete-image framing is `NICIMG03`, with Qwen
-target image version `3`; old cache namespaces must be deleted rather than migrated.
+target image version `4` (packed 4-bit KV pages in the midrise codec); old cache namespaces must be
+deleted rather than migrated.
 
 ## System One decision states
 
@@ -271,7 +272,7 @@ mkdir -p "$HOME/.cache/ninfer/continuations"
 ./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --host 127.0.0.1 --port 8080 \
   --max-context 262144 --kv-capacity 262144 \
-  --max-concurrency 1 --kv-dtype rk4v4-e8 \
+  --max-concurrency 1 --kv-dtype rk4v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --prefix-checkpoint-policy rolling-tool \
   --continuation-cache l1-l2-l3 \

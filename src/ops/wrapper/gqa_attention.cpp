@@ -65,9 +65,6 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.rotate_v && !cache.packed_v) {
         throw std::invalid_argument(std::string(op) + ": rotated V requires packed V4");
     }
-    if (cache.e8_lattice && !cache.packed_k) {
-        throw std::invalid_argument(std::string(op) + ": E8 lattice requires packed K");
-    }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -131,9 +128,6 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.rotate_v && !cache.packed_v) {
         throw std::invalid_argument(std::string(op) + ": rotated V requires packed V4");
-    }
-    if (cache.e8_lattice && !cache.packed_k) {
-        throw std::invalid_argument(std::string(op) + ": E8 lattice requires packed K");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -574,8 +568,10 @@ void gqa_attention_segmented(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(out, op, "out");
     const std::uint32_t capacity = validate_batch_cache(cache, kSegmentedKVHeads, op);
     const std::int64_t end       = static_cast<std::int64_t>(prefix) + columns;
-    if (prefix < 0 || end > capacity || end > kGqaAttentionMaximumVisibleKeys) {
-        throw std::invalid_argument("gqa_attention_segmented: prefix + N exceeds the KV row");
+    if (prefix < 0 || static_cast<std::uint32_t>(prefix) > capacity ||
+        end > kGqaAttentionMaximumVisibleKeys) {
+        throw std::invalid_argument(
+            "gqa_attention_segmented: prefix exceeds the KV row or prefix + N the visible keys");
     }
 
     auto scope                 = workspace.scope();

@@ -28,7 +28,8 @@
 
 namespace ninfer::targets::qwen3_8::detail::continuation {
 
-inline constexpr std::uint32_t kTargetImageVersion = 3;
+// Version 4: packed 4-bit KV pages hold the midrise codec, and E8-lattice keys are gone.
+inline constexpr std::uint32_t kTargetImageVersion = 4;
 class Writer {
 public:
     void u8(std::uint8_t value) { bytes_.push_back(value); }

@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-// Retained-session snapshot format (target-private, version 1).
+// Retained-session snapshot format (target-private; kSessionSnapshotVersion below).
 //
 // A snapshot is the complete host image of one idle retained lane: the resident prefix
 // (ledger + identity), the paged Text/backend KV payload in logical page order, the lane's
@@ -31,6 +31,9 @@ namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
 namespace {
 
 constexpr char kSessionSnapshotMagic[8] = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
+// Version 5 holds packed 4-bit KV planes in the midrise codec. Version 4 held symmetric 4-bit
+// codes and could carry E8-lattice keys, neither of which this build decodes.
+//
 // Version 4 records the producing LoRA adapter by its 32-byte artifact content fingerprint and
 // appends the host turn-checkpoint ring after the KV payload. Both are unconditional: the ring
 // section is always written, empty or not, so one reader shape covers every image.
@@ -39,7 +42,7 @@ constexpr char kSessionSnapshotMagic[8] = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1
 // and index-identical across processes; with a swapped slot pool an index names whichever
 // adapter happens to occupy that position, so a v3 image would hand one adapter's KV and GDN
 // state to another. Older versions cannot be restored.
-constexpr std::uint32_t kSessionSnapshotVersion = 4;
+constexpr std::uint32_t kSessionSnapshotVersion = 5;
 // All-zero marks the base weights. A real SHA-256 of an artifact is not zero.
 using SnapshotAdapterFingerprint = std::array<std::uint8_t, 32>;
 constexpr std::uint32_t kSessionSnapshotMaxRingEntries = 64;
@@ -48,8 +51,7 @@ constexpr std::uint32_t kKvFlagPackedV    = 1U << 0;
 constexpr std::uint32_t kKvFlagRotateK    = 1U << 1;
 constexpr std::uint32_t kKvFlagRotateV    = 1U << 2;
 constexpr std::uint32_t kKvFlagPackedK    = 1U << 3;
-constexpr std::uint32_t kKvFlagE8Lattice  = 1U << 4;
-constexpr std::uint32_t kKvFlagE8Root     = 1U << 5;
+constexpr std::uint32_t kKvFlagE8Root     = 1U << 4;
 
 class SnapshotWriter {
 public:
@@ -391,8 +393,7 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     config.kv_quant_group      = kv_quant_group;
     config.kv_flags            = (kv_packed_v ? kKvFlagPackedV : 0U) |
                       (kv_rotate_k ? kKvFlagRotateK : 0U) | (kv_rotate_v ? kKvFlagRotateV : 0U) |
-                      (kv_packed_k ? kKvFlagPackedK : 0U) |
-                      (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+                      (kv_packed_k ? kKvFlagPackedK : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
     config.speculative_backend  = static_cast<std::uint32_t>(speculative_backend);
     config.draft_window         = draft_window;
     config.page_size            = static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -579,7 +580,7 @@ std::uint32_t ProgramImplCore::restore_retained_lane(
     const std::uint32_t expected_flags =
         (kv_packed_v ? kKvFlagPackedV : 0U) | (kv_rotate_k ? kKvFlagRotateK : 0U) |
         (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
-        (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+        (kv_e8_root ? kKvFlagE8Root : 0U);
     if (config.kv_dtype != static_cast<std::uint32_t>(kv_dtype) ||
         config.kv_quant_group != kv_quant_group || config.kv_flags != expected_flags ||
         config.page_size != static_cast<std::uint32_t>(kPagedKVPageSize) ||

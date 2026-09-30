@@ -479,13 +479,13 @@ throughput only.
 | GPU | NVIDIA GeForce RTX 4090, 24 GiB, 480 W power limit (~2,715 MHz sustained) |
 | Toolchain | CUDA 13.2, `CMAKE_CUDA_ARCHITECTURES=89`, Release |
 | Artifact | `qwen3.8-27b/groupwise-int` |
-| KV dtype | `rk4v4-e8` |
-| Prompt | 115,125 tokens |
+| KV dtype | `rk4v4` (the INT8-route ladder below: its predecessor `rk4v4-e8`) |
+| Prompt | `scripts/prefill_probe.py --targets 102400`: 118,242 tokens (the ladder: 115,125) |
 
 ```bash
 ./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --max-context 262144 --kv-capacity 262144 --prefill-chunk 1024 \
-  --kv-dtype rk4v4-e8 --continuation-cache off --no-prefix-reuse
+  --kv-dtype rk4v4 --continuation-cache off --no-prefix-reuse
 ```
 
 Prefill rate is read from the structured request log, as `request_done.result.computed_prefill_tokens`
@@ -514,6 +514,11 @@ split in the attention prefill kernel read 1,701.4 / 1,976.4 / 2,147.3 / 2,409.2
 cumulative); that split lifted both arms, the BF16 baseline by 2.2% and the INT8 build by 3.6%.
 
 `--prefill-chunk 2048` adds a further 0.6%; 4096 does not improve on it.
+
+The ladder used the E8-lattice `rk4v4-e8` KV mode, which the midrise `rk4v4` codec has replaced
+([docs/cli.md](cli.md)). On the probe's current 118,242-token prompt, measured back to back
+(2,714-2,715 MHz mean SM clock, 461-465 W), the last `rk4v4-e8` build prefills at 2,520.6 tok/s and
+the `rk4v4` build at **2,577.9 tok/s** (+2.3%).
 
 ### Activation-compute profile
 

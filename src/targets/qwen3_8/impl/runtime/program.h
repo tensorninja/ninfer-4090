@@ -52,8 +52,9 @@ enum class MtpBridgeMode : std::uint8_t {
 // The unit sequence of one System One decision (decision.h), fixed when the request is planned.
 // The state prefills in `prefill_chunk` chunks. Short branches are packed first-fit in request
 // order into passes of at most `pass_columns`; each pass is one weight stream in which every
-// branch continues the state independently. A branch longer than a pass runs alone as a long
-// branch, chunk by chunk, over a copy of the state's GDN slot.
+// branch continues the state independently and attends its own columns from the pass, so a pass
+// writes no KV page. A branch longer than a pass runs alone as a long branch, chunk by chunk,
+// over a copy of the state's GDN slot, with its KV in pages above the state.
 struct DecisionPlan {
     struct Pass {
         // Branch indices in pass column order, and the columns they occupy together.
@@ -67,7 +68,8 @@ struct DecisionPlan {
     std::uint32_t state_tokens   = 0;
     std::uint32_t input_tokens   = 0;
     std::uint32_t pass_columns   = 0;
-    // KV tokens a lane holds above the state for branch execution; never interpreted afterwards.
+    // KV tokens a lane holds above the state for its longest long branch (zero without one);
+    // never interpreted afterwards.
     std::uint32_t scratch_extent = 0;
     // Passes plus long-branch chunks: every unit after the state.
     std::uint64_t branch_units = 0;
@@ -506,7 +508,6 @@ public:
     const bool kv_rotate_k;
     const bool kv_rotate_v;
     const bool kv_packed_k;
-    const bool kv_e8_lattice;
     const bool kv_e8_root;
     const ProposalHead proposal_head;
     const bool vision_enabled;

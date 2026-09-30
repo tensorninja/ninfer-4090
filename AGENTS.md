@@ -135,9 +135,9 @@ the measured deviation `docs/serving.md` publishes, and nothing enforces a codec
 training, its corpus and the engine-agnostic System One probe belong to `llm-datasets`; kev's
 `/permute` and `/separate` endpoints and decisions on `qwen3.6-35b-a3b` are outside the product.
 
-KV storage is selected at startup from BF16, INT8, and the rotated/E8-lattice codecs
-(`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`). `rk4v4-e8` is the shipping default and serves the
-model's full native 262,144-token context on 24 GB.
+KV storage is selected at startup from BF16, INT8, and the Hadamard-rotated codecs (`rk8v4`,
+`rk4v4`, and `rk2v4-e8` with E8-root keys); every packed 4-bit plane uses one midrise codec.
+`rk4v4` is the shipping default and serves the model's full native 262,144-token context on 24 GB.
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded

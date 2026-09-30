@@ -927,8 +927,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                            *active_gqa_envelope_, work_, a_batch, s);
     } else if (active_segment_table_ != nullptr) {
-        // A decision pass: every segment sees the resident prefix and its own causal past, and
-        // column i's K/V land at cache position prefix + i.
+        // A decision pass: every segment sees the cached resident prefix and its own causal
+        // past from kn/v; the cache is only read.
         ops::gqa_attention_segmented(qn, kn, v, *active_segment_table_, kv_table_rows,
                                      static_cast<std::int32_t>(segment_prefix_), kAttnScale,
                                      batch_text_kv_->batch_layer_view(fidx), work_, a, s);

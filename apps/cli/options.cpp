@@ -58,7 +58,6 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
     if (text == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
-    if (text == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
     if (text == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
@@ -114,7 +113,7 @@ std::string usage_text(const char* argv0) {
            "[--systemone-probabilities] [--systemone-dump-prepared FILE]\n"
            "[--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "[--device N]\n"
-           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
+           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"

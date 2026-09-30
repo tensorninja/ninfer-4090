@@ -1,13 +1,14 @@
 #pragma once
 
-// A4 shared-prefix segmented GQA attention: the split key-tile plan, per-row visibility, and
-// the fixed-order split merge shared by the BF16 and INT8 split kernels
-// (gqa_attention_segmented_{bf16,i8}.cuh).
+// A4 shared-prefix segmented GQA attention: the prefix split plan, the own-column row windows,
+// and the partial layout shared by the prefix split kernels (gqa_attention_segmented_{bf16,i8}.cuh)
+// and the own-column kernel that folds them (gqa_attention_segmented_bf16.cuh).
 //
-// One CTA owns 64 GQA-packed query rows of one KV head (row = column * group + local head) and
-// one split of the shared prefix. Every column sees the whole prefix, so the prefix splits are
-// unmasked dense tiles; the last split also walks the tiles of the appended suffix under the
-// per-row segment-causal mask. Tiles are 64 keys, which is exactly one KV page.
+// A prefix split CTA owns 64 GQA-packed query rows (row = column * group + local head) of one KV
+// head and one balanced share of the cached prefix tiles. Every column sees the whole prefix, so
+// prefix tiles are dense; only the partial last page masks keys at or past the prefix. Tiles are
+// 64 keys, which is exactly one KV page. The own-column kernel reads the call's BF16 K/V instead
+// of the cache, walks each row's segment window, and merges the prefix partials in fixed order.
 
 #include "ops/common/math.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
@@ -36,7 +37,7 @@ struct GqaSegmentedParams {
     std::int32_t prefix;
     std::int32_t columns;
     std::int32_t prefix_tiles;
-    std::int32_t splits;
+    std::int32_t splits; // prefix splits; zero when the prefix is empty
     float scale_log2;
     float* partial_acc; // FP32 [256, q_heads, columns, splits], unnormalized
     float* partial_m;   // FP32 [q_heads, columns, splits], running max in the log2 domain
@@ -60,8 +61,21 @@ __device__ __forceinline__ std::int32_t gqa_segmented_segment_start(const std::i
     return __ldg(&segments[2 * lo]);
 }
 
-// Visible absolute-key interval [lo, hi] of one packed row inside the appended suffix. Every
-// row additionally sees the whole prefix [0, prefix). Rows past the call are empty.
+// Balanced share [begin, end) of the prefix tiles for one split. The launcher never runs more
+// splits than prefix tiles, so every share is nonempty.
+struct GqaSegmentedPrefixShare {
+    std::int32_t begin;
+    std::int32_t end;
+};
+
+__device__ __forceinline__ GqaSegmentedPrefixShare
+gqa_segmented_prefix_share(const GqaSegmentedParams& params, std::int32_t split) {
+    return {split * params.prefix_tiles / params.splits,
+            (split + 1) * params.prefix_tiles / params.splits};
+}
+
+// Own-column window [lo, hi] of one packed row: its segment start through its own column. Rows
+// past the call are empty.
 struct GqaSegmentedRowRange {
     std::int32_t lo;
     std::int32_t hi;
@@ -69,57 +83,15 @@ struct GqaSegmentedRowRange {
 
 template <int GroupSize>
 __device__ __forceinline__ GqaSegmentedRowRange
-gqa_segmented_row_range(const GqaSegmentedParams& params, std::int32_t packed_row, bool needed) {
+gqa_segmented_row_range(const GqaSegmentedParams& params, std::int32_t packed_row) {
     const std::int32_t column = packed_row / GroupSize;
-    if (!needed || column >= params.columns) { return {kGqaSegmentedEmptyLo, -1}; }
-    return {params.prefix +
-                gqa_segmented_segment_start(params.segments, params.segment_count, column),
-            params.prefix + column};
+    if (column >= params.columns) { return {kGqaSegmentedEmptyLo, -1}; }
+    return {gqa_segmented_segment_start(params.segments, params.segment_count, column), column};
 }
 
-__device__ __forceinline__ bool gqa_segmented_visible(std::int32_t key, std::int32_t prefix,
-                                                      GqaSegmentedRowRange range) {
-    return key < prefix || (key >= range.lo && key <= range.hi);
-}
-
-// Key tiles walked by one CTA: its balanced share of the prefix tiles, followed (last split
-// only) by the suffix tiles that intersect its rows' segment windows. A suffix tile that is
-// also the partial last prefix tile is walked once, as a prefix tile.
-struct GqaSegmentedTilePlan {
-    std::int32_t prefix_begin;
-    std::int32_t prefix_count;
-    std::int32_t suffix_begin;
-    std::int32_t suffix_count;
-
-    __device__ __forceinline__ std::int32_t count() const { return prefix_count + suffix_count; }
-
-    __device__ __forceinline__ std::int32_t tile(std::int32_t index) const {
-        return index < prefix_count ? prefix_begin + index
-                                    : suffix_begin + (index - prefix_count);
-    }
-};
-
-template <int GroupSize>
-__device__ __forceinline__ GqaSegmentedTilePlan
-gqa_segmented_tile_plan(const GqaSegmentedParams& params, std::int32_t split,
-                        std::int32_t first_row, std::int32_t last_row) {
-    GqaSegmentedTilePlan plan{};
-    plan.prefix_begin             = split * params.prefix_tiles / params.splits;
-    const std::int32_t prefix_end = (split + 1) * params.prefix_tiles / params.splits;
-    plan.prefix_count             = prefix_end - plan.prefix_begin;
-    plan.suffix_begin             = prefix_end;
-    plan.suffix_count             = 0;
-    if (split == params.splits - 1) {
-        const std::int32_t first_column = first_row / GroupSize;
-        const std::int32_t last_column  = last_row / GroupSize;
-        const std::int32_t first_key =
-            params.prefix +
-            gqa_segmented_segment_start(params.segments, params.segment_count, first_column);
-        const std::int32_t last_key = params.prefix + last_column;
-        plan.suffix_begin           = max(first_key / kGqaSegmentedKeys, prefix_end);
-        plan.suffix_count           = last_key / kGqaSegmentedKeys + 1 - plan.suffix_begin;
-    }
-    return plan;
+__device__ __forceinline__ bool gqa_segmented_in_range(std::int32_t column,
+                                                       GqaSegmentedRowRange range) {
+    return column >= range.lo && column <= range.hi;
 }
 
 __device__ __forceinline__ std::int64_t gqa_segmented_stat_index(int q_heads, int q_head,
@@ -128,48 +100,6 @@ __device__ __forceinline__ std::int64_t gqa_segmented_stat_index(int q_heads, in
     return static_cast<std::int64_t>(q_head) +
            static_cast<std::int64_t>(q_heads) *
                (static_cast<std::int64_t>(column) + static_cast<std::int64_t>(columns) * split);
-}
-
-// Fixed split order: the merged value is a pure function of the partials, so a repeated call is
-// bit-identical. Rotated V leaves the Hadamard domain here, before the single BF16 rounding.
-template <int QHeads, bool RotateV>
-__launch_bounds__(128) __global__
-    void gqa_attention_segmented_merge_kernel(const float* __restrict__ partial_acc,
-                                              const float* __restrict__ partial_m,
-                                              const float* __restrict__ partial_l,
-                                              std::int32_t columns, std::int32_t splits,
-                                              __nv_bfloat16* __restrict__ out) {
-    const int column = static_cast<int>(blockIdx.x);
-    const int q_head = static_cast<int>(blockIdx.y);
-    const int group  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int d0     = group * kGqaKvQuantGroup + lane;
-    const int d1     = d0 + 32;
-
-    const std::int64_t split_stride = static_cast<std::int64_t>(QHeads) * columns;
-    const std::int64_t stat0 = gqa_segmented_stat_index(QHeads, q_head, column, 0, columns);
-    float maximum            = -CUDART_INF_F;
-    for (int split = 0; split < splits; ++split) {
-        maximum = fmaxf(maximum, partial_m[stat0 + split * split_stride]);
-    }
-    float sum = 0.0f;
-    float a0  = 0.0f;
-    float a1  = 0.0f;
-    for (int split = 0; split < splits; ++split) {
-        const std::int64_t stat = stat0 + split * split_stride;
-        const float weight      = exp2f(partial_m[stat] - maximum);
-        const float* acc        = partial_acc + kGqaSegmentedHeadDim * stat;
-        sum                     = fmaf(weight, partial_l[stat], sum);
-        a0                      = fmaf(weight, acc[d0], a0);
-        a1                      = fmaf(weight, acc[d1], a1);
-    }
-    const float inverse = 1.0f / sum;
-    float x0            = a0 * inverse;
-    float x1            = a1 * inverse;
-    if constexpr (RotateV) { gqa_kv_hadamard64(x0, x1); }
-    __nv_bfloat16* row = out + kGqaSegmentedHeadDim * stat0;
-    row[d0]            = __float2bfloat16(x0);
-    row[d1]            = __float2bfloat16(x1);
 }
 
 } // namespace ninfer::ops

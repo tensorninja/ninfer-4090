@@ -483,18 +483,13 @@ PreparedDecision Engine::prepare_decision(DecisionInput input) const {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
             targets::qwen3_8::DecisionPrompt prepared =
                 target_ptr->loaded->frontend.prepare_decision(input);
-            // A lane holds the state plus the branch scratch of one pass (or of its longest
-            // branch); the pass width is the Program's prefill chunk.
             const std::uint32_t capacity = target_ptr->capacity;
-            const std::uint32_t pass     = std::min(impl_->options.prefill_chunk, capacity);
-            const std::uint64_t context =
-                static_cast<std::uint64_t>(prepared.state_tokens()) +
-                targets::qwen3_8::decision_scratch_extent(prepared, pass);
+            const std::uint64_t context  = targets::qwen3_8::decision_context_tokens(prepared);
             if (context > capacity) {
                 throw DecisionInputError(
                     "decision needs " + std::to_string(context) + " tokens of context (a " +
-                    std::to_string(prepared.state_tokens()) + "-token state and its branch " +
-                    "scratch); this server's lanes hold " + std::to_string(capacity));
+                    std::to_string(prepared.state_tokens()) + "-token state and its longest " +
+                    "question); this server's lanes hold " + std::to_string(capacity));
             }
             return PreparedDecision(std::make_unique<PreparedDecision::Impl>(std::move(prepared)));
         },

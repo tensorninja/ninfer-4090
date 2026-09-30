@@ -53,7 +53,6 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
     if (value == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
-    if (value == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
     if (value == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
@@ -114,7 +113,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
            "[--web-dir DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
+           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk2v4-e8] [--spec mtp|dflash --draft-tokens "
            "N] "
            "[--default-max-tokens N] "
            "[--lora-dir DIR] [--lora-slots N] [--lora-rank N] [--systemone-default NAME] "

@@ -739,14 +739,16 @@ Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改
 ### 9.6 System One decision
 
 Decision（`concurrent-inference-architecture.md` §4.5）只使用 Main Text pool，不使用 backend pool。
-Admission 一次性 reserve `ceil((Ls + scratch) / P_main)` pages，`scratch = max(min(短 branch 总长,
-pass 列数), 最长的长 branch)`；超过 Engine context capacity 时以 `ContextLengthExceeded` 拒绝。
+Admission 一次性 reserve `ceil((Ls + scratch) / P_main)` pages，`scratch` 是最长的长 branch（长于
+pass 列数）的长度，没有长 branch 时为 0；state 加最长 branch 超过 Engine context capacity 时以
+`ContextLengthExceeded` 拒绝。
 
 - State `[0,Ls)` 与普通 prompt prefill 相同，按 chunk 推进 frontier。
-- Branch KV 是 `Ls` 之上的 scratch，位于该 lane 自己的 pages 中：packed pass 的第 `i` 列写入 position
-  `Ls + i`，因此 segment `s` 占 `[Ls + c_s, Ls + c_s + T_s)`；长 branch 的连续 chunks 从 `Ls` 起写入。
-  Scratch 只在写入它的 unit 内被读取，从不成为 committed frontier。Branches 彼此不可见；state pages
-  不跨 lane 共享（§1.1）。
+- Packed pass 不写 page：它经 codec 读取 state `[0,Ls)`，每个 segment 自身的 columns 直接取自该 pass
+  的 BF16 K/V 输入（§16.2），因此 branch 自身 tokens 不经过 KV codec。
+- 长 branch 的 KV 是 `Ls` 之上的 scratch，位于该 lane 自己的 pages 中，连续 chunks 从 `Ls` 起写入；
+  scratch 只在写入它的 branch 内被读取，从不成为 committed frontier。
+- Branches 彼此不可见；state pages 不跨 lane 共享（§1.1）。
 - 完成时按 §9.4 truncate 到 `Ls`（host page-map 更新，不复制 payload），取消剩余 reservation；
   `allow_prefix_reuse` 时 bundle 作为 retained decision state 进入 Prefix Cache，否则 release。
 
@@ -1072,7 +1074,7 @@ storage/view boundary。
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
 | `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
-| `gqa_attention_segmented` | writable `PagedKVBatchLayerView` + `table_rows[1]` + host `prefix` | 把 `N` 个 columns 写到 `[prefix,prefix+N)`，再对 shared prefix 执行一次 segment-causal Attention；其余 rows 不变 |
+| `gqa_attention_segmented` | read-only `PagedKVBatchLayerView` + `table_rows[1]` + host `prefix` | 经 codec 读取 shared prefix `[0,prefix)`，segment 自身 columns 取自 BF16 K/V 输入，执行一次 segment-causal Attention；不写 cache |
 | `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
 | `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
 | `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
@@ -1107,9 +1109,9 @@ RoPE/MRoPE coordinate。对 row `b` 的 query position `p`，causal visible doma
 
 `gqa_attention_segmented` 只注册 27B group-6 geometry：Q/Out BF16 `[256,24,N]`、K/V BF16
 `[256,4,N]`、`segments` I32 `[2,S]`（`(c_s,T_s)` 按序铺满 `[0,N)`）、`table_rows` I32 `[1]`，以及 host
-`prefix`。属于 segment `s` 的 column `i` 可见 `[0,prefix) ∪ [prefix+c_s,prefix+i]`，segments 之间互不可见；
-自身 columns 与 prefix 一样读取 codec 编码后的 cache 值。Workspace capacity 只由 `N` 上界决定，与
-`prefix` 无关。
+`prefix`。属于 segment `s` 的 column `i` 可见 `[0,prefix) ∪ [prefix+c_s,prefix+i]`，segments 之间互不可见。
+Cache 只读：prefix 经 codec 解码读取，自身 columns 直接使用 BF16 K/V 输入，不写入任何 page。Workspace
+capacity 只由 `N` 上界决定，与 `prefix` 无关。
 
 DFlash full-context entry 使用 `[D,H,W,B]` query block、per-row `context_lengths[B]`、
 `valid_columns[B]` 和 `table_rows[B]`。每行只读取自己 allocation 的 context `[0,Lb)`，再加该行完整
@@ -1126,6 +1128,7 @@ Wrapper 必须验证：
   I32 `[Nlogical,C]`，row selectors 是 contiguous I32 `[B]`；
 - BF16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
 - causal `max_visible_keys <= Nlogical*P`；
+- segmented `prefix <= Nlogical*P`，且 `prefix + N` 不超过 visible-key 上界；
 - DFlash `max_context <= Nlogical*P`；
 - input/output Tensor domain 与当前 entry 的已注册 geometry 一致。
 

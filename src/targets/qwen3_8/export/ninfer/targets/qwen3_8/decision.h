@@ -59,22 +59,14 @@ struct DecisionOutcome {
     double branch_seconds             = 0.0;
 };
 
-// Branch scratch a decision lane holds above its state: packed short branches occupy at most one
-// pass of `pass_columns`, and a branch longer than a pass occupies its whole length.
-[[nodiscard]] inline std::uint32_t decision_scratch_extent(const DecisionPrompt& prompt,
-                                                           std::uint32_t pass_columns) noexcept {
-    std::uint64_t short_tokens = 0;
-    std::uint32_t long_branch  = 0;
+// Context a decision occupies: every branch continues the state at positions state, state + 1,
+// ..., so the lane must hold the state plus its longest branch.
+[[nodiscard]] inline std::uint64_t decision_context_tokens(const DecisionPrompt& prompt) noexcept {
+    std::uint32_t longest = 0;
     for (const DecisionBranch& branch : prompt.branches) {
-        if (branch.length <= pass_columns) {
-            short_tokens += branch.length;
-        } else {
-            long_branch = std::max(long_branch, branch.length);
-        }
+        longest = std::max(longest, branch.length);
     }
-    return std::max(static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(short_tokens, pass_columns)),
-                    long_branch);
+    return static_cast<std::uint64_t>(prompt.state_tokens()) + longest;
 }
 
 } // namespace ninfer::targets::qwen3_8

@@ -123,7 +123,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_rotate_k               = plan.kv_rotate_k,
                      .kv_rotate_v               = plan.kv_rotate_v,
                      .kv_packed_k               = plan.kv_packed_k,
-                     .kv_e8_lattice             = plan.kv_e8_lattice,
                      .kv_e8_root                = plan.kv_e8_root,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
@@ -718,7 +717,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_rotate_k         = inputs.kv_rotate_k;
     impl->kv_rotate_v         = inputs.kv_rotate_v;
     impl->kv_packed_k         = inputs.kv_packed_k;
-    impl->kv_e8_lattice       = inputs.kv_e8_lattice;
     impl->kv_e8_root          = inputs.kv_e8_root;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -808,20 +806,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_8::kKvQuantGroup,
         .kv_packed_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                        options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
                        options.kv_cache == KvCacheStorage::RK2V4E8,
         .kv_rotate_k = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                        options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
                        options.kv_cache == KvCacheStorage::RK2V4E8,
         .kv_rotate_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                        options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
                        options.kv_cache == KvCacheStorage::RK2V4E8,
-        .kv_packed_k = options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8,
-        .kv_e8_lattice = options.kv_cache == KvCacheStorage::RK4V4E8,
-        .kv_e8_root    = options.kv_cache == KvCacheStorage::RK2V4E8,
+        .kv_packed_k = options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64,
+        .kv_e8_root  = options.kv_cache == KvCacheStorage::RK2V4E8,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_8::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

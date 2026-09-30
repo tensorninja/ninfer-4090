@@ -112,8 +112,9 @@ int test_cli_contract() {
                "output settings");
 
     const qb::BenchOptions k4_parsed =
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk4v4-e8"});
-    failures += expect(k4_parsed.kv_cache == ninfer::KvCacheStorage::RK4V4E8, "rk4v4-e8 KV");
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk4v4"});
+    failures += expect(k4_parsed.kv_cache == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64,
+                       "rk4v4 KV");
 
     const qb::BenchOptions k2_parsed =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk2v4-e8"});

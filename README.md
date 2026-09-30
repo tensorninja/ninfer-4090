@@ -54,10 +54,9 @@ being waited on.
 
 The work specific to this branch, each with the measurement that established it:
 
-- **The full native 262,144-token (262K) context on 24 GB.** The E8 Conway-Sloane lattice KV mode
-  is the shipping default and leaves 1.37 GiB of slack. Retrieval stays exact through 260K
-  (single-needle, 5-needle, and exact-code-detail probes), and vision fits alongside it.
-  [Details](#the-tradeoff)
+- **The full native 262,144-token (262K) context on 24 GB.** The rotated midrise 4-bit KV mode
+  (`rk4v4`) is the shipping default and leaves 1.37 GiB of slack. A 5-needle retrieval probe at
+  248K tokens returns all five codes, and vision fits alongside it. [Details](#the-tradeoff)
 - **1.415x long-context prefill.** Every dense body GEMM now routes through INT8 tensor cores
   (`mma.m16n8k32.s32.s8.s8.s32`) during prefill: 1,701.4 → **2,409.2 tok/s** on a 115,125-token
   prompt. Decode is untouched — the INT8 activation catalog is admitted in prefill only, so
@@ -115,7 +114,7 @@ comes from `/metrics`.
 
 | Test | KV mode | Result |
 |---|---|---|
-| Prefill at 115K depth | `rk4v4-e8` | **2,409.2 tok/s** |
+| Prefill at 118K depth | `rk4v4` | **2,577.9 tok/s** |
 | Decode, code generation, MTP3 | `int8` | **148.6 tok/s** at 81.0% draft acceptance |
 | Decode, bench corpus, MTP3 | `int8` | 106.5 tok/s at 48.7% acceptance |
 | Decode, no speculation | `int8` | 50.5 tok/s |
@@ -133,11 +132,12 @@ prefill path. The decode rows are unaffected by that change: the INT8 activation
 to `TextPhase::Prefill`, so decode and speculative verify keep the BF16 catalog and are
 bit-identical to the previous build.
 
-The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the model's
-full native 262,144-token context on this card. MTP acceptance at depth is unchanged, and the costs
-against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
-[Quick start](#text-only-full-262144-token-native-context-e8-4-bit-kv-default) for the measured
-deltas.
+The shipping default has since moved from INT8 KV to the rotated midrise 4-bit KV mode (`rk4v4`),
+which serves the model's full native 262,144-token context on this card. Against the INT8 numbers
+above, its E8-lattice predecessor `rk4v4-e8` left MTP acceptance at depth unchanged and cost a 5.7%
+decode tax and 1-2% of prefill; `rk4v4` decodes at that predecessor's rate and prefills 2.3%
+faster. See [Quick start](#text-only-full-262144-token-native-context-4-bit-kv-default) for the
+measured deltas.
 
 For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
@@ -159,6 +159,10 @@ cache off, and prefix reuse disabled, reading `prefill_tok_s` from the structure
 
 `--prefill-chunk 2048` adds a further 0.6% (2,423.2 tok/s); 4096 does not improve on it. Repeat
 measurements of one configuration reproduce to within 0.12%.
+
+That ladder used the E8-lattice `rk4v4-e8` KV mode, since replaced by the midrise `rk4v4`. On the
+probe's current 118,242-token prompt, measured back to back at a 2,715 MHz SM clock, the last
+`rk4v4-e8` build prefills at 2,520.6 tok/s and the `rk4v4` build at **2,577.9 tok/s** (+2.3%).
 
 The routes are registered over every prefill token count, which keeps a token's projection output
 independent of the width of the call that produced it — the property prefix reuse depends on. The
@@ -231,7 +235,7 @@ a few points below the 2026-08-15 payloads (code 78% against 81%), which account
 difference from the headline 148.6 tok/s. The llama.cpp MTP rows required a reduced
 131,584-token context; the draft buffers push VRAM to 23.8 of 24 GiB, and the deployed 144K
 llama.cpp configuration cannot fit them at all. NInfer serves 172,032 tokens with MTP in the same
-VRAM at INT8 KV, and the full native 262,144 with the E8 4-bit KV default. Acceptance matches per
+VRAM at INT8 KV, and the full native 262,144 with the 4-bit `rk4v4` KV default. Acceptance matches per
 content type, so the decode gap is engine time, not draft quality.
 
 Full configurations, method, and raw numbers:
@@ -276,10 +280,11 @@ a client that does not parse error events sees a stream that ends without a
 `finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
 contract.
 
-### Text-only, full 262,144-token native context (E8 4-bit KV, default)
+### Text-only, full 262,144-token native context (4-bit KV, default)
 
-The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
-[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
+The rotated 4-bit KV mode (`rk4v4`: Hadamard-rotated keys and values in one midrise 4-bit codec;
+the rotated modes were ported from
+[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090), see
 [the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
 262,144-token context on 24 GB with 1.37 GiB to spare:
 
@@ -304,7 +309,7 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --prefix-checkpoint-policy rolling-tool \
   --continuation-cache l1-l2-l3 \
@@ -317,10 +322,12 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --preserve-thinking
 ```
 
-Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
-(78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
-probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
-code-detail retrieval through 260K tokens.
+Measured against INT8 KV with the E8-lattice predecessor `rk4v4-e8`: identical MTP acceptance at
+111K depth (78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
+probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and code-detail
+retrieval through 260K tokens. Against that predecessor, `rk4v4` decodes at the same rate at 114K
+depth (42.7 vs 42.6 tok/s without speculation), prefills 2.3% faster, and returns all five codes of
+a 5-needle probe at 248K tokens.
 
 ### Text-only, 172,032-token context (INT8 KV, maximum precision)
 
@@ -341,10 +348,10 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-### With vision, full 262,144-token context (E8 4-bit KV)
+### With vision, full 262,144-token context (4-bit KV)
 
 The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
-the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
+the same fork as the rotated KV modes) instead of the former hardcoded 32768. The
 smaller scratchpad frees about 1.5 GiB, so the full native context fits next to
 vision on 4-bit keys:
 
@@ -357,7 +364,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --continuation-cache l1-l2-l3 \
   --continuation-cache-dir /var/cache/ninfer \
@@ -379,16 +386,16 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 
 | Profile | KV mode | Context | KV runtime | Startup slack |
 |---|---|---:|---:|---:|
-| Text-only, MTP3 | `rk4v4-e8` | 262,144 | 5.08 GiB | 1.37 GiB |
+| Text-only, MTP3 | `rk4v4` | 262,144 | 5.08 GiB | 1.37 GiB |
 | Text-only, MTP3 | `rk2v4-e8` | 262,144 | 4.01 GiB | 2.43 GiB |
 | Text-only, MTP3 | `int8` | 172,032 | 6.31 GiB | 136 MiB |
-| With `--vision`, MTP3 | `rk4v4-e8` | 262,144 | 5.41 GiB | 780 MiB |
+| With `--vision`, MTP3 | `rk4v4` | 262,144 | 5.41 GiB | 780 MiB |
 | With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262,144 | 5.85 GiB | 329 MiB |
-| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212,992 | 6.06 GiB | 108 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk4v4` | 212,992 | 6.06 GiB | 108 MiB |
 | With `--vision` (32K scratchpad), MTP3 | `int8` | 98,304 | - | ~1 GiB |
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
-buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
+buys no additional context over `rk4v4` in the text-only profile - only slack.
 That slack is what pays for vision. With the former hardcoded 32,768-token vision
 scratchpad, vision cost about 2.1 GiB (1.83 GiB of runtime buffers plus a
 0.28 GiB tower): INT8 could only afford it at 98,304, 4-bit keys topped out at
@@ -463,13 +470,16 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   End-to-end this is bounded by the attention wall share of this hybrid-GDN model: about +1%
   serve prefill at 51K on INT8 KV, within noise on the E8 modes, whose staging time is dominated
   by lattice decode rather than the removed guards.
-- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
-  and the 262K-to-1M visible-keys envelope lift from the
+- **Rotated KV quantization (ported, then reworked).** The rotated KV modes (`rk8v4`, `rk4v4`,
+  `rk2v4-e8`) and the 262K-to-1M visible-keys envelope lift from the
   [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
-  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
-  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
-  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
-  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
+  merged under this fork's retuned `sm_89` attention prefill schedule. Every packed 4-bit plane now
+  uses one midrise codec, sixteen odd multiples of a half-step group scale, which replaced both
+  the ported symmetric 4-bit codec and the E8-lattice 4-bit key mode `rk4v4-e8`. The 2-bit E8 root
+  key codec of `rk2v4-e8` verifies bit-exactly against the upstream microbenchmark (96.155%
+  cosine); their 1 GiB CUDA-graph allowance bump was deliberately not taken (it would evict the
+  INT8 168K profile). Port method and measurements in
+  [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
 
 ### Long-context state reuse
 
@@ -745,8 +755,9 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
   ReplaySSM integration, and Qwen3.8 runtime support this fork builds on. Its
   [v0.6.1 release notes](RELEASE_NOTES_0.6.1.md) describe the inherited state.
 - [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) - a sibling
-  RTX 4090 port from the same 3090 base. The rotated and E8-lattice KV-cache quantization
-  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, the configurable vision
+  RTX 4090 port from the same 3090 base. The rotated KV-cache quantization modes (`rk8v4`,
+  `rk4v4`, `rk2v4-e8`, whose 4-bit planes now use this fork's midrise codec), the E8 root codec,
+  the configurable vision
   scratchpad, and the 1M visible-keys envelope are their work, cherry-picked here with authorship
   preserved. The full 262K default profile exists because of it; see
   [the fork comparison](docs/udp-fork-comparison.md).

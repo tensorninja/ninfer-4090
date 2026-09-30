@@ -10,6 +10,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -142,13 +143,18 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+// Merges the split partials of one (Q head, 64-dimension chunk, column). A rotated-V cache
+// accumulates values in the Hadamard domain, so RotateV applies the inverse rotation of the chunk's
+// quantization group to the FP32 merge before the single BF16 rounding of the output.
+template <typename Geometry, int DChunk, bool Int8, bool RotateV, bool MultiBatch, bool Masked,
+          bool Offset>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
+    static_assert(!RotateV || (Int8 && DChunk == kGqaKvQuantGroup));
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
@@ -232,30 +238,49 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const float head_l = reduce[0];
 
     const int d = d_start + tid;
-    if (tid >= DChunk || d >= kGqaHeadDim) { return; }
+    if constexpr (!RotateV) {
+        if (tid >= DChunk || d >= kGqaHeadDim) { return; }
+    }
 
-    float numerator = 0.0f;
-    if (head_l > 0.0f) {
-        for (int split = 0; split < active_split_count; ++split) {
-            const float tile_l =
-                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-            if (tile_l <= 0.0f) { continue; }
-            const float weight = expf(
-                partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] - head_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) *
-                weight;
+    float value = 0.0f;
+    if (tid < DChunk && d < kGqaHeadDim) {
+        float numerator = 0.0f;
+        if (head_l > 0.0f) {
+            for (int split = 0; split < active_split_count; ++split) {
+                const float tile_l =
+                    partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+                if (tile_l <= 0.0f) { continue; }
+                const float weight =
+                    expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
+                         head_m);
+                numerator += __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                                 q_head, d, token, split, tokens)]) *
+                             weight;
+            }
         }
+        bool valid = true;
+        if constexpr (Masked) {
+            int absolute_column = token;
+            if constexpr (Offset) { absolute_column += column_begin; }
+            valid = absolute_column < valid_columns[batch];
+        }
+        value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
     }
-    bool valid = true;
-    if constexpr (Masked) {
-        int absolute_column = token;
-        if constexpr (Offset) { absolute_column += column_begin; }
-        valid = absolute_column < valid_columns[batch];
+    if constexpr (RotateV) {
+        __shared__ float group[kGqaKvQuantGroup];
+        if (tid < DChunk) { group[tid] = value; }
+        __syncthreads();
+        if (tid < 32) {
+            float x0 = group[tid];
+            float x1 = group[tid + 32];
+            gqa_kv_hadamard64(x0, x1);
+            out[gqa_q_index<Geometry>(q_head, d_start + tid, output_column)] = __float2bfloat16(x0);
+            out[gqa_q_index<Geometry>(q_head, d_start + tid + 32, output_column)] =
+                __float2bfloat16(x1);
+        }
+    } else {
+        out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
     }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
 }
 
 } // namespace ninfer::ops

@@ -369,11 +369,11 @@ RECEIVED → WAITING → PREFILL(state chunks, branch units) → MODEL_FINISHED
 - Units：未复用的 state suffix 按 `prefill_chunk` 切成普通 prefill chunks；之后每个 packed branch pass
   （按 first-fit 把若干短 branch 装进至多 `prefill_chunk` 列）和每个长 branch 的每个 chunk 各是一个
   `PrefillChunk(request)` unit。Admission 的 service work 与这些 units 一一对应。
-- Branch 只看到 state 与自身。Packed pass 由 segmented mixers 一次执行：attention 对每个 segment 读取
-  state 的 KV `[0,Ls)` 和自身 causal past，GDN convolution/recurrence 让每个 segment 从 lane 的 current
-  slot 起步；它们只读该 slot，不写出任何 final state。长 branch 先把 current slot `copy_slot` 到
-  turn-checkpoint slot，再在该副本上逐 chunk prefill。Branch KV 写在 `Ls` 之后、该 lane 自己的 pages
-  中（`paged-kv-cache.md` §9.6），只在当前 unit 内被读取。
+- Branch 只看到 state 与自身。Packed pass 由 segmented mixers 一次执行：attention 对每个 segment 经 KV
+  codec 读取 state 的 KV `[0,Ls)`，自身 causal past 直接取自该 pass 的 BF16 K/V，不写任何 page；GDN
+  convolution/recurrence 让每个 segment 从 lane 的 current slot 起步；它们只读该 slot，不写出任何 final
+  state。长 branch 先把 current slot `copy_slot` 到 turn-checkpoint slot，再在该副本上逐 chunk prefill，
+  其 KV 写在 `Ls` 之后、该 lane 自己的 pages 中（`paged-kv-cache.md` §9.6），只在该 branch 内被读取。
 - 完成时 KV trim 回 `Ls`，释放 growth entitlement；`allow_prefix_reuse` 时 lane 把 `[0,Ls)` 保留为
   retained decision state（带 adapter），否则清空 lane。下一 decision 仅在 adapter 相同、其 state tokens
   以 retained frontier 为前缀时复用它，只 prefill 剩余 state suffix。Generation 不复用 decision state，

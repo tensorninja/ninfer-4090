@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <cmath>
 
-#include "ops/kernel/e8_lattice.cuh"
-
 namespace ninfer::ops {
 
 // Algebraic Conway-Sloane E8 Root Quantization (Finds closest root out of 240 minimal vectors)

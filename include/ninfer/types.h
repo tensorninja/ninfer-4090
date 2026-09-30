@@ -23,7 +23,6 @@ enum class KvCacheStorage : std::uint8_t {
     Int8Group64,
     RotatedInt8KeyInt4ValueGroup64,
     RotatedInt4KeyInt4ValueGroup64,
-    RK4V4E8,
     RK2V4E8,
 };
 

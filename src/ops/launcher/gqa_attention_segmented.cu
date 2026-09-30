@@ -1,5 +1,6 @@
-// ninfer::ops - A4 shared-prefix segmented attention launcher: A2 append at prefix + i, one
-// prefix-split attention launch, and one fixed-order merge.
+// ninfer::ops - A4 shared-prefix segmented attention launcher: one prefix-split launch over the
+// cached prefix (none for an empty prefix) and one own-column launch that attends the call's BF16
+// K/V and folds the prefix partials in fixed split order.
 #include "ops/launcher/gqa_attention.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -20,7 +21,6 @@ using Geometry = Gqa27Geometry;
 constexpr std::int32_t kRtx4090SmCount = 128;
 // Split capacity targets four waves; the workspace is sized from this budget, not the prefix.
 constexpr std::int32_t kSplitCtaBudget = 4 * kRtx4090SmCount;
-constexpr std::int32_t kMaximumSplits  = 64;
 // Per-CTA fixed cost (Q staging/quantization, pipeline fill, partial store) in key-tile units.
 constexpr std::int64_t kSplitOverheadTiles = 2;
 constexpr float kLog2E                     = 1.4426950408889634074f;
@@ -30,11 +30,13 @@ std::int32_t row_tiles(std::int32_t columns) {
 }
 
 // Smallest modeled makespan (waves x tiles per CTA) inside the capacity; ties keep fewer splits.
+// An empty prefix has no split.
 std::int32_t choose_splits(std::int32_t columns, std::int32_t prefix_tiles) {
+    if (prefix_tiles == 0) { return 0; }
     const std::int64_t ctas_per_split = static_cast<std::int64_t>(row_tiles(columns)) *
                                         Geometry::KVHeads;
-    const std::int32_t limit = std::min(gqa_attention_segmented_split_capacity(columns),
-                                        std::max<std::int32_t>(1, prefix_tiles));
+    const std::int32_t limit =
+        std::min(gqa_attention_segmented_split_capacity(columns), prefix_tiles);
     std::int32_t best      = 1;
     std::int64_t best_cost = std::numeric_limits<std::int64_t>::max();
     for (std::int32_t splits = 1; splits <= limit; ++splits) {
@@ -49,10 +51,20 @@ std::int32_t choose_splits(std::int32_t columns, std::int32_t prefix_tiles) {
     return best;
 }
 
-template <GqaSegmentedKCodec KCodec, bool PackedV, bool Rotate>
+// CTAs per row tile of the own launch: an own grid of at most a quarter (half) wave repeats its
+// own attention in four (two) CTAs that each fold a share of the rows, so the prefix partials are
+// read by up to one wave of SMs. Without prefix splits there is nothing to fold.
+std::int32_t own_shares(std::int32_t columns, std::int32_t splits) {
+    if (splits == 0) { return 1; }
+    const std::int32_t ctas = row_tiles(columns) * Geometry::KVHeads;
+    if (4 * ctas <= kRtx4090SmCount) { return 4; }
+    return 2 * ctas <= kRtx4090SmCount ? 2 : 1;
+}
+
+template <GqaSegmentedKCodec KCodec, bool PackedV, bool RotateK>
 void launch_i8_split(const Tensor& q, const PagedKVBatchLayerView& cache,
                      const GqaSegmentedParams& params, dim3 grid, cudaStream_t stream) {
-    constexpr auto kernel = gqa_attention_segmented_i8_kernel<Geometry, KCodec, PackedV, Rotate>;
+    constexpr auto kernel = gqa_attention_segmented_i8_kernel<Geometry, KCodec, PackedV, RotateK>;
     constexpr int bytes   = GqaSegmentedI8Layout<KCodec, PackedV>::Bytes;
     static const cudaError_t attribute =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
@@ -65,11 +77,49 @@ void launch_i8_split(const Tensor& q, const PagedKVBatchLayerView& cache,
         static_cast<const __half*>(cache.v_scale_pages.data), params);
 }
 
+void launch_prefix_split(const Tensor& q, const PagedKVBatchLayerView& cache,
+                         const GqaSegmentedParams& params, dim3 grid, cudaStream_t stream) {
+    if (cache.dtype == DType::I8) {
+        if (cache.e8_root) {
+            launch_i8_split<GqaSegmentedKCodec::E8Root, true, true>(q, cache, params, grid, stream);
+        } else if (cache.packed_k) {
+            launch_i8_split<GqaSegmentedKCodec::Packed4, true, true>(q, cache, params, grid,
+                                                                     stream);
+        } else if (cache.packed_v) {
+            launch_i8_split<GqaSegmentedKCodec::Int8, true, true>(q, cache, params, grid, stream);
+        } else {
+            launch_i8_split<GqaSegmentedKCodec::Int8, false, false>(q, cache, params, grid,
+                                                                    stream);
+        }
+        return;
+    }
+    constexpr auto kernel              = gqa_attention_segmented_bf16_kernel<Geometry>;
+    static const cudaError_t attribute = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaSegmentedBf16SmemBytes);
+    CUDA_CHECK(attribute);
+    kernel<<<grid, kGqaSegmentedBf16Threads, kGqaSegmentedBf16SmemBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(cache.k_pages.data),
+        static_cast<const __nv_bfloat16*>(cache.v_pages.data), params);
+}
+
+template <bool RotateV>
+void launch_own(const Tensor& q, const Tensor& k, const Tensor& v, const GqaSegmentedParams& params,
+                dim3 grid, Tensor& out, cudaStream_t stream) {
+    constexpr auto kernel              = gqa_attention_segmented_own_kernel<Geometry, RotateV>;
+    static const cudaError_t attribute = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaSegmentedBf16SmemBytes);
+    CUDA_CHECK(attribute);
+    kernel<<<grid, kGqaSegmentedBf16Threads, kGqaSegmentedBf16SmemBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), params, static_cast<__nv_bfloat16*>(out.data));
+}
+
 } // namespace
 
 std::int32_t gqa_attention_segmented_split_capacity(std::int32_t columns) {
     const std::int32_t ctas_per_split = row_tiles(columns) * Geometry::KVHeads;
-    return std::clamp(div_up(kSplitCtaBudget, ctas_per_split), 1, kMaximumSplits);
+    return std::clamp(div_up(kSplitCtaBudget, ctas_per_split), 1, kGqaSegmentedMaxSplits);
 }
 
 void gqa_attention_segmented_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -77,9 +127,7 @@ void gqa_attention_segmented_launch(const Tensor& q, const Tensor& k, const Tens
                                     std::int32_t prefix, float scale, PagedKVBatchLayerView cache,
                                     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                     Tensor& out, cudaStream_t stream) {
-    const std::int32_t columns = q.ne[2];
-    gqa_kv_append_at_launch(k, v, prefix, table_rows, cache, stream);
-
+    const std::int32_t columns      = q.ne[2];
     const std::int32_t prefix_tiles = div_up<std::int32_t>(prefix, kGqaSegmentedKeys);
     const std::int32_t splits       = choose_splits(columns, prefix_tiles);
     const GqaSegmentedParams params{
@@ -97,44 +145,20 @@ void gqa_attention_segmented_launch(const Tensor& q, const Tensor& k, const Tens
         .partial_m     = static_cast<float*>(partial_m.data),
         .partial_l     = static_cast<float*>(partial_l.data),
     };
-    const dim3 grid(static_cast<unsigned>(row_tiles(columns)), static_cast<unsigned>(splits),
-                    static_cast<unsigned>(Geometry::KVHeads));
+    const auto tiles    = static_cast<unsigned>(row_tiles(columns));
+    const auto kv_heads = static_cast<unsigned>(Geometry::KVHeads);
 
-    if (cache.dtype == DType::I8) {
-        if (cache.e8_root) {
-            launch_i8_split<GqaSegmentedKCodec::E8Root, true, true>(q, cache, params, grid, stream);
-        } else if (cache.packed_k) {
-            launch_i8_split<GqaSegmentedKCodec::Packed4, true, true>(q, cache, params, grid,
-                                                                     stream);
-        } else if (cache.packed_v) {
-            launch_i8_split<GqaSegmentedKCodec::Int8, true, true>(q, cache, params, grid, stream);
-        } else {
-            launch_i8_split<GqaSegmentedKCodec::Int8, false, false>(q, cache, params, grid,
-                                                                    stream);
-        }
-    } else {
-        constexpr auto kernel = gqa_attention_segmented_bf16_kernel<Geometry>;
-        static const cudaError_t attribute = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaSegmentedBf16SmemBytes);
-        CUDA_CHECK(attribute);
-        kernel<<<grid, kGqaSegmentedBf16Threads, kGqaSegmentedBf16SmemBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const __nv_bfloat16*>(cache.k_pages.data),
-            static_cast<const __nv_bfloat16*>(cache.v_pages.data), params);
+    if (splits > 0) {
+        launch_prefix_split(q, cache, params, dim3(tiles, static_cast<unsigned>(splits), kv_heads),
+                            stream);
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
-
-    const dim3 merge_grid(static_cast<unsigned>(columns), static_cast<unsigned>(Geometry::QHeads));
-    const auto merge = [&](auto kernel) {
-        kernel<<<merge_grid, 128, 0, stream>>>(
-            static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
-            static_cast<const float*>(partial_l.data), columns, splits,
-            static_cast<__nv_bfloat16*>(out.data));
-    };
-    if (cache.rotate_v) {
-        merge(gqa_attention_segmented_merge_kernel<Geometry::QHeads, true>);
+    const dim3 own_grid(tiles, static_cast<unsigned>(own_shares(columns, splits)), kv_heads);
+    // Only prefix partials of a rotated-V cache live in the rotated V domain.
+    if (cache.rotate_v && splits > 0) {
+        launch_own<true>(q, k, v, params, own_grid, out, stream);
     } else {
-        merge(gqa_attention_segmented_merge_kernel<Geometry::QHeads, false>);
+        launch_own<false>(q, k, v, params, own_grid, out, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

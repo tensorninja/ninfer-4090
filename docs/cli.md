@@ -165,7 +165,7 @@ measured recommendation rather than a semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |
+| `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk2v4-e8` | KV-cache storage; the Hadamard-rotated modes trade key/value precision for capacity | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -270,18 +270,18 @@ system energy: the CPU, the rest of the platform, and power-supply losses are ex
 The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 4090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for the maximum-precision profile. The compressed modes store
-Hadamard-rotated keys and 4-bit values:
+Use `--kv-dtype int8` for the maximum-precision quantized profile. The compressed modes rotate
+every 64-element key and value group with an orthonormal Hadamard transform and store 4-bit
+values:
 
 - `rk8v4` keeps 8-bit keys.
-- `rk4v4` packs keys to 4 bits.
-- `rk4v4-e8` selects 4-bit key codes on the E8 Conway-Sloane lattice. This is the
-  recommended long-context mode on the RTX 4090 and fits the full native 262,144
-  context. The measured quality gates are in [the fork comparison](udp-fork-comparison.md).
+- `rk4v4` packs keys to 4 bits as well. This is the recommended long-context mode on the RTX 4090
+  and fits the full native 262,144 context.
 - `rk2v4-e8` packs keys to 2 bits with a 240-root E8 codebook, for maximum capacity.
 
-None of these modes is byte-equivalent to INT8. At depth, `rk4v4-e8` measured no loss in
-MTP acceptance or retrieval. The prepared prompt must fit
+Every 4-bit plane uses one midrise codec: its sixteen levels are the odd multiples of the group's
+FP16 scale `h = max|x| / 15`, symmetric about zero with no zero level, so both extremes of a group
+decode to its absolute maximum. None of these modes is byte-equivalent to INT8. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

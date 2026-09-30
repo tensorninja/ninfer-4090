@@ -627,7 +627,7 @@ correctness requirement, not an optimization. Three mechanisms enforce it:
   the same reason the snapshot does. Scoping is unconditional, including the base weights, so no
   unscoped key exists and two adapters cannot collide. `import_continuation_lane` takes the
   requesting adapter and stamps it onto the restored sequence.
-- Snapshot version 4 carries `SnapshotSession::adapter` as a **32-byte SHA-256 content
+- The snapshot (version 4 onward) carries `SnapshotSession::adapter` as a **32-byte SHA-256 content
   fingerprint** of the adapter's artifact, all-zero meaning base weights. It is written from the
   pool entry that produced the lane and resolved back to a pool index on restore, which then calls
   `ensure_adapter_resident` before the image is accepted.

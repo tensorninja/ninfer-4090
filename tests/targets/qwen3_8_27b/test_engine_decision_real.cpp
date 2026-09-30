@@ -406,7 +406,7 @@ int exercise(const char* artifact, const char* decision_path) {
     options.artifact_path            = artifact;
     options.max_context              = kMaxContext;
     options.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
-    options.kv_cache                 = ninfer::KvCacheStorage::RK4V4E8;
+    options.kv_cache                 = ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
     options.prefill_chunk            = kPrefillChunk;
     options.max_concurrency          = kConcurrency;
     options.lora.directory           = pool.path();

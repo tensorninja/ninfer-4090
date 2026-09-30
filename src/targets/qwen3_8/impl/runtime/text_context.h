@@ -242,10 +242,10 @@ public:
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
     // One System One branch pass: `ids` holds `segments` back to back, and each segment continues
     // the resident prefix [0, prefix) on its own at RoPE positions prefix, prefix + 1, ... Its
-    // attention sees the prefix and its own causal past; its GDN convolution and recurrence start
-    // from the current state slot, which the segmented mixers only read. Column i's K/V land in
-    // the lane's pages at prefix + i. The final-norm hidden of every column lands in
-    // prefill_hidden; no lm_head runs and nothing is sampled.
+    // attention sees the cached prefix and its own causal past, whose K/V it reads from the pass
+    // at BF16; its GDN convolution and recurrence start from the current state slot, which the
+    // segmented mixers only read. The pass writes no KV page. The final-norm hidden of every
+    // column lands in prefill_hidden; no lm_head runs and nothing is sampled.
     void decision_pass(std::span<const int> ids, std::span<const DecisionSegment> segments,
                        std::uint32_t prefix);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,

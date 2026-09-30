@@ -934,7 +934,7 @@ def main() -> None:
                            "development.jsonl")
     gate.add_argument("--records", type=int, default=KEV_RECORDS)
     gate.add_argument("--work-dir", type=Path, required=True)
-    gate.add_argument("--kv-dtype", default="rk4v4-e8", help="engine KV storage")
+    gate.add_argument("--kv-dtype", default="rk4v4", help="engine KV storage")
     gate.add_argument("--prefill-chunk", type=int, default=1024, help="engine pass width")
     gate.add_argument("--max-context", type=int, default=8192)
     gate.add_argument("--reference-kv-dtype", choices=("bf16", "int8"), default="bf16")

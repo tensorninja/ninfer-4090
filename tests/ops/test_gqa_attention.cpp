@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <span>
 #include <string>
 #include <thread>
@@ -1349,10 +1350,11 @@ int verify_workspace_capacity_contract() {
     return failures;
 }
 
-// A4 shared-prefix segmented attention; only the 27B group-6 geometry is registered. Every case
-// populates [0, prefix) through A2 from representative BF16 K/V and leaves every other cache row
-// NaN, so reading any key the Op must not see poisons the output. The attention is checked
-// against the independent FP64 oracle below with the named criterion of the cache dtype.
+// Every cache codec, including the rotated ones, through fixtures that address the paged planes
+// of one codec with a two-row block-table matrix: row 0 is a decoy over the even physical pages
+// and row 1, the row under test, maps logical page p to physical page 2p + 1. Every row an Op
+// must neither read nor write holds all-ones bytes, NaN as BF16 values and as FP16 scales, so
+// reading one poisons the output and writing one fails the byte comparison.
 
 struct KvCodec {
     const char* name;
@@ -1360,7 +1362,6 @@ struct KvCodec {
     bool packed_k;
     bool packed_v;
     bool rotated;
-    bool e8_lattice;
     bool e8_root;
 
     [[nodiscard]] bool quantized() const { return dtype == DType::I8; }
@@ -1376,17 +1377,14 @@ struct KvCodec {
     }
 };
 
-constexpr KvCodec kBf16Kv{"bf16", DType::BF16, false, false, false, false, false};
-constexpr KvCodec kInt8Kv{"int8-g64", DType::I8, false, false, false, false, false};
-constexpr KvCodec kRk8v4Kv{"rk8v4", DType::I8, false, true, true, false, false};
-constexpr KvCodec kRk4v4Kv{"rk4v4", DType::I8, true, true, true, false, false};
-constexpr KvCodec kRk4v4E8Kv{"rk4v4-e8", DType::I8, true, true, true, true, false};
-constexpr KvCodec kRk2v4E8Kv{"rk2v4-e8", DType::I8, false, true, true, false, true};
+constexpr KvCodec kBf16Kv{"bf16", DType::BF16, false, false, false, false};
+constexpr KvCodec kInt8Kv{"int8-g64", DType::I8, false, false, false, false};
+constexpr KvCodec kRk8v4Kv{"rk8v4", DType::I8, false, true, true, false};
+constexpr KvCodec kRk4v4Kv{"rk4v4", DType::I8, true, true, true, false};
+constexpr KvCodec kRk2v4E8Kv{"rk2v4-e8", DType::I8, false, true, true, true};
 
-constexpr Geometry kSegmentedGeometry   = kGeometries[0];
-constexpr std::int32_t kSegmentedGroup  = 6;
 constexpr std::int32_t kScaleRowBytes   = kQuantGroups * 2;
-constexpr std::int32_t kSegmentedRow    = 1;
+constexpr std::int32_t kTestedRow       = 1;
 constexpr std::int32_t kPrefixFillChunk = 8192;
 
 struct CacheBytes {
@@ -1396,13 +1394,12 @@ struct CacheBytes {
     std::vector<std::uint8_t> v_scale;
 };
 
-// Paged planes of one codec with a two-row table matrix: row 0 is a decoy over the even physical
-// pages and row 1, the row under test, maps logical page p to physical page 2p + 1.
-class SegmentedCache {
+class CodecCache {
 public:
-    SegmentedCache(const KvCodec& codec, std::int32_t logical_pages)
-        : codec_(codec), logical_pages_(logical_pages), physical_pages_(2 * logical_pages + 1),
-          k_(plane_bytes(codec.k_row_bytes())), v_(plane_bytes(codec.v_row_bytes())),
+    CodecCache(const Geometry& geometry, const KvCodec& codec, std::int32_t logical_pages)
+        : geometry_(geometry), codec_(codec), logical_pages_(logical_pages),
+          physical_pages_(2 * logical_pages + 1), k_(plane_bytes(codec.k_row_bytes())),
+          v_(plane_bytes(codec.v_row_bytes())),
           k_scale_(codec.quantized() ? plane_bytes(kScaleRowBytes) : 1),
           v_scale_(codec.quantized() ? plane_bytes(kScaleRowBytes) : 1),
           tables_(static_cast<std::size_t>(2 * logical_pages) * sizeof(std::int32_t)) {
@@ -1412,24 +1409,25 @@ public:
             tables_host_[static_cast<std::size_t>(logical_pages + page)] = 2 * page + 1;
         }
         tables_.copy_from_host(tables_host_.data(), tables_host_.size() * sizeof(std::int32_t));
-        // All-ones bytes are NaN BF16 values and NaN FP16 scales.
         k_.fill(0xff);
         v_.fill(0xff);
         k_scale_.fill(0xff);
         v_scale_.fill(0xff);
     }
 
+    [[nodiscard]] const Geometry& geometry() const { return geometry_; }
     [[nodiscard]] const KvCodec& codec() const { return codec_; }
 
+    // Byte offset of one row (position, head) of table row 1 in a plane of `row_bytes` rows.
     [[nodiscard]] std::size_t row_offset(std::int32_t row_bytes, std::int32_t position,
                                          std::int32_t head) const {
         const std::int32_t page = tables_host_[static_cast<std::size_t>(
-            logical_pages_ * kSegmentedRow + position / kPagedKVPageSize)];
+            logical_pages_ * kTestedRow + position / kPagedKVPageSize)];
         return static_cast<std::size_t>(row_bytes) *
                (static_cast<std::size_t>(position % kPagedKVPageSize) +
                 static_cast<std::size_t>(kPagedKVPageSize) *
                     (static_cast<std::size_t>(head) +
-                     static_cast<std::size_t>(kSegmentedGeometry.kv_heads) * page));
+                     static_cast<std::size_t>(geometry_.kv_heads) * page));
     }
 
     PagedKVBatchLayerView batch_view() {
@@ -1443,7 +1441,7 @@ public:
         PagedKVLayerView view;
         bind_planes(view);
         view.block_table = Tensor(static_cast<std::int32_t*>(tables_.data()) +
-                                      static_cast<std::ptrdiff_t>(logical_pages_) * kSegmentedRow,
+                                      static_cast<std::ptrdiff_t>(logical_pages_) * kTestedRow,
                                   DType::I32, {logical_pages_});
         return view;
     }
@@ -1474,13 +1472,13 @@ public:
 private:
     std::size_t plane_bytes(std::int32_t row_bytes) const {
         return static_cast<std::size_t>(row_bytes) * kPagedKVPageSize *
-               static_cast<std::size_t>(kSegmentedGeometry.kv_heads) *
+               static_cast<std::size_t>(geometry_.kv_heads) *
                static_cast<std::size_t>(physical_pages_);
     }
 
     template <typename View>
     void bind_planes(View& view) {
-        const DType k_dtype = !codec_.quantized() ? DType::BF16
+        const DType k_dtype = !codec_.quantized()                   ? DType::BF16
                               : (codec_.packed_k || codec_.e8_root) ? DType::U8
                                                                      : DType::I8;
         const DType v_dtype = !codec_.quantized() ? DType::BF16
@@ -1488,7 +1486,7 @@ private:
                                                   : DType::I8;
         const std::int32_t k_elements = codec_.quantized() ? codec_.k_row_bytes() : kHeadDim;
         const std::int32_t v_elements = codec_.quantized() ? codec_.v_row_bytes() : kHeadDim;
-        const std::int32_t heads      = kSegmentedGeometry.kv_heads;
+        const std::int32_t heads      = geometry_.kv_heads;
         view.k_pages = Tensor(k_.data(), k_dtype, {k_elements, kPagedKVPageSize, heads, physical_pages_});
         view.v_pages = Tensor(v_.data(), v_dtype, {v_elements, kPagedKVPageSize, heads, physical_pages_});
         if (codec_.quantized()) {
@@ -1505,10 +1503,10 @@ private:
         view.rotate_k     = codec_.rotated;
         view.rotate_v     = codec_.rotated;
         view.packed_k     = codec_.packed_k;
-        view.e8_lattice   = codec_.e8_lattice;
         view.e8_root      = codec_.e8_root;
     }
 
+    Geometry geometry_;
     KvCodec codec_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
@@ -1574,8 +1572,9 @@ void decode_e8_root(std::uint8_t root, std::uint8_t radius_axis, float* out) {
 }
 
 // Stored-domain value of one cache row: BF16 values, or each decoded code times its FP16 group
-// scale. Rotated codecs store the Hadamard rotation of the logical row.
-void decode_cache_row(const SegmentedCache& cache, const CacheBytes& bytes, bool key,
+// scale. A packed nibble c is the midrise level 2c + 1. Rotated codecs store the Hadamard
+// rotation of the logical row.
+void decode_cache_row(const CodecCache& cache, const CacheBytes& bytes, bool key,
                       std::int32_t position, std::int32_t head, float* out) {
     const KvCodec& codec        = cache.codec();
     const std::int32_t row_size = key ? codec.k_row_bytes() : codec.v_row_bytes();
@@ -1607,7 +1606,8 @@ void decode_cache_row(const SegmentedCache& cache, const CacheBytes& bytes, bool
     } else if (key ? codec.packed_k : codec.packed_v) {
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
             const std::int32_t nibble = (row[d / 2] >> (4 * (d % 2))) & 15;
-            out[d] = static_cast<float>(nibble >= 8 ? nibble - 16 : nibble) * scales[d / kQuantGroup];
+            const std::int32_t code   = nibble >= 8 ? nibble - 16 : nibble;
+            out[d] = static_cast<float>(2 * code + 1) * scales[d / kQuantGroup];
         }
     } else {
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
@@ -1635,6 +1635,293 @@ void hadamard64_groups(double* values) {
     }
 }
 
+// Logical value of one cache row: the stored-domain value, rotated back for a rotated codec.
+void logical_cache_row(const CodecCache& cache, const CacheBytes& bytes, bool key,
+                       std::int32_t position, std::int32_t head, double* out) {
+    float stored[kHeadDim];
+    decode_cache_row(cache, bytes, key, position, head, stored);
+    for (std::int32_t d = 0; d < kHeadDim; ++d) { out[d] = static_cast<double>(stored[d]); }
+    if (cache.codec().rotated) { hadamard64_groups(out); }
+}
+
+// The exact encoding of one K or V row (256 BF16 values of one token and KV head) under the
+// shared numerical contract. The conformance inputs lie on a dyadic grid on which every partial
+// sum of the FP32 H64 butterfly is exact, so the rotated values are those of the exact transform.
+// E8-root key codes have no host encoder: only their scales are written here, and the codes are
+// held to the A2 encoding instead.
+void encode_cache_row(const KvCodec& codec, bool key, const float* x, std::uint8_t* row,
+                      std::uint8_t* scale_row) {
+    if (!codec.quantized()) {
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            const std::uint16_t bits = f32_to_bf16(x[d]);
+            std::memcpy(row + 2 * d, &bits, sizeof(bits));
+        }
+        return;
+    }
+    double rotated[kHeadDim];
+    for (std::int32_t d = 0; d < kHeadDim; ++d) { rotated[d] = static_cast<double>(x[d]); }
+    if (codec.rotated) { hadamard64_groups(rotated); }
+    const bool packed   = key ? codec.packed_k : codec.packed_v;
+    const bool e8_root  = key && codec.e8_root;
+    const float divisor = packed ? 15.0f : (e8_root ? 7.0f : 127.0f);
+    for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+        float y[kQuantGroup];
+        float absmax = 0.0f;
+        for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+            y[i]   = static_cast<float>(rotated[group * kQuantGroup + i]);
+            absmax = std::max(absmax, std::abs(y[i]));
+        }
+        const std::uint16_t scale_bits = f32_to_f16_bits(absmax / divisor);
+        std::memcpy(scale_row + 2 * group, &scale_bits, sizeof(scale_bits));
+        if (e8_root) continue;
+        const float scale   = f16_bits_to_f32(scale_bits);
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+            const std::int32_t d = group * kQuantGroup + i;
+            if (packed) {
+                const float scaled      = y[i] * inverse;
+                const std::int32_t code = std::clamp(
+                    static_cast<std::int32_t>(std::floor(0.5f * scaled)), -8, 7);
+                const auto nibble = static_cast<std::uint8_t>(code & 15);
+                row[d / 2] = d % 2 == 0 ? static_cast<std::uint8_t>((row[d / 2] & 0xf0) | nibble)
+                                        : static_cast<std::uint8_t>((row[d / 2] & 0x0f) | (nibble << 4));
+            } else {
+                const std::int32_t code =
+                    scale == 0.0f ? 0 : std::clamp(round_even_to_i32(y[i] * inverse), -127, 127);
+                row[d] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
+            }
+        }
+    }
+}
+
+// Writes the exact encoding of tokens [0, count) of k/v at positions first + t into `bytes`.
+void encode_rows(const CodecCache& cache, const std::vector<float>& k, const std::vector<float>& v,
+                 std::int32_t first, std::int32_t count, CacheBytes& bytes) {
+    const Geometry& geometry = cache.geometry();
+    const KvCodec& codec     = cache.codec();
+    for (std::int32_t token = 0; token < count; ++token) {
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            const std::size_t source = kv_input_index(geometry, head, 0, token);
+            const std::int32_t position = first + token;
+            std::uint8_t* scale_k =
+                codec.quantized() ? bytes.k_scale.data() + cache.row_offset(kScaleRowBytes, position, head)
+                                  : nullptr;
+            std::uint8_t* scale_v =
+                codec.quantized() ? bytes.v_scale.data() + cache.row_offset(kScaleRowBytes, position, head)
+                                  : nullptr;
+            encode_cache_row(codec, true, &k[source],
+                             bytes.k.data() + cache.row_offset(codec.k_row_bytes(), position, head),
+                             scale_k);
+            encode_cache_row(codec, false, &v[source],
+                             bytes.v.data() + cache.row_offset(codec.v_row_bytes(), position, head),
+                             scale_v);
+        }
+    }
+}
+
+int verify_cache_bytes(const std::string& label, const CacheBytes& got, const CacheBytes& expected) {
+    int failures = verify_exact((label + " cache-k").c_str(), got.k, expected.k);
+    failures += verify_exact((label + " cache-v").c_str(), got.v, expected.v);
+    failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
+    failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
+    return failures;
+}
+
+// Values n / denominator with integer n in [-8, 8]: BF16 values on the dyadic grid of
+// encode_cache_row.
+std::vector<float> make_grid_values(std::size_t count, std::uint32_t seed, float denominator) {
+    std::mt19937 generator(seed);
+    std::uniform_int_distribution<std::int32_t> distribution(-8, 8);
+    std::vector<float> values(count);
+    for (float& value : values) { value = static_cast<float>(distribution(generator)) / denominator; }
+    return values;
+}
+
+// FP64 oracle of the A1/A3 formula over the logical values of table row 1: token t sits at
+// position base + t and sees [0, base + t].
+std::vector<double> causal_attention_oracle(const CodecCache& cache, const CacheBytes& bytes,
+                                            const std::vector<float>& q, std::int32_t base,
+                                            std::int32_t tokens) {
+    const Geometry& geometry = cache.geometry();
+    const std::int32_t keys  = base + tokens;
+    std::vector<double> output(static_cast<std::size_t>(kHeadDim) * geometry.q_heads * tokens);
+    std::vector<double> k_rows(static_cast<std::size_t>(keys) * kHeadDim);
+    std::vector<double> v_rows(static_cast<std::size_t>(keys) * kHeadDim);
+    std::vector<double> scores(static_cast<std::size_t>(keys));
+    for (std::int32_t kv_head = 0; kv_head < geometry.kv_heads; ++kv_head) {
+        for (std::int32_t key = 0; key < keys; ++key) {
+            const std::size_t row = static_cast<std::size_t>(key) * kHeadDim;
+            logical_cache_row(cache, bytes, true, key, kv_head, &k_rows[row]);
+            logical_cache_row(cache, bytes, false, key, kv_head, &v_rows[row]);
+        }
+        for (std::int32_t local = 0; local < geometry.query_group(); ++local) {
+            const std::int32_t q_head = kv_head * geometry.query_group() + local;
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                const std::int32_t visible = base + token + 1;
+                double maximum             = -std::numeric_limits<double>::infinity();
+                for (std::int32_t key = 0; key < visible; ++key) {
+                    double dot = 0.0;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
+                               k_rows[static_cast<std::size_t>(key) * kHeadDim + d];
+                    }
+                    scores[static_cast<std::size_t>(key)] = dot * static_cast<double>(kAttentionScale);
+                    maximum = std::max(maximum, scores[static_cast<std::size_t>(key)]);
+                }
+                double sum = 0.0;
+                for (std::int32_t key = 0; key < visible; ++key) {
+                    scores[static_cast<std::size_t>(key)] =
+                        std::exp(scores[static_cast<std::size_t>(key)] - maximum);
+                    sum += scores[static_cast<std::size_t>(key)];
+                }
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    double value = 0.0;
+                    for (std::int32_t key = 0; key < visible; ++key) {
+                        value += scores[static_cast<std::size_t>(key)] *
+                                 v_rows[static_cast<std::size_t>(key) * kHeadDim + d];
+                    }
+                    output[q_index(geometry, q_head, d, token)] = value / sum;
+                }
+            }
+        }
+    }
+    return output;
+}
+
+// A2 appends k/v columns [first, first + count) at the same positions of table row 1.
+void append_rows(CodecCache& cache, const DeviceBuffer& k, const DeviceBuffer& v,
+                 std::int32_t first, std::int32_t count) {
+    const Geometry& geometry = cache.geometry();
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(count));
+    for (std::int32_t token = 0; token < count; ++token) {
+        positions[static_cast<std::size_t>(token)] = first + token;
+    }
+    const DeviceBuffer dp   = to_device(positions);
+    const auto offset       = static_cast<std::ptrdiff_t>(kHeadDim) * geometry.kv_heads * first;
+    auto* const k_base      = static_cast<std::uint16_t*>(k.p) + offset;
+    auto* const v_base      = static_cast<std::uint16_t*>(v.p) + offset;
+    const Tensor tk(k_base, DType::BF16, {kHeadDim, geometry.kv_heads, count});
+    const Tensor tv(v_base, DType::BF16, {kHeadDim, geometry.kv_heads, count});
+    ops::gqa_kv_append(tk, tv, Tensor(dp.p, DType::I32, {count}), cache.row_view(), nullptr);
+    cuda_synchronize();
+}
+
+// A rotated codec through A2, A1, and A3. History [0, base) is appended by A2 in two calls, one
+// per fill schedule; A1 appends `tokens` more and attends. Every written code and scale must be
+// the exact encoding (E8-root key codes: A1's must equal A2's), and A1 and A3 must meet the
+// INT8-cache criterion against the FP64 oracle over the logical cache values.
+int run_codec_case(const Geometry& geometry, const KvCodec& codec, std::int32_t base,
+                   std::int32_t tokens, std::uint32_t seed) {
+    const std::int32_t total = base + tokens;
+    CodecCache cache(geometry, codec, total / kPagedKVPageSize + 2);
+    const std::string label = std::string("gqa codec ") + geometry.name + " " + codec.name +
+                              " base=" + std::to_string(base) + " T=" + std::to_string(tokens);
+
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * total;
+    std::vector<float> k = make_grid_values(kv_elements, seed, 32.0f);
+    std::vector<float> v = make_grid_values(kv_elements, seed + 1u, 8.0f);
+    // Codec edges: an all-zero group (zero scale) and a one-hot group, which rotates to 64 values
+    // of one magnitude and so to the two extreme levels.
+    for (std::int32_t d = 0; d < kQuantGroup; ++d) {
+        k[kv_input_index(geometry, 0, d, 0)]               = 0.0f;
+        v[kv_input_index(geometry, 0, kQuantGroup + d, 1)] = d == 5 ? 1.0f : 0.0f;
+    }
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) * geometry.q_heads * tokens;
+    const std::vector<float> q   = make_bf16_values(q_elements, seed + 2u, -0.25f, 0.25f);
+    const DeviceBuffer dk        = to_device(to_bf16_bits(k));
+    const DeviceBuffer dv        = to_device(to_bf16_bits(v));
+    const DeviceBuffer dq        = to_device(to_bf16_bits(q));
+
+    const CacheBytes poisoned = cache.snapshot();
+    const std::int32_t paged  = std::min(base, 40);
+    append_rows(cache, dk, dv, 0, paged);
+    if (base > paged) { append_rows(cache, dk, dv, paged, base - paged); }
+
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = base + token;
+    }
+    const DeviceBuffer dp = to_device(positions);
+    const std::int32_t table_row = kTestedRow;
+    const DeviceBuffer dtable_row = to_device(std::vector<std::int32_t>{table_row});
+    const auto kv_offset = static_cast<std::ptrdiff_t>(kHeadDim) * geometry.kv_heads * base;
+    const Tensor tq(dq.p, DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    const Tensor tk(static_cast<std::uint16_t*>(dk.p) + kv_offset, DType::BF16,
+                    {kHeadDim, geometry.kv_heads, tokens});
+    const Tensor tv(static_cast<std::uint16_t*>(dv.p) + kv_offset, DType::BF16,
+                    {kHeadDim, geometry.kv_heads, tokens});
+    const Tensor tp(dp.p, DType::I32, {tokens});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                             static_cast<std::uint32_t>(total)};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        geometry.q_heads, codec.dtype, envelope, 1, tokens, tokens);
+    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+    GuardedDeviceBuffer dout(q_elements * sizeof(std::uint16_t));
+    const auto attend = [&](bool append) {
+        const std::vector<std::uint16_t> canary(q_elements, kOutputCanary);
+        dout.copy_from_host(canary.data(), canary.size() * sizeof(std::uint16_t));
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+        if (append) {
+            ops::gqa_attention(tq, tk, tv, tp, Tensor{}, Tensor(dtable_row.p, DType::I32, {1}),
+                               kAttentionScale, cache.batch_view(), envelope, workspace, tout,
+                               nullptr);
+        } else {
+            ops::gqa_attention_cached(tq, tp, kAttentionScale, cache.row_view(), envelope,
+                                      workspace, tout, nullptr);
+        }
+        cuda_synchronize();
+        return bf16_bits_to_double(copy_from_guarded<std::uint16_t>(dout, q_elements));
+    };
+
+    const std::vector<double> a1  = attend(true);
+    const CacheBytes after        = cache.snapshot();
+    CacheBytes expected           = poisoned;
+    encode_rows(cache, k, v, 0, total, expected);
+    if (codec.e8_root) {
+        for (std::int32_t position = 0; position < total; ++position) {
+            for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+                const std::size_t offset = cache.row_offset(codec.k_row_bytes(), position, head);
+                std::memcpy(expected.k.data() + offset, after.k.data() + offset,
+                            static_cast<std::size_t>(codec.k_row_bytes()));
+            }
+        }
+    }
+    int failures = verify_cache_bytes(label + " encoding", after, expected);
+
+    const std::vector<double> reference = causal_attention_oracle(cache, after, q, base, tokens);
+    failures += verify_attention(label + " A1", a1, reference, attention_criterion(codec.dtype));
+    failures += verify_attention(label + " A3", attend(false), reference,
+                                 attention_criterion(codec.dtype));
+    failures += verify_cache_bytes(label + " A3 cache unchanged", cache.snapshot(), after);
+
+    // A1 and A2 produce identical code and scale bits.
+    append_rows(cache, dk, dv, base, tokens);
+    failures += verify_cache_bytes(label + " A2 rewrite of A1 rows", cache.snapshot(), after);
+    failures += dout.verify_guards(label + " output");
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
+int run_codec_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const KvCodec* codec : {&kRk8v4Kv, &kRk4v4Kv, &kRk2v4E8Kv}) {
+            // T=6 takes the small-T decode route with its fused append; T=66 the prompt route.
+            failures += run_codec_case(geometry, *codec, 61, 6, 700u + geometry.q_heads);
+            failures += run_codec_case(geometry, *codec, 61, 66, 710u + geometry.q_heads);
+        }
+    }
+    return failures;
+}
+
+// A4 shared-prefix segmented attention; only the 27B group-6 geometry is registered. Every case
+// populates [0, prefix) through A2 from representative BF16 K/V and leaves every other cache row
+// NaN. The attention is checked against the independent FP64 oracle below with the named
+// criterion of the cache dtype.
+
+constexpr Geometry kSegmentedGeometry = kGeometries[0];
+
 double dot_fp64(const double* query, const float* key) {
     double s0 = 0.0;
     double s1 = 0.0;
@@ -1649,22 +1936,25 @@ double dot_fp64(const double* query, const float* key) {
     return (s0 + s1) + (s2 + s3);
 }
 
-// FP64 oracle of the A4 formula over the cache state after the append. A rotated row's logical
-// value is H * (stored value); because H is orthonormal and symmetric, the oracle rotates q and the
-// reduced value instead of every row, which evaluates the same formula.
-std::vector<double> segmented_attention_oracle(const SegmentedCache& cache, const CacheBytes& state,
-                                               const std::vector<float>& q, std::int32_t prefix,
+// FP64 oracle of the A4 formula: prefix keys and values are the logical cache values, a segment's
+// own keys and values its BF16 k/v columns. A rotated row's logical value is H times its stored
+// value; because H is orthonormal and symmetric, the oracle scores stored prefix keys against
+// H q and rotates the prefix value sum once, which evaluates the same formula.
+std::vector<double> segmented_attention_oracle(const CodecCache& cache, const CacheBytes& state,
+                                               const std::vector<float>& q,
+                                               const std::vector<float>& k,
+                                               const std::vector<float>& v, std::int32_t prefix,
                                                const std::vector<std::int32_t>& starts) {
-    const Geometry& geometry   = kSegmentedGeometry;
+    const Geometry& geometry   = cache.geometry();
+    const std::int32_t group   = geometry.query_group();
     const bool rotated         = cache.codec().rotated;
     const std::int32_t columns = static_cast<std::int32_t>(starts.size());
-    const std::int32_t keys    = prefix + columns;
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) * geometry.q_heads * columns);
-    std::vector<float> k_rows(static_cast<std::size_t>(keys) * kHeadDim);
-    std::vector<float> v_rows(static_cast<std::size_t>(keys) * kHeadDim);
+    std::vector<float> k_rows(static_cast<std::size_t>(prefix) * kHeadDim);
+    std::vector<float> v_rows(static_cast<std::size_t>(prefix) * kHeadDim);
     for (std::int32_t kv_head = 0; kv_head < geometry.kv_heads; ++kv_head) {
         run_threads([&](unsigned thread, unsigned threads) {
-            for (std::int32_t key = static_cast<std::int32_t>(thread); key < keys;
+            for (std::int32_t key = static_cast<std::int32_t>(thread); key < prefix;
                  key += static_cast<std::int32_t>(threads)) {
                 const std::size_t row = static_cast<std::size_t>(key) * kHeadDim;
                 decode_cache_row(cache, state, true, key, kv_head, &k_rows[row]);
@@ -1672,44 +1962,58 @@ std::vector<double> segmented_attention_oracle(const SegmentedCache& cache, cons
             }
         });
         run_threads([&](unsigned thread, unsigned threads) {
-            std::vector<double> scores(static_cast<std::size_t>(keys));
+            std::vector<double> prefix_scores(static_cast<std::size_t>(prefix));
+            std::vector<double> own_scores(static_cast<std::size_t>(columns));
             double query[kHeadDim];
-            double value[kHeadDim];
-            for (std::int32_t unit = static_cast<std::int32_t>(thread);
-                 unit < columns * kSegmentedGroup; unit += static_cast<std::int32_t>(threads)) {
-                const std::int32_t column = unit / kSegmentedGroup;
-                const std::int32_t q_head = kv_head * kSegmentedGroup + unit % kSegmentedGroup;
+            double rotated_query[kHeadDim];
+            double prefix_value[kHeadDim];
+            double own_value[kHeadDim];
+            for (std::int32_t unit = static_cast<std::int32_t>(thread); unit < columns * group;
+                 unit += static_cast<std::int32_t>(threads)) {
+                const std::int32_t column = unit / group;
+                const std::int32_t q_head = kv_head * group + unit % group;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    query[d] = static_cast<double>(q[q_index(geometry, q_head, d, column)]);
-                    value[d] = 0.0;
+                    query[d]         = static_cast<double>(q[q_index(geometry, q_head, d, column)]);
+                    rotated_query[d] = query[d];
+                    prefix_value[d]  = 0.0;
+                    own_value[d]     = 0.0;
                 }
-                if (rotated) { hadamard64_groups(query); }
-                const std::int32_t lo = prefix + starts[static_cast<std::size_t>(column)];
-                const std::int32_t hi = prefix + column;
-                const auto visit      = [&](auto&& body) {
-                    for (std::int32_t key = 0; key < prefix; ++key) { body(key); }
-                    for (std::int32_t key = lo; key <= hi; ++key) { body(key); }
-                };
-                double maximum = -std::numeric_limits<double>::infinity();
-                visit([&](std::int32_t key) {
-                    const double score = dot_fp64(query, &k_rows[static_cast<std::size_t>(key) * kHeadDim]) *
+                if (rotated) { hadamard64_groups(rotated_query); }
+                const std::int32_t start = starts[static_cast<std::size_t>(column)];
+                double maximum           = -std::numeric_limits<double>::infinity();
+                for (std::int32_t key = 0; key < prefix; ++key) {
+                    const double score =
+                        dot_fp64(rotated_query, &k_rows[static_cast<std::size_t>(key) * kHeadDim]) *
+                        static_cast<double>(kAttentionScale);
+                    prefix_scores[static_cast<std::size_t>(key)] = score;
+                    maximum                                      = std::max(maximum, score);
+                }
+                for (std::int32_t own = start; own <= column; ++own) {
+                    const double score = dot_fp64(query, &k[kv_input_index(geometry, kv_head, 0, own)]) *
                                          static_cast<double>(kAttentionScale);
-                    scores[static_cast<std::size_t>(key)] = score;
-                    maximum                               = std::max(maximum, score);
-                });
+                    own_scores[static_cast<std::size_t>(own)] = score;
+                    maximum                                   = std::max(maximum, score);
+                }
                 double sum = 0.0;
-                visit([&](std::int32_t key) {
-                    const double weight = std::exp(scores[static_cast<std::size_t>(key)] - maximum);
+                for (std::int32_t key = 0; key < prefix; ++key) {
+                    const double weight = std::exp(prefix_scores[static_cast<std::size_t>(key)] - maximum);
                     const float* row    = &v_rows[static_cast<std::size_t>(key) * kHeadDim];
                     sum += weight;
                     for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                        value[d] += weight * static_cast<double>(row[d]);
+                        prefix_value[d] += weight * static_cast<double>(row[d]);
                     }
-                });
-                for (std::int32_t d = 0; d < kHeadDim; ++d) { value[d] /= sum; }
-                if (rotated) { hadamard64_groups(value); }
+                }
+                for (std::int32_t own = start; own <= column; ++own) {
+                    const double weight = std::exp(own_scores[static_cast<std::size_t>(own)] - maximum);
+                    const float* row    = &v[kv_input_index(geometry, kv_head, 0, own)];
+                    sum += weight;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        own_value[d] += weight * static_cast<double>(row[d]);
+                    }
+                }
+                if (rotated) { hadamard64_groups(prefix_value); }
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    output[q_index(geometry, q_head, d, column)] = value[d];
+                    output[q_index(geometry, q_head, d, column)] = (prefix_value[d] + own_value[d]) / sum;
                 }
             }
         });
@@ -1718,8 +2022,8 @@ std::vector<double> segmented_attention_oracle(const SegmentedCache& cache, cons
 }
 
 // Writes [0, prefix) of table row 1 through A2 from representative BF16 K/V.
-void populate_prefix(SegmentedCache& cache, std::int32_t prefix, std::uint32_t seed) {
-    const Geometry& geometry = kSegmentedGeometry;
+void populate_prefix(CodecCache& cache, std::int32_t prefix, std::uint32_t seed) {
+    const Geometry& geometry = cache.geometry();
     for (std::int32_t begin = 0; begin < prefix; begin += kPrefixFillChunk) {
         const std::int32_t tokens = std::min(kPrefixFillChunk, prefix - begin);
         const std::size_t elements =
@@ -1742,35 +2046,6 @@ void populate_prefix(SegmentedCache& cache, std::int32_t prefix, std::uint32_t s
     }
 }
 
-// Copies the rows of [begin, end) from `source` into `target` for every plane.
-void copy_rows(const SegmentedCache& cache, const CacheBytes& source, std::int32_t begin,
-               std::int32_t end, CacheBytes& target) {
-    const KvCodec& codec = cache.codec();
-    const auto copy      = [&](const std::vector<std::uint8_t>& from, std::vector<std::uint8_t>& to,
-                          std::int32_t row_bytes, std::int32_t position, std::int32_t head) {
-        const std::size_t offset = cache.row_offset(row_bytes, position, head);
-        std::memcpy(to.data() + offset, from.data() + offset, static_cast<std::size_t>(row_bytes));
-    };
-    for (std::int32_t position = begin; position < end; ++position) {
-        for (std::int32_t head = 0; head < kSegmentedGeometry.kv_heads; ++head) {
-            copy(source.k, target.k, codec.k_row_bytes(), position, head);
-            copy(source.v, target.v, codec.v_row_bytes(), position, head);
-            if (codec.quantized()) {
-                copy(source.k_scale, target.k_scale, kScaleRowBytes, position, head);
-                copy(source.v_scale, target.v_scale, kScaleRowBytes, position, head);
-            }
-        }
-    }
-}
-
-int verify_cache_bytes(const std::string& label, const CacheBytes& got, const CacheBytes& expected) {
-    int failures = verify_exact((label + " cache-k").c_str(), got.k, expected.k);
-    failures += verify_exact((label + " cache-v").c_str(), got.v, expected.v);
-    failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
-    failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
-    return failures;
-}
-
 // Two implementations that each meet a reduction criterion against the same oracle differ by at
 // most the sum of their envelopes.
 ReductionCriterion pairwise_criterion(const ReductionCriterion& criterion) {
@@ -1788,12 +2063,18 @@ struct SegmentedCase {
 };
 
 // The supplementary consistency check: each segment runs A1 alone behind the same prefix, which
-// appends it at [prefix, prefix + T_s). It rewrites the cache, so it runs last.
+// appends it at [prefix, prefix + T_s) and attends it from the cache. Only a BF16 cache stores the
+// own columns exactly, so only there is this the A4 formula. It rewrites the cache, so it runs
+// last.
 int verify_per_segment_a1(const std::string& label, const SegmentedCase& test_case,
-                          SegmentedCache& cache, const GuardedDeviceBuffer& dq,
+                          CodecCache& cache, const GuardedDeviceBuffer& dq,
                           const GuardedDeviceBuffer& dk, const GuardedDeviceBuffer& dv,
                           GuardedDeviceBuffer& dtable_row, const std::vector<double>& segmented) {
-    const Geometry& geometry = kSegmentedGeometry;
+    if (test_case.codec->quantized()) {
+        std::cerr << label << ": per-segment A1 is the A4 formula only on a BF16 cache\n";
+        return 1;
+    }
+    const Geometry& geometry = cache.geometry();
     const std::int32_t columns =
         static_cast<std::int32_t>(segmented.size() / (static_cast<std::size_t>(kHeadDim) * geometry.q_heads));
     GuardedDeviceBuffer dout(static_cast<std::size_t>(kHeadDim) * geometry.q_heads * columns * 2);
@@ -1852,8 +2133,9 @@ int run_segmented_case(const SegmentedCase& test_case) {
                               codec.name + " prefix=" + std::to_string(prefix) + " mix=" +
                               test_case.mix;
 
-    // One logical page past the call stays unwritten, so reads beyond prefix + N meet NaN rows.
-    SegmentedCache cache(codec, (prefix + columns) / kPagedKVPageSize + 2);
+    // The row spans the per-segment A1 appends behind the prefix plus one unwritten page, so every
+    // row at or past the prefix is NaN while A4 runs.
+    CodecCache cache(geometry, codec, (prefix + columns) / kPagedKVPageSize + 2);
     populate_prefix(cache, prefix, test_case.seed + 100u);
 
     const std::size_t q_elements =
@@ -1861,11 +2143,11 @@ int run_segmented_case(const SegmentedCase& test_case) {
     const std::size_t kv_elements =
         static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * static_cast<std::size_t>(columns);
     const std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    const std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
+    const std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
-    const std::vector<std::uint16_t> k_bits =
-        to_bf16_bits(make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f));
-    const std::vector<std::uint16_t> v_bits =
-        to_bf16_bits(make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f));
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
@@ -1876,7 +2158,7 @@ int run_segmented_case(const SegmentedCase& test_case) {
     dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
     dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
     dsegments.copy_from_host(table.data(), table.size() * sizeof(std::int32_t));
-    dtable_row.copy_from_host(&kSegmentedRow, sizeof(kSegmentedRow));
+    dtable_row.copy_from_host(&kTestedRow, sizeof(kTestedRow));
     const std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
     dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
 
@@ -1898,37 +2180,19 @@ int run_segmented_case(const SegmentedCase& test_case) {
     };
     const CacheBytes before              = cache.snapshot();
     const std::vector<std::uint16_t> out = run();
-    const CacheBytes after               = cache.snapshot();
 
     const std::vector<double> output = bf16_bits_to_double(out);
     int failures = verify_attention(label, output,
-                                    segmented_attention_oracle(cache, after, q, prefix, starts),
+                                    segmented_attention_oracle(cache, before, q, k, v, prefix, starts),
                                     attention_criterion(codec.dtype));
-    // Only the appended rows of the selected table row may change.
-    CacheBytes expected = before;
-    copy_rows(cache, after, prefix, prefix + columns, expected);
-    failures += verify_cache_bytes(label + " rows outside [prefix, prefix + N)", after, expected);
-
+    failures += verify_cache_bytes(label + " cache unchanged", cache.snapshot(), before);
     failures += verify_exact((label + " repeated output").c_str(), run(), out);
-    failures += verify_cache_bytes(label + " repeated append", cache.snapshot(), after);
-
-    // The appended rows are exactly the A2 encoding of k/v at prefix + i.
-    {
-        std::vector<std::int32_t> positions(static_cast<std::size_t>(columns));
-        for (std::int32_t column = 0; column < columns; ++column) {
-            positions[static_cast<std::size_t>(column)] = prefix + column;
-        }
-        const DeviceBuffer dp = to_device(positions);
-        ops::gqa_kv_append(tk, tv, Tensor(dp.p, DType::I32, {columns}), cache.row_view(), nullptr);
-        cuda_synchronize();
-        failures += verify_cache_bytes(label + " A2 encoding", cache.snapshot(), after);
-    }
 
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
     failures += verify_input(label + " v unchanged", dv, v_bits);
     failures += verify_positions(label + " segments unchanged", dsegments, table);
-    failures += verify_positions(label + " table row unchanged", dtable_row, {kSegmentedRow});
+    failures += verify_positions(label + " table row unchanged", dtable_row, {kTestedRow});
     failures += dout.verify_guards(label + " output");
     failures += workspace_buffer.verify_guards(label + " workspace");
     if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
@@ -1945,25 +2209,28 @@ int run_segmented_case(const SegmentedCase& test_case) {
 int run_segmented_cases() {
     const std::vector<std::int32_t> single{1};
     const std::vector<std::int32_t> six_by_40(6, 40);
+    const std::vector<std::int32_t> six_by_21(6, 21);
     const std::vector<std::int32_t> wide{1024};
     const std::vector<std::int32_t> many(255, 3);
     // Every codec, prefix, and segment mix appears; the long-prefix and wide cases are spread over
     // codecs instead of forming the full product. Prefixes straddle the page (63/64) and split
-    // (1000, 8192, 65535) boundaries; prefix 0 has no shared history.
+    // (1000, 8192, 65535) boundaries; prefix 0 has no shared history and runs no prefix split.
+    // With a prefix, 1x1 folds its partials in four CTAs per row tile, 6x21 in two, the rest in one.
     const SegmentedCase cases[] = {
         {&kBf16Kv, 1, "1x1024", wide, false, 601u},
         {&kBf16Kv, 1000, "6x40", six_by_40, true, 602u},
+        {&kBf16Kv, 63, "255x3", many, true, 615u},
         {&kInt8Kv, 0, "6x40", six_by_40, false, 603u},
-        {&kInt8Kv, 63, "255x3", many, true, 604u},
+        {&kInt8Kv, 63, "255x3", many, false, 604u},
         {&kInt8Kv, 8192, "1x1", single, false, 605u},
         {&kRk8v4Kv, 64, "1x1024", wide, false, 606u},
         {&kRk8v4Kv, 65535, "1x1", single, false, 607u},
+        {&kRk8v4Kv, 0, "255x3", many, false, 616u},
         {&kRk4v4Kv, 1000, "255x3", many, false, 608u},
-        {&kRk4v4Kv, 63, "6x40", six_by_40, false, 609u},
-        {&kRk4v4E8Kv, 65535, "6x40", six_by_40, true, 610u},
-        {&kRk4v4E8Kv, 63, "1x1024", wide, false, 611u},
-        {&kRk4v4E8Kv, 1, "1x1", single, false, 612u},
-        {&kRk2v4E8Kv, 8192, "6x40", six_by_40, false, 613u},
+        {&kRk4v4Kv, 63, "1x1024", wide, false, 609u},
+        {&kRk4v4Kv, 65535, "6x40", six_by_40, false, 610u},
+        {&kRk4v4Kv, 1, "1x1", single, false, 612u},
+        {&kRk2v4E8Kv, 8192, "6x21", six_by_21, false, 613u},
         {&kRk2v4E8Kv, 64, "255x3", many, false, 614u},
     };
     int failures = 0;
@@ -1983,6 +2250,7 @@ int main() {
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();
+    failures += run_codec_cases();
     failures += run_segmented_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";

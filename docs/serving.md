@@ -134,8 +134,9 @@ session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. Th
 backend is not supported.
 
 When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry. The snapshot format is version 4, which always records both the
-adapter fingerprint and the ring section; earlier versions are rejected. The restored
+about 147 MiB per entry. The snapshot format is version 5, which always records both the
+adapter fingerprint and the ring section and stores packed 4-bit KV pages in the midrise codec;
+earlier versions are rejected. The restored
 ring lets a later mid-history edit reuse the session; see
 [turn-checkpoint-ring.md](turn-checkpoint-ring.md).
 
@@ -681,7 +682,7 @@ count of the answers' Python `json.dumps` text. `latency_ms` is the engine's tim
 to 0.1 ms: the restore of a cached state image, if any, plus execution from admission to result,
 excluding the queue wait. A state is cut to its first 65,536
 tokens, delimiter included. A question whose branch does not fit the 73,728-token row with its
-state, or a decision whose state plus branch scratch exceeds a lane's `--max-context`, is refused
+state, or a decision whose state plus its longest branch exceeds a lane's `--max-context`, is refused
 with 422 and a `detail` string.
 
 | Status | When |
@@ -726,26 +727,31 @@ weights, with BF16 KV.
 
 Every unit of a decision, state chunks and branch passes alike, runs BF16 activations: the INT8
 activation routes of chat prefill are never admitted. The KV codec is therefore the one lossy choice
-left to the operator. Measured on an RTX 4090, 2026-09-29, with `systemone-decision-v7`:
+left to the operator, and it touches only the state: a branch pass attends its own question tokens
+from their BF16 values and writes no KV, so only a branch longer than one pass stores its tokens
+through the codec. Measured on an RTX 4090, 2026-09-30, with `systemone-decision-v7`:
 
 | `--kv-dtype` | Served vs reference, max \|Δp\| (mean) | Changed answers / 290 | Alone vs full request, max \|Δp\| | kev's bars |
 |---|---:|---:|---:|---|
-| `bf16` | 0.029 (0.0025) | 0 | 0.006 | met |
-| `int8` | 0.026 (0.0029) | 0 | 0.009 | met |
-| `rk8v4` | 0.054 (0.0052) | 1 | 0.010 | missed |
-| `rk4v4-e8` | 0.205 (0.0100) | 2 | 0.021, one changed answer | missed |
+| `bf16` | 0.018 (0.0026) | 0 | 0.006 | met |
+| `int8` | 0.025 (0.0028) | 0 | 0.008 | met |
+| `rk8v4` | 0.041 (0.0042) | 0 | 0.007 | missed |
+| `rk4v4` | 0.048 (0.0048) | 1 | 0.004 | missed |
 
-A repeated cold decision is bit-identical on every codec. At the task level the codec makes no
-measurable difference: over the development partition's 1,264 clean questions, probed before the
-segmented branch Ops, accuracy is 0.870–0.872, Brier 0.184–0.185 and ECE 0.024–0.031 for all four,
-against an accuracy standard error of about 0.009.
+A repeated cold decision is bit-identical on every codec. The rotated codecs miss only the
+probability bar, and only on a few questions: 5 of kev's 280 exceed 0.03 on `rk8v4` and 6 on
+`rk4v4`, none by more than 0.018, while their changed answers stay within kev's one per 280. At the
+task level the codec made no measurable difference even before the current 4-bit codec: over the
+development partition's 1,264 clean questions, probed before the segmented branch Ops, accuracy was
+0.870–0.872, Brier 0.184–0.185 and ECE 0.024–0.031 for `bf16`, `int8`, `rk8v4` and the since-removed
+`rk4v4-e8`, whose largest deviation (0.205) was four times the current `rk4v4`'s, against an
+accuracy standard error of about 0.009.
 
 `bf16`, the `ninfer-serve` default, is the qualified configuration for decisions. `int8` met both
-bars here, but measured 0.031 before the segmented branch Ops, so it sits at the bar rather than
-inside it. The rotated codecs keep task-level
-quality while moving individual probabilities beyond kev's tolerance; choose them for chat context
-capacity (`rk4v4-e8` stores about 3.8 times as many tokens per GiB as `bf16`) knowing that decisions
-served beside chat on them are not qualified to kev's bar. A trainer on another quantization of the
+bars here, but measured 0.031 before the segmented branch Ops, so it sits near the bar rather than
+well inside it. Choose a rotated codec for chat context capacity (`rk4v4` stores about 3.8 times as
+many tokens per GiB as `bf16`) knowing that decisions served beside chat on it keep task-level
+quality but are not qualified to kev's bar. A trainer on another quantization of the
 base, such as the NF4 QLoRA base `llm-datasets` trains on, differs from any served codec by more than
 the codec does ([adapter authority](maintainer/qwen3.8-27b-lora-adapters.md#33-revisit-decision-adapters-use-only-these-six-modules)).
 
@@ -861,7 +867,7 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |
+| `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk2v4-e8` | KV-cache storage; the Hadamard-rotated modes trade key/value precision for capacity | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -926,7 +932,7 @@ aliases and can be shared across independent requests with different suffixes.
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --max-context 262144 --kv-capacity 262144 --max-concurrency 1 \
-  --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --kv-dtype rk4v4 --spec mtp --draft-tokens 3 --lm-head-draft \
   --continuation-cache l1-l2-l3 \
   --continuation-cache-dir "$HOME/.cache/ninfer/continuations" \
   --continuation-cache-namespace opencode \

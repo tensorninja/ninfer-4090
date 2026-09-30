@@ -65,25 +65,6 @@ struct GqaPrefillBatchMetadata {
     }
 };
 
-// A dense single-row append whose first position is a host launch value (A4 appends its
-// columns at prefix + i); no device position vector exists.
-struct GqaPrefillHostPositionMetadata {
-    const std::int32_t* tables;
-    const std::int32_t* table_rows;
-    std::int32_t table_stride;
-    std::int32_t first_position;
-
-    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
-
-    __device__ __forceinline__ std::int32_t base_position(const std::int32_t*) const {
-        return first_position;
-    }
-
-    __device__ __forceinline__ const std::int32_t* block_table() const {
-        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
-    }
-};
-
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_prefill_q_row_offset(int q_head, int token) {
     return static_cast<std::int64_t>(kGqaPrefillHeadDim) *

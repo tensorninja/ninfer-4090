@@ -119,7 +119,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
 }
 
 template <typename Geometry, int TokenTile, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
+          bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -138,14 +138,14 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 static const cudaError_t attr = cudaFuncSetAttribute(
                     gqa_attention_decode_i8_tiled_kernel<
                         Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
-                        PackedV, RotateK, RotateV, PackedK, E8Lattice, E8Root, MultiBatch, Masked,
+                        PackedV, RotateK, RotateV, PackedK, E8Root, MultiBatch, Masked,
                         CacheInput>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
                 CUDA_CHECK(attr);
             }
             gqa_attention_decode_i8_tiled_kernel<
                 Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, PackedV,
-                RotateK, RotateV, PackedK, E8Lattice, E8Root, MultiBatch, Masked, CacheInput>
+                RotateK, RotateV, PackedK, E8Root, MultiBatch, Masked, CacheInput>
                 <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(pos.data),
@@ -227,7 +227,6 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .rotate_k      = cache.rotate_k,
         .rotate_v      = cache.rotate_v,
         .packed_k      = cache.packed_k,
-        .e8_lattice    = cache.e8_lattice,
         .e8_root       = cache.e8_root,
     };
 }
@@ -275,32 +274,26 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                      \
                 if (cache.dtype == DType::I8) {                                                    \
                     if (cache.e8_root) {                                                           \
-                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false,   \
-                                             true, MultiBatch, Masked>(                            \
-                            q, input, pos, scale, cache, invocation, logical_capacity,             \
-                            implementation_window, splits, partial_acc, partial_m, partial_l,      \
-                            stream);                                                               \
-                    } else if (cache.e8_lattice) {                                                 \
-                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true,     \
-                                             false, MultiBatch, Masked>(                           \
+                        launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, true,    \
+                                             MultiBatch, Masked>(                                  \
                             q, input, pos, scale, cache, invocation, logical_capacity,             \
                             implementation_window, splits, partial_acc, partial_m, partial_l,      \
                             stream);                                                               \
                     } else if (cache.packed_k) {                                                   \
                         launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false,    \
-                                             false, MultiBatch, Masked>(                           \
+                                             MultiBatch, Masked>(                                  \
                             q, input, pos, scale, cache, invocation, logical_capacity,             \
                             implementation_window, splits, partial_acc, partial_m, partial_l,      \
                             stream);                                                               \
                     } else if (cache.packed_v) {                                                   \
                         launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false,   \
-                                             false, MultiBatch, Masked>(                           \
+                                             MultiBatch, Masked>(                                  \
                             q, input, pos, scale, cache, invocation, logical_capacity,             \
                             implementation_window, splits, partial_acc, partial_m, partial_l,      \
                             stream);                                                               \
                     } else {                                                                       \
                         launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false,       \
-                                             false, false, MultiBatch, Masked>(                    \
+                                             false, MultiBatch, Masked>(                           \
                             q, input, pos, scale, cache, invocation, logical_capacity,             \
                             implementation_window, splits, partial_acc, partial_m, partial_l,      \
                             stream);                                                               \
@@ -336,9 +329,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
-    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                   Offset>
+    const auto launch_reduce = [&]<bool Int8, bool RotateV, bool MultiBatch, bool Masked,
+                                   bool Offset>() {
+        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, RotateV, MultiBatch,
+                                                   Masked, Offset>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
@@ -351,43 +345,34 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
     };
     const bool masked         = invocation.valid_columns != nullptr;
-    const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
+    const auto launch_profile = [&]<bool Int8, bool RotateV, bool MultiBatch, bool Masked>() {
         if (invocation.column_begin == 0) {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, false>();
+            launch_reduce.template operator()<Int8, RotateV, MultiBatch, Masked, false>();
         } else {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, true>();
+            launch_reduce.template operator()<Int8, RotateV, MultiBatch, Masked, true>();
         }
     };
-    const auto launch_for_dtype = [&]<bool Int8>() {
+    const auto launch_for_dtype = [&]<bool Int8, bool RotateV>() {
         if (invocation.batch_size == 1) {
             if (masked) {
-                launch_profile.template operator()<Int8, false, true>();
+                launch_profile.template operator()<Int8, RotateV, false, true>();
             } else {
-                launch_profile.template operator()<Int8, false, false>();
+                launch_profile.template operator()<Int8, RotateV, false, false>();
             }
         } else if (masked) {
-            launch_profile.template operator()<Int8, true, true>();
+            launch_profile.template operator()<Int8, RotateV, true, true>();
         } else {
-            launch_profile.template operator()<Int8, true, false>();
+            launch_profile.template operator()<Int8, RotateV, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
-        launch_for_dtype.template operator()<true>();
+    if (cache.dtype != DType::I8) {
+        launch_for_dtype.template operator()<false, false>();
+    } else if (cache.rotate_v) {
+        launch_for_dtype.template operator()<true, true>();
     } else {
-        launch_for_dtype.template operator()<false>();
+        launch_for_dtype.template operator()<true, false>();
     }
     CUDA_CHECK(cudaGetLastError());
-    if (cache.rotate_v) {
-        const int units =
-            invocation.batch_size * invocation.width * Geometry::QHeads * kGqaKvQuantGroups;
-        gqa_kv_inverse_rotate_output_kernel<Geometry::QHeads><<<units, 32, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
-            invocation.column_begin,
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data));
-        CUDA_CHECK(cudaGetLastError());
-    }
 }
 
 #    define NINFER_JOIN_IMPL(left, right) left##right

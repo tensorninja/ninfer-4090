@@ -1,10 +1,11 @@
 // Public-Op benchmark for A4 shared-prefix segmented attention.
 //
-// Each case populates [0, prefix) of one block-table row through A2, then times one A4 call (the
-// append at prefix + i plus segment-causal attention over the shared prefix) against the
-// per-segment A1 loop, which serves the same segments one A1 call at a time behind the same
-// prefix. Both entries use only the public Op contracts and their capacity queries; split counts
-// and kernel routes are private and never enter the dispatch or the output schema.
+// Each case populates [0, prefix) of one block-table row through A2, then times one A4 call
+// (segment-causal attention over the cached shared prefix plus each segment's own BF16 K/V)
+// against the per-segment A1 loop, which serves the same segments one A1 call at a time behind
+// the same prefix, appending each segment to the cache first. Both entries use only the public Op
+// contracts and their capacity queries; split counts and kernel routes are private and never
+// enter the dispatch or the output schema.
 
 #include "ninfer/ops/gqa_attention.h"
 
@@ -43,7 +44,6 @@ struct Codec {
     bool packed_k;
     bool packed_v;
     bool rotated;
-    bool e8_lattice;
     bool e8_root;
 
     [[nodiscard]] bool quantized() const { return dtype == DType::I8; }
@@ -60,12 +60,11 @@ struct Codec {
 };
 
 constexpr Codec kCodecs[] = {
-    {"bf16", DType::BF16, false, false, false, false, false},
-    {"int8", DType::I8, false, false, false, false, false},
-    {"rk8v4", DType::I8, false, true, true, false, false},
-    {"rk4v4", DType::I8, true, true, true, false, false},
-    {"rk4v4-e8", DType::I8, true, true, true, true, false},
-    {"rk2v4-e8", DType::I8, false, true, true, false, true},
+    {"bf16", DType::BF16, false, false, false, false},
+    {"int8", DType::I8, false, false, false, false},
+    {"rk8v4", DType::I8, false, true, true, false},
+    {"rk4v4", DType::I8, true, true, true, false},
+    {"rk2v4-e8", DType::I8, false, true, true, true},
 };
 
 struct Mix {
@@ -79,7 +78,7 @@ enum class CacheMode : std::uint8_t { Cold, Warm };
 struct Options {
     std::vector<std::int32_t> prefixes{8192, 65535};
     std::vector<Mix> mixes{{1, 40}, {6, 40}, {255, 3}};
-    std::vector<const Codec*> codecs{&kCodecs[0], &kCodecs[4]};
+    std::vector<const Codec*> codecs{&kCodecs[0], &kCodecs[3]};
     Entry entry     = Entry::Both;
     CacheMode cache = CacheMode::Cold;
     int warmup      = 3;
@@ -90,7 +89,7 @@ struct Options {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_gqa_attention_segmented_bench [--prefix L,...] [--mix SxT,...] "
-                 "[--kv bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|all[,...]] "
+                 "[--kv bf16|int8|rk8v4|rk4v4|rk2v4-e8|all[,...]] "
                  "[--entry segmented|per-segment|both] [--cache cold|warm] [--warmup N] "
                  "[--repeat N]\n",
                  message);
@@ -319,7 +318,6 @@ private:
         view.rotate_k     = codec_.rotated;
         view.rotate_v     = codec_.rotated;
         view.packed_k     = codec_.packed_k;
-        view.e8_lattice   = codec_.e8_lattice;
         view.e8_root      = codec_.e8_root;
     }
 

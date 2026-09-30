@@ -1,7 +1,7 @@
 #pragma once
 
-// A4 INT8-family split kernel for the INT8-G64, rk8v4, rk4v4, rk4v4-e8, and rk2v4-e8 caches.
-// One CTA owns 64 GQA-packed rows of one KV head and one key split. QK runs the registered
+// A4 INT8-family prefix split kernel for the INT8-G64, rk8v4, rk4v4, and rk2v4-e8 caches.
+// One CTA owns 64 GQA-packed rows of one KV head and one prefix split. QK runs the registered
 // Q8-G64 x INT8-K profile on m16n8k32.s8 Tensor Cores; V is dequantized to FP16 and PV runs
 // FP16 m16n8k16 with a per-tile FP16 accumulator folded into FP32 (the sm_89 prompt schedule).
 //
@@ -9,7 +9,7 @@
 // softmax while eight workers dequantize V; all sixteen then split PV by 64-dimension slice.
 // Every cache code reaches shared memory through cp.async. Packed and E8-root K codes stream
 // one tile ahead under QK and are expanded to INT8 under PV; V codes and all scales stream
-// under PV. The CTA writes unnormalized FP32 partials for gqa_attention_segmented_merge_kernel.
+// under PV. The CTA writes unnormalized FP32 partials for gqa_attention_segmented_own_kernel.
 
 #include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
@@ -57,37 +57,6 @@ struct GqaSegmentedI8Layout {
 
 inline constexpr int kGqaSegmentedI8Warps   = 16;
 inline constexpr int kGqaSegmentedI8Threads = kGqaSegmentedI8Warps * 32;
-
-// Eight signed 4-bit codes (dimension order, low nibble first) to eight INT8 lanes.
-__device__ __forceinline__ uint2 gqa_segmented_unpack_i4x8(unsigned word) {
-    const unsigned shifted = word >> 4;
-    unsigned lo            = __byte_perm(word, shifted, 0x5140u) & 0x0f0f0f0fu;
-    unsigned hi            = __byte_perm(word, shifted, 0x7362u) & 0x0f0f0f0fu;
-    lo |= (lo & 0x08080808u) * 0x1eu;
-    hi |= (hi & 0x08080808u) * 0x1eu;
-    return make_uint2(lo, hi);
-}
-
-// Eight signed 4-bit codes to eight FP16 values code * scale. Biased nibbles are spliced under
-// the FP16 exponents of 1024 (low nibble, unit weight) and 64 (high nibble at bits 4..7, unit
-// weight); subtracting 1032/72 recovers each integer code exactly, so the single rounding is the
-// product with the group scale, as in the INT8 dequantizer.
-__device__ __forceinline__ int4 gqa_segmented_dequant_i4x8(unsigned word, __half scale) {
-    const unsigned biased = word ^ 0x88888888u;
-    const __half2 magic   = __halves2half2(__ushort_as_half(0x6408), __ushort_as_half(0x5480));
-    const __half2 scale2  = __halves2half2(scale, scale);
-    unsigned packed[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const unsigned selector = 0x7050u | (static_cast<unsigned>(i) << 8) | static_cast<unsigned>(i);
-        const unsigned pair     = __byte_perm(biased, 0x54006400u, selector) & 0xfff0ff0fu;
-        const __half2 code      = __hsub2(half2_from_bits(pair), magic);
-        const __half2 value     = __hmul2(code, scale2);
-        packed[i]               = *reinterpret_cast<const unsigned*>(&value);
-    }
-    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-}
 
 template <typename Geometry, GqaSegmentedKCodec KCodec, bool PackedV, bool RotateK>
 __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
@@ -146,19 +115,16 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
 
     const int first_row  = row_tile * Br;
     const int tile_rows  = min(Br, Group * params.columns - first_row);
-    const bool last      = split == params.splits - 1;
     const int prefix     = params.prefix;
-    const int key_limit  = prefix + params.columns;
     const float scale_l2 = params.scale_log2;
     const std::int32_t* block_table =
         params.tables + static_cast<std::int64_t>(params.table_rows[0]) * params.table_stride;
-    const GqaSegmentedTilePlan plan =
-        gqa_segmented_tile_plan<Group>(params, split, first_row, first_row + tile_rows - 1);
-    const int tiles = plan.count();
+    const GqaSegmentedPrefixShare share = gqa_segmented_prefix_share(params, split);
+    const int tiles                     = share.end - share.begin;
 
-    // Cache staging. A tile is one physical page; keys at or past key_limit are zero-filled.
+    // Cache staging. A tile is one physical page; keys at or past the prefix are zero-filled.
     auto live_bytes = [&](int k0, int key_l, int bytes) {
-        return k0 + key_l < key_limit ? bytes : 0;
+        return k0 + key_l < prefix ? bytes : 0;
     };
     auto stage_k = [&](int tile) {
         const int k0   = tile * Bc;
@@ -199,7 +165,7 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
         if (tid < 64) {
             const int chunk  = tid & 31;
             const int key_l  = 2 * chunk;
-            const int bytes  = min(16, max(0, (key_limit - k0 - key_l) * 8));
+            const int bytes  = min(16, max(0, (prefix - k0 - key_l) * 8));
             const std::int64_t offset =
                 paged_kv_page_head_offset<Groups, Geometry::KVHeads>(page, kv_head) + key_l * Groups;
             if (tid < 32) {
@@ -217,10 +183,10 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
             const int key_l  = tid >> 3;
             const int chunk  = tid & 7;
             const uint4 raw  = load_vec<uint4>(k_raw + key_l * 128 + chunk * 16);
-            const uint2 d0   = gqa_segmented_unpack_i4x8(raw.x);
-            const uint2 d8   = gqa_segmented_unpack_i4x8(raw.y);
-            const uint2 d16  = gqa_segmented_unpack_i4x8(raw.z);
-            const uint2 d24  = gqa_segmented_unpack_i4x8(raw.w);
+            const uint2 d0   = gqa_kv_unpack_mr4x8(raw.x);
+            const uint2 d8   = gqa_kv_unpack_mr4x8(raw.y);
+            const uint2 d16  = gqa_kv_unpack_mr4x8(raw.z);
+            const uint2 d24  = gqa_kv_unpack_mr4x8(raw.w);
             std::int8_t* lo  = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, chunk * 16)) * 2];
             std::int8_t* hi  = &k_i8[(key_l * DB16 + gqa_prefill_swz(key_l, chunk * 16 + 8)) * 2];
             store_vec(lo, make_uint4(d0.x, d0.y, d8.x, d8.y));
@@ -242,8 +208,8 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
         }
     };
 
-    stage_k(plan.tile(0));
-    stage_v_and_scales(plan.tile(0));
+    stage_k(share.begin);
+    stage_v_and_scales(share.begin);
     cp_commit();
 
     // Q8-G64: one warp quantizes one (row, 64-dimension group) unit at a time. Rotated-K caches
@@ -274,12 +240,6 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
     const bool producer = warp < ProducerWarps;
     const int row_base  = (warp / ColSplit) * 16;
     const int col_half  = warp % ColSplit;
-    GqaSegmentedRowRange range0{kGqaSegmentedEmptyLo, -1};
-    GqaSegmentedRowRange range1{kGqaSegmentedEmptyLo, -1};
-    if (producer) {
-        range0 = gqa_segmented_row_range<Group>(params, first_row + row_base + gid, last);
-        range1 = gqa_segmented_row_range<Group>(params, first_row + row_base + gid + 8, last);
-    }
 
     cp_wait<0>();
     __syncthreads();
@@ -321,7 +281,7 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
         constexpr bool Masked = decltype(masked_tag)::value;
         const int k0          = tile * Bc;
         const bool has_next   = index + 1 < tiles;
-        const int next        = has_next ? plan.tile(index + 1) : tile;
+        const int next        = has_next ? tile + 1 : tile;
         if constexpr (RawK) {
             if (has_next) {
                 stage_k(next);
@@ -382,19 +342,8 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
 #pragma unroll
                 for (int ntl = 0; ntl < QKNtL; ++ntl) {
                     const int key0 = k0 + (col_half * QKNtL + ntl) * 8 + 2 * lid;
-                    const int key1 = key0 + 1;
-                    if (!gqa_segmented_visible(key0, prefix, range0)) {
-                        score[ntl][0] = -CUDART_INF_F;
-                    }
-                    if (!gqa_segmented_visible(key1, prefix, range0)) {
-                        score[ntl][1] = -CUDART_INF_F;
-                    }
-                    if (!gqa_segmented_visible(key0, prefix, range1)) {
-                        score[ntl][2] = -CUDART_INF_F;
-                    }
-                    if (!gqa_segmented_visible(key1, prefix, range1)) {
-                        score[ntl][3] = -CUDART_INF_F;
-                    }
+                    if (key0 >= prefix) { score[ntl][0] = score[ntl][2] = -CUDART_INF_F; }
+                    if (key0 + 1 >= prefix) { score[ntl][1] = score[ntl][3] = -CUDART_INF_F; }
                 }
             }
             const int row0 = row_base + gid;
@@ -459,7 +408,7 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
                 const __half scale = v_scale_s[key_l * Groups + (d >> 6)];
                 __half* dst        = &v_f16[key_l * D + gqa_prefill_swz(key_l, d)];
                 if constexpr (PackedV) {
-                    store_vec(dst, gqa_segmented_dequant_i4x8(
+                    store_vec(dst, gqa_kv_dequant_mr4x8_f16(
                                        load_vec<unsigned>(v_raw + key_l * 128 + d / 2), scale));
                 } else {
                     store_vec(dst, gqa_prefill_i8_dequant_f16x8(
@@ -525,7 +474,7 @@ __global__ __maxnreg__(128) void gqa_attention_segmented_i8_kernel(
     };
 
     for (int index = 0; index < tiles; ++index) {
-        const int tile = plan.tile(index);
+        const int tile = share.begin + index;
         if ((tile + 1) * Bc <= prefix) {
             process_tile(index, tile, std::false_type{});
         } else {

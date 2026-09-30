@@ -246,6 +246,7 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
         if (length > pass_columns) {
             plan->long_branches.push_back(index);
             plan->branch_units += 1ULL + (static_cast<std::uint64_t>(length) - 1ULL) / pass_columns;
+            plan->scratch_extent = std::max(plan->scratch_extent, length);
             continue;
         }
         auto pass = std::find_if(plan->passes.begin(), plan->passes.end(),
@@ -260,10 +261,9 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
         pass->branches.push_back(index);
         pass->columns += length;
     }
-    plan->scratch_extent = decision_scratch_extent(prompt, pass_columns);
-    if (static_cast<std::uint64_t>(state) + plan->scratch_extent > capacity) {
+    if (decision_context_tokens(prompt) > capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           "decision state and branch scratch exceed Engine context capacity");
+                           "decision state and its longest branch exceed Engine context capacity");
     }
     plan->logit_scale = static_cast<float>(
         1.0 / (std::sqrt(static_cast<double>(Variant::DecisionConfig::pointer_dim)) * temperature));
@@ -856,7 +856,8 @@ ContinuationRestoreFailure ProgramImplCore::import_decision_state_lane(
         decoded.dflash_local || decoded.dflash_checkpoint_local) {
         return Failure::MetadataMismatch;
     }
-    // The decision's planned entitlement, branch scratch included, as a cold admission reserves.
+    // The decision's planned entitlement, long-branch scratch included, as a cold admission
+    // reserves.
     const std::uint32_t text_pages = std::max(pages_for_tokens(state), entitlement.text_pages);
     if (!kv_reservation_fits(text_pages, 0)) { return Failure::KvReservationExhausted; }
     try {

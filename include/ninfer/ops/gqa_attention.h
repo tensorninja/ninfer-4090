@@ -31,10 +31,25 @@ struct GqaExecutionEnvelope {
  *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(x[i]) * inv), -127, 127))
  *   decode[i]  = FP32(code[i]) * s
  *
+ * The rotated caches (rk8v4, rk4v4, rk2v4-e8) encode each 64-element group of K and of V after
+ * the orthonormal Walsh-Hadamard transform y = H64 x (natural order, scaled by 1/8, evaluated in
+ * FP32). rk8v4 K applies INT8-G64 above to y; rk2v4-e8 K stores E8-root codes
+ * (ops/kernel/e8_root_codec.cuh). Every packed 4-bit plane (rk8v4 V, rk4v4 K and V, rk2v4-e8 V)
+ * holds the midrise codec, whose sixteen levels are the odd multiples of a half step h:
+ *
+ *   a          = max_i abs(y[i])
+ *   scale_bits = FP16_RNE(a / 15)
+ *   h          = FP32(scale_bits)
+ *   inv        = h == 0 ? 0 : FP32(1 / h)
+ *   code[i]    = clamp(floor(FP32(y[i] * inv) / 2), -8, 7)
+ *   decode[i]  = (2 * code[i] + 1) * h
+ *
+ * The logical cache value of a rotated group is H64 applied to its decoded values.
+ *
  * A1 and A2 produce identical code and scale bits. The common ideal attention oracle uses BF16 Q
- * and logical cache values (BF16 values for a BF16 cache, FP32 decode above for INT8-G64), then
- * evaluates score dot products, stable softmax, and value reduction in FP64. The BF16 Op output is
- * promoted to FP64 for comparison with that result.
+ * and logical cache values (BF16 values for a BF16 cache, the FP32 decode above for INT8-G64 and
+ * the rotated caches), then evaluates score dot products, stable softmax, and value reduction in
+ * FP64. The BF16 Op output is promoted to FP64 for comparison with that result.
  *
  * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
  * compute profile. Its profile-defined query quantization and any narrower staging do not replace
@@ -71,9 +86,10 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
  * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
- * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
- * or INT8-G64 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
- * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
+ * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16,
+ * INT8-G64, or a rotated cache under the shared numerical contract above. PagedKVBatchLayerView
+ * supplies shared planes and the complete block-table matrix; kv_table_rows[b] selects one row
+ * for sequence b.
  *
  * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
  * prefix are sequential and address populated causal histories. Each nonempty row repeats its
@@ -118,30 +134,32 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
 [[nodiscard]] std::size_t gqa_attention_segmented_workspace_capacity_bytes(std::int32_t max_columns);
 
 /**
- * A4: append N columns of one sequence behind a populated shared prefix and compute
- * segment-causal grouped-query attention. The only registered geometry is group 6: q/out are
- * contiguous BF16 `[256,24,N]` and k/v are contiguous BF16 `[256,4,N]`, N >= 1. segments is
- * contiguous I32 [2,S] holding (c_s, T_s) pairs with c_0 = 0, T_s >= 1, and
+ * A4: compute segment-causal grouped-query attention for N columns of one sequence behind a
+ * populated shared prefix, without writing the cache. The only registered geometry is group 6:
+ * q/out are contiguous BF16 `[256,24,N]` and k/v are contiguous BF16 `[256,4,N]`, N >= 1.
+ * segments is contiguous I32 [2,S] holding (c_s, T_s) pairs with c_0 = 0, T_s >= 1, and
  * c_{s+1} = c_s + T_s, so the S segments tile [0,N) in order. kv_table_rows is contiguous I32 [1]
  * selecting one row of the PagedKVBatchLayerView block-table matrix. prefix is a host value with
- * 0 <= prefix and prefix + N no larger than the row capacity or kGqaAttentionMaximumVisibleKeys.
+ * 0 <= prefix no larger than the row capacity and prefix + N no larger than
+ * kGqaAttentionMaximumVisibleKeys.
  *
- * The Op overwrites cache position prefix + i with column i of k/v in the A2 encoding. For column
- * i of segment s (c_s <= i < c_s + T_s), query head h, and kvh = floor(h/6):
+ * Keys and values below the prefix are the logical cache values; a segment's own keys and values
+ * are its columns of k/v at their BF16 storage boundary. For column i of segment s
+ * (c_s <= i < c_s + T_s), query head h, and kvh = floor(h/6):
  *
- *   visible(i)   = [0, prefix) U [prefix + c_s, prefix + i]
- *   score[x]     = scale * dot(q[:,h,i], K_cache[:,x,kvh]), x in visible(i)
- *   probability  = softmax_x(score)
- *   ideal[:,h,i] = sum_x probability[x] * V_cache[:,x,kvh].
+ *   score[x]     = scale * dot(q[:,h,i], K_cache[:,x,kvh]),  0 <= x < prefix
+ *   score[j]     = scale * dot(q[:,h,i], k[:,kvh,j]),        c_s <= j <= i
+ *   probability  = softmax over both score sets
+ *   ideal[:,h,i] = sum_x probability[x] * V_cache[:,x,kvh] + sum_j probability[j] * v[:,kvh,j].
  *
- * Every segment sees the whole shared prefix and none of another segment's columns. Cache
- * storage, the numerical contract, and the BF16-cache/INT8-cache compute profiles are those of
- * A1 above. The segment table and the population of [0, prefix) are caller promises that the
- * host does not read; it checks shapes and ranges only. Cache positions outside
- * [prefix, prefix + N) are not modified, and a repeated call on identical inputs is
- * bit-identical. q/k/v/segments/kv_table_rows/out, every cache plane/table, and live workspace
- * suballocations are pairwise non-overlapping. The Op owns no persistent frontier, allocation,
- * request identity, or commit authority.
+ * Every segment sees the whole shared prefix and none of another segment's columns. The prefix
+ * follows the numerical contract and the BF16-cache/INT8-cache compute profiles of A1 above; the
+ * own columns always take the BF16 profile. The segment table and the population of [0, prefix)
+ * are caller promises that the host does not read; it checks shapes and ranges only. No cache
+ * plane is modified, and a repeated call on identical inputs is bit-identical.
+ * q/k/v/segments/kv_table_rows/out, every cache plane/table, and live workspace suballocations are
+ * pairwise non-overlapping. The Op owns no persistent frontier, allocation, request identity, or
+ * commit authority.
  */
 void gqa_attention_segmented(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& segments, const Tensor& kv_table_rows,
