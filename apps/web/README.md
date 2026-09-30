@@ -4,7 +4,9 @@ Observability dashboard for a running `ninfer-serve` instance and both systems i
 generation and System One decisions. It shows throughput, scheduler occupancy and lane work, TTFT
 decomposition, decision latency and state reuse, the shared adapter bank, continuation-cache
 behaviour, VRAM budget, board telemetry, and per-request and per-decision detail, either live or
-replayed from a request log.
+replayed from a request log. A second view, `/playground`, builds and runs System One requests
+against the same server and shows each answer's distribution beside what the engine did for that
+decision.
 
 `docs/dashboard.md` describes what each panel means and how to read it. This file covers building
 and developing the app itself.
@@ -29,9 +31,10 @@ configuration is involved:
   --web-dir apps/web/dist
 ```
 
-The dashboard is then at the server's root. `--request-log-jsonl` is optional for live use — the
-same records reach the browser over `/events` either way — but it is what produces a file the
-dashboard can replay later.
+The dashboard is then at the server's root and the playground at `/playground`. Neither works on a
+server started with `--api-key`, which gates the static files too. `--request-log-jsonl` is
+optional for live use — the same records reach the browser over `/events` either way — but it is
+what produces a file the dashboard can replay later.
 
 ## Development
 
@@ -40,8 +43,8 @@ NINFER_BASE_URL=http://127.0.0.1:8080 bun run dev
 ```
 
 Vite serves on `127.0.0.1:5180` and proxies `/telemetry`, `/events`, `/metrics`, `/slots`,
-`/health`, and `/v1` to the engine, so the development build sees the same same-origin layout as
-production. `NINFER_BASE_URL` is validated rather than defaulted silently: a malformed or
+`/health`, `/v1`, and `/typesafe` to the engine, so the development build sees the same same-origin
+layout as production. `NINFER_BASE_URL` is validated rather than defaulted silently: a malformed or
 path-bearing origin fails the config instead of quietly pointing at the wrong engine. Proxy
 timeouts are disabled because `/events` is an open-ended stream that a long generation can outlast.
 
@@ -50,7 +53,7 @@ timeouts are disabled because `/events` is an open-ended stream that a long gene
 | `bun run dev`          | Vite dev server with the engine proxy          |
 | `bun run build`        | Typecheck, then production bundle into `dist/` |
 | `bun run typecheck`    | `tsc -b` only                                  |
-| `bun test`             | Derivation tests                               |
+| `bun test`             | Derivation and playground tests                |
 | `bun run format`       | Prettier write                                 |
 | `bun run format:check` | Prettier check, for CI or a pre-commit hook    |
 
@@ -82,18 +85,23 @@ shown as a measurement.
 
 ## Layout
 
-| Path                         | Contents                                                              |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `src/lib/records.ts`         | Schema-22 record types and a tolerant line parser                     |
-| `src/lib/telemetry.ts`       | `/telemetry` payload types, cache view from records, Prometheus parse |
-| `src/lib/derive.ts`          | Request and decision analytics, adapter pool, cache partitioning      |
-| `src/lib/engine-client.ts`   | Poll + stream + file replay, and the state they produce               |
-| `src/lib/glossary.ts`        | Definitions behind every tooltip                                      |
-| `src/lib/palette.ts`         | Chart colours, mirroring the CSS custom properties                    |
-| `src/components/echart.tsx`  | ECharts registration, shared theme, React binding                     |
-| `src/components/charts.tsx`  | Band, sample, line, and stacked-bar primitives                        |
-| `src/components/tooltip.tsx` | Portal-positioned tooltips                                            |
-| `src/panels/`                | One file per panel                                                    |
+| Path                          | Contents                                                              |
+| ----------------------------- | --------------------------------------------------------------------- |
+| `src/lib/records.ts`          | Schema-22 record types and a tolerant line parser                     |
+| `src/lib/telemetry.ts`        | `/telemetry` payload types, cache view from records, Prometheus parse |
+| `src/lib/derive.ts`           | Request and decision analytics, adapter pool, cache partitioning      |
+| `src/lib/engine-client.ts`    | Poll + stream + file replay, and the state they produce               |
+| `src/lib/glossary.ts`         | Definitions behind every tooltip                                      |
+| `src/lib/palette.ts`          | Chart colours, mirroring the CSS custom properties                    |
+| `src/lib/route.ts`            | Path routes over `pushState`; the hash is left for share links        |
+| `src/components/echart.tsx`   | ECharts registration, shared theme, React binding                     |
+| `src/components/charts.tsx`   | Band, sample, line, and stacked-bar primitives                        |
+| `src/components/tooltip.tsx`  | Portal-positioned tooltips                                            |
+| `src/components/topbar.tsx`   | Engine identity, connection, replay, and the view switch              |
+| `src/components/decision.tsx` | A decision's phase split, shared by System One panel and playground   |
+| `src/views/Dashboard.tsx`     | The dashboard's panel grid                                            |
+| `src/panels/`                 | One file per panel                                                    |
+| `src/playground/`             | System One playground: request model, checks, answers, engine facts   |
 
 Records are discriminated on `event`, never on `schema_version`, so a log written by an older
 schema still replays: fields a later schema added are declared optional and read as absent.

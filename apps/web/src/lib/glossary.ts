@@ -243,6 +243,18 @@ export const GLOSSARY = {
     title: 'System One prefill',
     body: 'Decision state and branch tokens evaluated over the interval — the System One part of the prefill rate. Chat prefill is the rest. Both share one execution thread, so a burst of cold states shows up as slower chat decode in the same interval.',
   },
+  engineFacts: {
+    title: 'Engine facts',
+    body: 'What the engine did for this exact decision, read from its decision_start and decision_done or decision_error records on /events. The playground sends its own x-typesafe-request-id with every run and the records carry it, so the match is exact. The stream drops records under backpressure and while it reconnects, and a request refused while it is prepared is never logged; the playground says which of those happened.',
+  },
+  answerProbability: {
+    title: 'Probability and confidence',
+    body: 'The headline is the probability of the answer shown: p(true) or p(false) for noul, the chosen option for choice, the most likely level for score. Below 0.60 the answer is flagged uncertain with its runner-up. Choice and score answers also carry kev’s confidence, a spread measure that is 0 at a uniform distribution; noul answers carry none. Probabilities arrive rounded to four decimals.',
+  },
+  kvCodecCaution: {
+    title: 'Rotated KV codec',
+    body: 'Decisions are qualified to kev’s bar (every probability within 0.03 of the evaluation path) on bf16 KV, which int8 also met. The Hadamard-rotated codecs keep task-level quality but miss that bar on a few questions, by at most 0.018 beyond it. The fidelity table is in docs/serving.md, System One fidelity.',
+  },
   laneWork: {
     title: 'Lane work',
     body: 'What a lane is running — a chat generation or a System One decision — and under which adapter. An idle lane keeps the kind of state it retains: a chat session or a decision state, reusable only by the next request of the same kind on the same adapter.',

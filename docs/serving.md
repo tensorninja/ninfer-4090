@@ -741,6 +741,10 @@ decisions in `ninfer:decisions_total`, `ninfer:decision_questions_total`,
 `ninfer:decision_branch_tokens_total`, and `ninfer:decision_execution_seconds_total`; in-flight
 decisions count toward `llamacpp:requests_processing` and `llamacpp:requests_deferred`.
 
+With `--web-dir`, the [playground](dashboard.md#playground) at `/playground` builds and runs these
+requests in a browser and joins each answer to its decision's records through
+`x-typesafe-request-id`.
+
 ### System One fidelity
 
 kev holds a served decision model to two bars (its Kev-27B model card): every question's
@@ -888,7 +892,7 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records; `/events` streams the same records regardless | disabled |
-| `--web-dir DIR` | serve the built dashboard (`apps/web/dist`) from `/` on this port | disabled |
+| `--web-dir DIR` | serve the built dashboard (`apps/web/dist`) from `/` on this port, and its System One playground from `/playground` | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |

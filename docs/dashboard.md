@@ -6,7 +6,9 @@ the engine is doing for both of the systems it serves — chat generation on `/v
 decode rates, whether requests are queueing for a lane, which lanes and adapter slots each system
 holds, where prompts and decision states are being served from, how the VRAM budget is spent, and
 whether the board is the limit. It also loads a `--request-log-jsonl` file to analyze a past
-session offline.
+session offline. A second view, the [playground](#playground) at `/playground`, builds a System One
+request, runs it against the same server, and shows each answer's distribution beside what the
+engine did for that decision.
 
 The application lives in [`apps/web/`](../apps/web/) and is built with Bun, Vite, and React.
 
@@ -30,8 +32,11 @@ Then serve it from the engine itself, same-origin with the API:
 ./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer --web-dir apps/web/dist
 ```
 
-Open `http://127.0.0.1:8080/`. Registered API routes are matched before the static mount, so the
-dashboard cannot shadow an endpoint; any other path resolves to the application shell.
+Open `http://127.0.0.1:8080/`, or `http://127.0.0.1:8080/playground` for the playground. Registered
+API routes are matched before the static mount, so the dashboard cannot shadow an endpoint; any
+other path resolves to the application shell. Neither view works on a server started with
+`--api-key`: the key gates every path except `/health`, the static files included, and a browser
+cannot attach it to a page load.
 
 For development against a running engine:
 
@@ -40,16 +45,16 @@ cd apps/web
 NINFER_BASE_URL=http://127.0.0.1:8080 bun run dev
 ```
 
-The dev server proxies `/telemetry`, `/events`, `/metrics`, `/slots`, `/health`, and `/v1` to that
-origin, so `--cors` is not required. `NINFER_BASE_URL` is validated as an origin and defaults to
-`http://127.0.0.1:8080`.
+The dev server proxies `/telemetry`, `/events`, `/metrics`, `/slots`, `/health`, `/v1`, and
+`/typesafe` to that origin, so `--cors` is not required. `NINFER_BASE_URL` is validated as an
+origin and defaults to `http://127.0.0.1:8080`.
 
 | Command | Purpose |
 |---|---|
 | `bun run dev` | development server on `127.0.0.1:5180` |
 | `bun run build` | typecheck and emit `dist/` |
 | `bun run typecheck` | types only |
-| `bun test` | derivation-layer tests |
+| `bun test` | derivation-layer and playground tests |
 | `bun run format` | Prettier write over the app sources |
 | `bun run format:check` | Prettier check |
 
@@ -276,3 +281,49 @@ Churn and recomputed coverage are summed from the interval deltas the throughput
 carries, rather than by differencing the cumulative endpoints of the window, so a server restart
 inside the window cannot turn a counter reset into a negative or absurd reading. A counter that a
 replayed log predates reads as zero rather than as `NaN` in a total.
+
+## Playground
+
+`/playground` is a console for [System One](serving.md#system-one-decisions): it builds a request,
+sends it to this server's `POST /typesafe/v1/systemone`, and reads every answer back as a
+distribution. Switching to the dashboard and back keeps the request and any run in flight. A run is
+never cancelled, because the server would log an abandoned decision as a 499.
+
+**Request.** The state is edited as name/value fields or as any JSON value, and the questions as
+cards or as JSON. The body is serialized from the parsed JSON, never from JavaScript numbers, so
+number spellings, key order, and integers beyond 2^53 reach the server as typed. The checks follow
+kev's schema. What it rejects is an error that blocks Run: JSON that does not parse, no questions, a
+missing or unknown type, `choice` criteria that are not an object of 1 to 255 options, `score`
+criteria that are not a list of 1 to 255 levels. What it accepts but is probably a mistake is a
+warning, such as a repeated key (the last one counts), an empty key or label, a question without
+instructions, an empty state, or a model the server does not list. F8 steps through both, and `?`
+lists the keyboard shortcuts. Token budgets are left to the server.
+
+**Models.** The picker lists `GET /typesafe/v1/models`, read once per page load. A new request
+leaves `model` out, so the server's `jev-latest` alias answers. On a rotated KV codec (`rk*`) the
+picker adds a caution: decisions there keep task-level quality but are not qualified to kev's 0.03
+bar, which `bf16` is ([System One fidelity](serving.md#system-one-fidelity)).
+
+**Answers.** The headline is the probability of the answer shown: p(true) or p(false) for `noul`,
+the chosen option for `choice`, the most likely level for `score`. Below 0.60 the answer is flagged
+uncertain and names its runner-up. kev's `confidence` is shown under the distribution for `choice`
+and `score`; `noul` carries none. A failed run says what its status means. kev's question union
+reports a 422 once per question type, so the list is folded to the type that was sent, and each
+location jumps to the text it names. The JSON view shows the raw body; the Code view gives the
+current request as curl and as TypeSafe SDK Python.
+
+**Engine facts.** Every run sends its own `x-typesafe-request-id`, and the decision's records on
+`/events` carry it, so each run shows what the engine did for that exact decision: state tokens
+reused and where from (a lane, L2, or L3) against those computed, branch passes, the lane, and the
+wait/restore/state/branch split. When no record arrives the run says why: the server refused the
+request while preparing it, which logs nothing; the stream dropped the record; or the dashboard is
+replaying a file instead of following the live stream. Playground runs appear in the System One
+panel like any other decision.
+
+**Sharing and drafts.** Copy link puts the whole request in the URL fragment (`#r=`, base64url of
+the body text), which is never sent to a server. The editors' text is kept in the browser as a
+draft, invalid or not, and restored on the next visit; a link takes precedence over `?preset=`,
+which takes precedence over the draft, and `?model=` picks the model on top of either.
+
+The presets are the examples of [laya](https://github.com/NandhaKishorM/laya)'s playground
+(Apache-2.0), rewritten as System One requests, and the editor and answer views follow its design.

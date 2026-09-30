@@ -23,7 +23,7 @@ function engineOrigin() {
 
 // Every path the engine owns. In production the dashboard is same-origin behind --web-dir, so
 // these are proxied only to make `bun run dev` behave identically without requiring --cors.
-const enginePaths = ['/telemetry', '/events', '/metrics', '/slots', '/health', '/v1']
+const enginePaths = ['/telemetry', '/events', '/metrics', '/slots', '/health', '/v1', '/typesafe']
 
 export default defineConfig(({ command, mode }) => {
   const developmentServer = command === 'serve' && mode === 'development'

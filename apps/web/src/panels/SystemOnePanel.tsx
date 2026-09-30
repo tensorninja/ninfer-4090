@@ -1,14 +1,8 @@
 import { Legend, StackedBar } from '../components/charts'
-import { CHART } from '../components/echart'
+import { DECISION_PHASES as PHASES, DecisionWaterfall } from '../components/decision'
 import { Term, Tooltip } from '../components/tooltip'
 import { Empty, Panel, Pill, Stat } from '../components/ui'
-import {
-  decisionLatency,
-  decisionPhases,
-  SOURCE_COLOR,
-  type DecisionSummary,
-  type PoolEntry,
-} from '../lib/derive'
+import { decisionLatency, SOURCE_COLOR, type DecisionSummary, type PoolEntry } from '../lib/derive'
 import { clock, count, percent, rate, seconds } from '../lib/format'
 import type {
   DecisionDoneRecord,
@@ -16,51 +10,6 @@ import type {
   DecisionStartRecord,
   SystemOneSurface,
 } from '../lib/records'
-
-const PHASES = [
-  {
-    key: 'wait',
-    label: 'wait',
-    color: CHART.warning,
-    hint: 'Waiting in the bounded FIFO for a lane. Chat and System One share the lanes, so this is where the two systems contend.',
-  },
-  {
-    key: 'restore',
-    label: 'restore',
-    color: CHART.blue,
-    hint: 'Importing a cached state from host memory (L2) or disk (L3).',
-  },
-  {
-    key: 'state',
-    label: 'state',
-    color: CHART.violet,
-    hint: 'Prefilling the state tokens that no lane or tier already held.',
-  },
-  {
-    key: 'branch',
-    label: 'branches',
-    color: CHART.systemOne,
-    hint: 'The branch passes, one per packed group of questions, with their readout and the pointer head.',
-  },
-] as const
-
-/** Per-decision phase split, on the same colours as the summary bar. */
-function Waterfall({ record }: { record: DecisionDoneRecord }) {
-  const phases = decisionPhases(record)
-  const total = phases.wait + phases.restore + phases.state + phases.branch
-  return (
-    <StackedBar
-      height={5}
-      segments={PHASES.map((phase) => ({
-        label: phase.label,
-        value: phases[phase.key],
-        color: phase.color,
-        hint: phase.hint,
-        display: `${seconds(phases[phase.key])} of ${seconds(total)}`,
-      }))}
-    />
-  )
-}
 
 /** Everything the record knows about one decision, shown on its timestamp. */
 function detail(record: DecisionDoneRecord): string {
@@ -282,7 +231,7 @@ export function SystemOnePanel({
                     <td className="numeric">{count(request.branch_tokens)}</td>
                     <td className="numeric emphasis">{seconds(decisionLatency(record))}</td>
                     <td>
-                      <Waterfall record={record} />
+                      <DecisionWaterfall record={record} />
                     </td>
                   </tr>
                 )

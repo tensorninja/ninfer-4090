@@ -160,8 +160,10 @@ image name, as in the [quick start](#quick-start-linux) profiles.
 The engine serves its own [dashboard](docs/dashboard.md) on the API port — no second process, no
 exporter, no time-series database. It shows both systems: System One decisions with their latency
 split and state reuse beside chat requests, which lanes run chat or decision work under which
-adapter, the adapter bank's live residency, and prefill split between the two. The screenshots and
-recordings below predate the System One view.
+adapter, the adapter bank's live residency, and prefill split between the two. A second view,
+[`/playground`](docs/dashboard.md#playground), builds and runs System One requests against the same
+server and shows each answer's distribution beside what the engine did for that decision. The
+screenshots and recordings below predate both System One views.
 
 ![NInfer dashboard under a light agent workload: three lanes with one running, reuse served from
 resident VRAM, and an empty disk cache tier.](media/dashboard-steady.png)

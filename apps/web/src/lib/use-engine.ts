@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { EngineClient, initialEngineState, type EngineState } from './engine-client'
 
@@ -28,11 +28,16 @@ export function useEngine(): EngineHandle {
     }
   }, [])
 
-  return {
-    state,
-    loadFile: async (file: File) => {
-      clientRef.current!.loadFile(file.name, await file.text())
-    },
-    resumeLive: () => clientRef.current!.resumeLive(),
-  }
+  // Stable across renders, so a memoized view that takes them does not re-render on every poll.
+  const actions = useMemo(
+    () => ({
+      loadFile: async (file: File) => {
+        clientRef.current!.loadFile(file.name, await file.text())
+      },
+      resumeLive: () => clientRef.current!.resumeLive(),
+    }),
+    [],
+  )
+
+  return { state, ...actions }
 }

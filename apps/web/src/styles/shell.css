@@ -42,6 +42,34 @@
   gap: 7px;
 }
 
+/* The two views: the dashboard and the System One playground. */
+.topbar__nav {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.topbar__nav a {
+  padding: 2px 9px;
+  border-radius: 2px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.topbar__nav a:hover {
+  color: var(--text);
+}
+
+.topbar__nav a[aria-current='page'] {
+  background: var(--line-soft);
+  color: var(--text);
+}
+
 /* Glance row: the readings that answer "is anything wrong" without scrolling. */
 .headline {
   display: grid;
