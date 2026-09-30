@@ -699,6 +699,9 @@ when the flag is unset; with several decision adapters and no flag it is unbound
 `model` is the adapter that answered, not the alias. Generative adapters and the base model are not
 System One models, and decision adapters are not OpenAI or Anthropic models.
 
+A `noul` answer is `{"type": "noul", "noul": p}` and carries no `confidence`; `choice` answers
+(`choice`, `confidence`, `probabilities`) and `score` answers (`score`, `legend`, `probabilities`,
+`confidence`) do, as in TypeSafe's API.
 `usage.input_tokens` counts the state and every question branch; `usage.output_tokens` is the token
 count of the answers' Python `json.dumps` text. `latency_ms` is the engine's time on the decision,
 to 0.1 ms: the restore of a cached state image, if any, plus execution from admission to result,
