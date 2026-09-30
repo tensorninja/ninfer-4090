@@ -55,8 +55,8 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
-| `POST /systemone/v1/systemone` | [System One](#system-one-decisions) decision answered by a decision adapter |
-| `GET /systemone/v1/models` | System One model cards: each decision adapter, then the bound `jev-latest` alias |
+| `POST /typesafe/v1/systemone` | [System One](#system-one-decisions) decision answered by a decision adapter |
+| `GET /typesafe/v1/models` | System One model cards: each decision adapter, then the bound `jev-latest` alias |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
@@ -104,7 +104,7 @@ reduced free memory. `adapters` carries:
 | `slot_waits` | requests whose admission waited because every slot was pinned by a running lane using another adapter |
 
 A generative adapter's `model_id` is `<model>-<name>` on `/v1`; a decision adapter's is its bare
-name on `/systemone`. The pool comes from the load summary rather than from served model ids, so an
+name on `/typesafe`. The pool comes from the load summary rather than from served model ids, so an
 adapter that has taken no traffic is still reported. `systemone` carries `supported` (the target
 can answer decisions), `alias` (`jev-latest`), and `binding`, the decision adapter the alias
 resolves to, empty when it is unbound.
@@ -674,13 +674,15 @@ never sample, decode, or draft. Qwen3.6-35B-A3B has no adapter pool and serves n
   --lora-dir lora --systemone-default decider --max-context 16384
 ```
 
-The routes live under their own base path, so the root `/v1/models` stays OpenAI's. Point the
-TypeSafe SDK at it with `base_url`; the SDK requires a key even for an open server:
+TypeSafe's `GET /v1/models` shares OpenAI's path but not its body, so the System One routes live
+under `/typesafe`, the base path Vercel AI Gateway also gives the TypeSafe API beside its OpenAI-
+and Anthropic-compatible ones, and the root `/v1/models` stays OpenAI's. Point the TypeSafe SDK at
+it with `base_url`; the SDK requires a key even for an open server:
 
 ```python
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
 
-client = TypeSafeClient(api_key="local", base_url="http://127.0.0.1:8080/systemone")
+client = TypeSafeClient(api_key="local", base_url="http://127.0.0.1:8080/typesafe")
 result = client.system_one(
     state="I was charged twice this month. Please refund one charge before Friday.",
     questions={
@@ -721,7 +723,7 @@ with 422 and a `detail` string.
 | 503 | the pending deadline passed; same retry headers |
 | 500 | an internal error, `{"detail": "Internal Server Error"}` |
 
-Every response under `/systemone/`, errors included, carries `x-typesafe-request-id`: the request's
+Every response under `/typesafe/`, errors included, carries `x-typesafe-request-id`: the request's
 own value when it sends one, otherwise a fresh uuid4 hex. A repeated state is not recomputed: it
 continues from a lane that retained it or, once no lane does, is restored from the exact-state image
 its first decision published to the L2/L3 continuation tiers
@@ -857,7 +859,7 @@ curl http://127.0.0.1:8080/v1/models \
 ```
 
 Every HTTP response, including errors and SSE, carries `x-request-id`. HTTP 429 overload and HTTP
-503 queue-timeout responses also carry `Retry-After: 1`. Under `/systemone/`, a missing or wrong
+503 queue-timeout responses also carry `Retry-After: 1`. Under `/typesafe/`, a missing or wrong
 key is answered in System One's shape (`{"detail": ...}` with `www-authenticate: Bearer`), and
 every response also carries `x-typesafe-request-id`. `--cors` adds permissive browser headers,
 allows unauthenticated `OPTIONS` preflight, permits SDK authentication/content headers, and exposes

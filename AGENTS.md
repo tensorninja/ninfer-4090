@@ -127,7 +127,7 @@ Merging into base weights, rescanning the directory after startup, and adapters 
 The 27B target also answers System One decisions, TypeSafe's classification API, with kev's
 semantics. A decision adapter is a LoRA adapter plus a pointer head (converted with
 `--decision-head`); it lives in the same pool and slots as generative adapters and is selected per
-request by model name on the `/systemone/v1/*` surface, in the same process and weights as chat.
+request by model name on the `/typesafe/v1/*` surface, in the same process and weights as chat.
 A decision is a prefill-only request (the state, then one branch per question, each continuing the
 state alone) whose readouts feed the pointer head; it never samples, decodes or drafts. Decisions
 are qualified to kev's per-question serving tolerance on BF16 KV; the other codecs serve them with

@@ -116,21 +116,20 @@ std::string event_frame(std::string_view event, std::string_view payload) {
 // Paths owned by the API. Everything else, under --web-dir, belongs to the dashboard's own
 // client-side router and resolves to the application shell.
 bool is_api_path(const std::string& path) {
-    static constexpr std::string_view kPrefixes[] = {"/v1/",      "/systemone/", "/slots",
-                                                     "/metrics",  "/health",     "/telemetry",
-                                                     "/events"};
+    static constexpr std::string_view kPrefixes[] = {"/v1/",    "/typesafe/", "/slots", "/metrics",
+                                                     "/health", "/telemetry", "/events"};
     for (const std::string_view prefix : kPrefixes) {
         if (path.rfind(prefix, 0) == 0) { return true; }
     }
     return false;
 }
 
-// The System One base path. Every response under it, errors included, speaks FastAPI's
-// {"detail": ...} shape and carries x-typesafe-request-id.
-bool is_systemone_path(const std::string& path) { return path.rfind("/systemone/", 0) == 0; }
+// The TypeSafe API's base path, where the System One routes live. Every response under it, errors
+// included, speaks FastAPI's {"detail": ...} shape and carries x-typesafe-request-id.
+bool is_typesafe_path(const std::string& path) { return path.rfind("/typesafe/", 0) == 0; }
 
 void ensure_typesafe_request_id(const httplib::Request& req, httplib::Response& res) {
-    if (!is_systemone_path(req.path) || res.has_header("x-typesafe-request-id")) { return; }
+    if (!is_typesafe_path(req.path) || res.has_header("x-typesafe-request-id")) { return; }
     const std::string incoming = req.get_header_value("x-typesafe-request-id");
     res.set_header("x-typesafe-request-id",
                    incoming.empty() ? new_typesafe_request_id() : incoming);
@@ -652,7 +651,7 @@ void HttpServer::register_routes() {
         ensure_request_id(res);
         ensure_typesafe_request_id(req, res);
         // A status no System One route answered itself (an unknown path, an oversized body).
-        if (is_systemone_path(req.path)) {
+        if (is_typesafe_path(req.path)) {
             if (res.body.empty()) {
                 write_systemone_error(res, res.status, systemone_status_detail(res.status));
             }
@@ -720,7 +719,7 @@ void HttpServer::register_routes() {
             req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
         const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
         if (!bearer_ok && !x_api_key_ok) {
-            if (is_systemone_path(req.path)) {
+            if (is_typesafe_path(req.path)) {
                 res.set_header("www-authenticate", "Bearer");
                 write_systemone_error(
                     res, 401, "missing or invalid API key; send Authorization: Bearer <key>");
@@ -750,7 +749,7 @@ void HttpServer::register_routes() {
         [](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
             ensure_request_id(res);
             ensure_typesafe_request_id(req, res);
-            if (is_systemone_path(req.path)) {
+            if (is_typesafe_path(req.path)) {
                 try {
                     std::rethrow_exception(ep);
                 } catch (const std::exception& e) {
@@ -884,13 +883,13 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
-    // System One (TypeSafe) under its own base path: SDK clients set
-    // base_url=http://host:port/systemone, and the root /v1/models stays OpenAI's.
-    server_.Get("/systemone/v1/models",
-                [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_systemone_models(req, res);
-                });
-    server_.Post("/systemone/v1/systemone",
+    // System One under /typesafe, where Vercel AI Gateway also mounts TypeSafe's API beside the
+    // OpenAI and Anthropic ones: SDK clients set base_url=http://host:port/typesafe. TypeSafe's
+    // GET /v1/models body is not OpenAI's, so the root /v1/models stays OpenAI's.
+    server_.Get("/typesafe/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_systemone_models(req, res);
+    });
+    server_.Post("/typesafe/v1/systemone",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_systemone(req, res);
                  });
@@ -1601,7 +1600,7 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     // Only generative adapters are OpenAI/Anthropic models; decision adapters are System One
-    // models and are served under the `/systemone` prefix.
+    // models and are served under the `/typesafe` prefix.
     adapter_names_.clear();
     adapter_model_ids_.clear();
     for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {

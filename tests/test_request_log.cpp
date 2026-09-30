@@ -147,7 +147,7 @@ int main() {
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     // The pool in pool order, each adapter with its kind and the model id that selects it: a chat
-    // model on /v1, or a System One model with its calibration on /systemone.
+    // model on /v1, or a System One model with its calibration on /typesafe.
     const Json& pool = server.at("adapters").at("pool");
     failures +=
         check(server.at("adapters").at("count") == 3 && pool.size() == 3, "adapter pool missing");

@@ -5,7 +5,7 @@ generative one). The wire contract the SDK does not exercise is checked over raw
 chat reply (through the generative adapter when one is given) must stay bit-identical while
 decisions run beside it. Then this file re-runs itself under each `--sdk-python` interpreter (a
 virtual environment with one `typesafe-sdk` version installed) and drives the SDK's own client against
-`base_url=http://host:port/systemone`: models.list, system_one with all three question types by
+`base_url=http://host:port/typesafe`: models.list, system_one with all three question types by
 object and by dictionary, the default-model alias, a 401, a 404 and a server-side 422.
 """
 
@@ -105,32 +105,32 @@ def check_wire(base_url: str, adapter: str, generative: str | None, model_id: st
         "questions": {"billing": {"type": "noul", "instructions": "Is this about billing?"}},
     }
 
-    status, headers, body = http(base_url, "GET", "/systemone/v1/models")
+    status, headers, body = http(base_url, "GET", "/typesafe/v1/models")
     require(status == 401, f"an unauthenticated models request returned {status}")
     require(isinstance(body, dict) and isinstance(body.get("detail"), str), f"401 body {body!r}")
     require(headers.get("www-authenticate") == "Bearer", "401 lacks www-authenticate: Bearer")
     require(re.fullmatch(r"[0-9a-f]{32}", headers.get("x-typesafe-request-id", "")) is not None,
             "a generated x-typesafe-request-id is not uuid4 hex")
 
-    status, headers, body = http(base_url, "POST", "/systemone/v1/systemone", request,
+    status, headers, body = http(base_url, "POST", "/typesafe/v1/systemone", request,
                                  authorized({"x-typesafe-request-id": "smoke-echo-1"}))
     require(status == 200, f"a decision returned {status}: {body!r}")
     require(headers.get("x-typesafe-request-id") == "smoke-echo-1", "request id was not echoed")
     require(list(body) == ["model", "answers", "usage", "latency_ms"], f"body keys {list(body)}")
     require(body["model"] == adapter, f"response model {body['model']!r} is not {adapter!r}")
 
-    status, headers, body = http(base_url, "POST", "/systemone/v1/systemone",
+    status, headers, body = http(base_url, "POST", "/typesafe/v1/systemone",
                                  {"model": adapter, "questions": request["questions"]}, authorized())
     require(status == 422 and isinstance(body.get("detail"), list), f"missing state: {status} {body!r}")
     require(body["detail"][0]["loc"] == ["body", "state"], f"422 loc {body['detail'][0]!r}")
     require("x-typesafe-request-id" in headers, "a 422 lacks x-typesafe-request-id")
 
-    status, _, body = http(base_url, "POST", "/systemone/v1/systemone", raw_body=b"{",
+    status, _, body = http(base_url, "POST", "/typesafe/v1/systemone", raw_body=b"{",
                            headers=authorized())
     require(status == 422 and body["detail"][0]["type"] == "json_invalid",
             f"undecodable JSON: {status} {body!r}")
 
-    status, headers, body = http(base_url, "GET", "/systemone/v1/unknown", headers=authorized())
+    status, headers, body = http(base_url, "GET", "/typesafe/v1/unknown", headers=authorized())
     require(status == 404 and body == {"detail": "Not Found"}, f"unknown route: {status} {body!r}")
     require("x-typesafe-request-id" in headers, "a route 404 lacks x-typesafe-request-id")
 
@@ -146,7 +146,7 @@ def check_wire(base_url: str, adapter: str, generative: str | None, model_id: st
     require(status == 404, f"chat accepted the decision adapter: {status} {body!r}")
 
     if generative is not None:
-        status, _, body = http(base_url, "POST", "/systemone/v1/systemone",
+        status, _, body = http(base_url, "POST", "/typesafe/v1/systemone",
                                {**request, "model": generative}, authorized())
         require(status == 404 and isinstance(body.get("detail"), str),
                 f"System One accepted the generative adapter: {status} {body!r}")
@@ -175,7 +175,7 @@ def check_chat_under_decisions(base_url: str, chat_model: str, adapter: str) -> 
                                               "instructions": "How urgent is this?",
                                               "criteria": ["Can wait", "This week", "Today"]}}}
             started = time.monotonic()
-            code, _, _ = http(base_url, "POST", "/systemone/v1/systemone", body, authorized())
+            code, _, _ = http(base_url, "POST", "/typesafe/v1/systemone", body, authorized())
             decisions.append((started, time.monotonic(), code))
             index += 1
 
@@ -205,7 +205,7 @@ def run_sdk_client(base_url: str, adapter: str) -> dict[str, Any]:
     """Client mode: runs under an interpreter with one typesafe-sdk version installed."""
     import typesafe_sdk as ts
 
-    base = base_url + "/systemone"
+    base = base_url + "/typesafe"
     no_retry = ts.RetryPolicy(max_retries=0)
     client = ts.TypeSafeClient(api_key=API_KEY, base_url=base, retry=no_retry, timeout=600.0)
 

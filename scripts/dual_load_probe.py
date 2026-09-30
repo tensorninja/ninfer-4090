@@ -125,7 +125,7 @@ class Probe:
     def decide(self, state, questions):
         request_id = uuid.uuid4().hex
         payload = {"model": self.args.decision_model, "state": state, "questions": questions}
-        status, _, body = call(self.root + "/systemone/v1/systemone", self.args.api_key, payload,
+        status, _, body = call(self.root + "/typesafe/v1/systemone", self.args.api_key, payload,
                                self.args.timeout, {"x-typesafe-request-id": request_id})
         record = self.log.wait(request_id)
         if status != 200 or record["event"] != "decision_done":

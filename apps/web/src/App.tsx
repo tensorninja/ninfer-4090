@@ -82,7 +82,7 @@ export function App() {
                 ...(systemOne || surface?.supported
                   ? [
                       {
-                        label: `System One /systemone${
+                        label: `System One /typesafe${
                           surface?.binding ? ` → ${surface.binding}` : ''
                         }`,
                         color: KIND_COLOR.decision,

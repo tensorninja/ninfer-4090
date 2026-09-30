@@ -256,7 +256,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="http://127.0.0.1:8080",
-                        help="server root; requests go to <url>/systemone/v1/systemone")
+                        help="server root; requests go to <url>/typesafe/v1/systemone")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--model", default="jev-latest")
     parser.add_argument("--log", default="/tmp/ninfer-reqlog.jsonl",
@@ -272,7 +272,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", default="", help="also write every row and summary here")
     args = parser.parse_args()
-    args.endpoint = args.url.rstrip("/") + "/systemone/v1/systemone"
+    args.endpoint = args.url.rstrip("/") + "/typesafe/v1/systemone"
 
     log = RequestLog(args.log)
     words = corpus()

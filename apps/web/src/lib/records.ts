@@ -9,7 +9,7 @@
 // replays: fields added by a later schema are declared optional and read as absent.
 //
 // One process serves two systems. Chat (OpenAI/Anthropic, `request_*`) generates text; System
-// One (`/systemone`, `decision_*`, schema 21 on) answers multiple-choice questions over a state
+// One (`/typesafe`, `decision_*`, schema 21 on) answers multiple-choice questions over a state
 // with a prefill-only pass. Both run on the same weights, lanes, KV pool and adapter bank.
 
 export interface RequestContext {
@@ -100,7 +100,7 @@ export interface SpeculativeStats {
 
 /**
  * A chat adapter corrects generation and is selected on `/v1` and the Anthropic route; a decision
- * adapter adds a System One pointer head and is selected on `/systemone`. Both kinds share one
+ * adapter adds a System One pointer head and is selected on `/typesafe`. Both kinds share one
  * pool and one device bank.
  */
 export type AdapterKind = 'generative' | 'decision'

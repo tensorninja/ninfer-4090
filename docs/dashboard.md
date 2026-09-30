@@ -2,7 +2,7 @@
 
 An optional single-page dashboard for one running `ninfer-serve`. It answers, at a glance, what
 the engine is doing for both of the systems it serves — chat generation on `/v1` and
-[System One](serving.md#system-one-decisions) decisions on `/systemone` — current prefill and
+[System One](serving.md#system-one-decisions) decisions on `/typesafe` — current prefill and
 decode rates, whether requests are queueing for a lane, which lanes and adapter slots each system
 holds, where prompts and decision states are being served from, how the VRAM budget is spent, and
 whether the board is the limit. It also loads a `--request-log-jsonl` file to analyze a past

@@ -67,7 +67,7 @@ private:
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_telemetry(const httplib::Request& req, httplib::Response& res) const;
     void handle_events(const httplib::Request& req, httplib::Response& res);
-    // System One (TypeSafe) routes under the /systemone base path.
+    // System One (TypeSafe) routes under the /typesafe base path.
     void handle_systemone(const httplib::Request& req, httplib::Response& res);
     void handle_systemone_models(const httplib::Request& req, httplib::Response& res) const;
 

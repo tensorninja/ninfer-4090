@@ -325,7 +325,7 @@ Writes a `<out>.conversion.json` report mirroring `tools/convert/qwen3_8/common/
 
 An adapter has one of two kinds under the same `qwen3.8-27b/lora-bf16` identity. A **generative**
 adapter carries only the factors above and serves chat. A **decision** adapter additionally carries
-the System One pointer head and serves only `/systemone` decisions; each kind is rejected on the
+the System One pointer head and serves only `/typesafe` decisions; each kind is rejected on the
 other's route. The kind is the presence of the head: all five objects below are present together or
 not at all, and the binder rejects a partial set.
 
@@ -355,7 +355,7 @@ q = Wq h_decide + bq,   k_i = Wk h_option_i + bk,   p = softmax_i((k_i . q) / (1
 | `readout` | `final_norm` |
 | `escape` | `kev-v1`: `<\|name\|>` in rendered text becomes `<¦name¦>` before tokenization |
 | `delimiters` | role → token: `state` `<\|fim_prefix\|>`, `question` `<\|fim_middle\|>`, `option_open` `<\|box_start\|>`, `option_close` `<\|box_end\|>`, `decide` `<\|fim_suffix\|>` |
-| `description`, `release_date` | served on `GET /systemone/v1/models`; `release_date` is `YYYY-MM-DD` |
+| `description`, `release_date` | served on `GET /typesafe/v1/models`; `release_date` is `YYYY-MM-DD` |
 | `base_model` | the trainer's base checkpoint, recorded for provenance |
 
 The engine resolves the delimiter names through the base tokenizer at load and rejects an adapter

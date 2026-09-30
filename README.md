@@ -30,7 +30,7 @@ kept and restored the way a conversation's prefix is.
 ```mermaid
 flowchart LR
     chat["System Two: chat<br/>/v1/chat/completions, /v1/responses, /v1/messages"] --> fifo
-    decide["System One: decisions<br/>/systemone/v1/systemone"] --> fifo
+    decide["System One: decisions<br/>/typesafe/v1/systemone"] --> fifo
     fifo["one bounded FIFO<br/>one scheduler"] --> lanes["1-8 lanes<br/>one paged KV pool"]
     weights["Qwen3.8-27B weights<br/>16.67 GiB, resident once"] --- lanes
     bank["LoRA bank<br/>--lora-slots device slabs"] --- lanes
@@ -41,7 +41,7 @@ flowchart LR
 
 | | System One: decisions | System Two: chat |
 |---|---|---|
-| API | `POST /systemone/v1/systemone`; the TypeSafe SDK 0.6 and 0.7 work unchanged | OpenAI Chat Completions and Responses, Anthropic Messages |
+| API | `POST /typesafe/v1/systemone`; the TypeSafe SDK 0.6 and 0.7 work unchanged | OpenAI Chat Completions and Responses, Anthropic Messages |
 | `model` selects | a decision adapter; `jev-latest` answers with the default one | the base weights or a generative adapter |
 | GPU work | prefill only: the state once, then one branch per question continuing it | prefill, then decode rounds that draft and verify with MTP |
 | Returns | an answer and calibrated option probabilities per question | streamed text, reasoning, and tool calls |
@@ -111,7 +111,7 @@ let machine run more instructions at once, matey.
 System One, from the same process and weights, through the pool's decision adapter:
 
 ```bash
-curl -s http://127.0.0.1:8080/systemone/v1/systemone -H 'content-type: application/json' -d '{
+curl -s http://127.0.0.1:8080/typesafe/v1/systemone -H 'content-type: application/json' -d '{
   "state": "I was charged twice this month. Please refund one charge before Friday.",
   "questions": {
     "billing": {"type": "noul", "instructions": "Is this message about billing?"},
@@ -131,7 +131,7 @@ curl -s http://127.0.0.1:8080/systemone/v1/systemone -H 'content-type: applicati
  "usage": {"input_tokens": 58, "output_tokens": 150}, "latency_ms": 105.9}
 ```
 
-The TypeSafe SDK needs only `base_url="http://127.0.0.1:8080/systemone"`; see
+The TypeSafe SDK needs only `base_url="http://127.0.0.1:8080/typesafe"`; see
 [System One decisions](docs/serving.md#system-one-decisions) for the SDK example, the routes and the
 error contract. In the Docker image, mount the adapter directory and pass the same flags after the
 image name, as in the [quick start](#quick-start-linux) profiles.
@@ -204,7 +204,7 @@ being waited on.
 The work specific to this branch, each with the measurement that established it:
 
 - **One model, two systems.** One process answers TypeSafe's System One protocol (`noul`, `choice`
-  and `score` questions over one state) under `/systemone` beside OpenAI- and Anthropic-compatible
+  and `score` questions over one state) under `/typesafe` beside OpenAI- and Anthropic-compatible
   chat, on one resident copy of the weights, one KV pool and one LoRA bank. A decision adapter — a
   LoRA adapter plus a calibrated pointer head — answers six questions on a retained 8K-token state
   in 101 ms by prefill alone. It never samples or decodes, and reproduces kev's request rendering,
@@ -788,7 +788,7 @@ same pool options are available in the CLI, where `--adapter NAME` selects one a
 - **Decision adapters in the same bank.** A System One decision adapter is a LoRA adapter plus a
   pointer head, converted with `convert_lora.py --decision-head`. It is pooled, staged and evicted
   like a generative adapter; when the pool holds one, every slot reserves a 5 MiB region for a head.
-  Its name answers only under `/systemone`, and generative adapters and the base model answer only
+  Its name answers only under `/typesafe`, and generative adapters and the base model answer only
   through the chat APIs. See [One model, two systems](#one-model-two-systems).
 - **Measured cost.** With one adapter selected, prefill runs at 3,307 tok/s on a 9,411-token prompt
   and 3,017 tok/s on 37,798, against 3,601 and 3,247 for a base request in the same process — about
@@ -911,7 +911,7 @@ switch with the thinking mode.
 OpenAI Chat Completions, OpenAI Responses with streaming and local continuation state, Anthropic
 Messages, prompt-rendered function tools with parsed tool calls, compatible-prefix reuse, and
 JSONL request logs — and, from the same process, TypeSafe's System One decisions under
-`/systemone` for the TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
+`/typesafe` for the TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
 [System One decisions](docs/serving.md#system-one-decisions) and [CLI usage](docs/cli.md).
 
 ## Upstream and credits

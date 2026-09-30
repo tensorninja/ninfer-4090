@@ -188,7 +188,7 @@ export function SystemOnePanel({
       </div>
 
       {summary.count === 0 ? (
-        <Empty>no decisions yet — POST /systemone/v1/systemone</Empty>
+        <Empty>no decisions yet — POST /typesafe/v1/systemone</Empty>
       ) : (
         <>
           <div className="latency__split">

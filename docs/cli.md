@@ -111,7 +111,7 @@ long-decode, and long-context inputs.
 
 `--systemone FILE` answers TypeSafe System One request bodies with the decision adapters of the
 `--lora-dir` pool, exactly as the server's
-[`POST /systemone/v1/systemone`](serving.md#system-one-decisions) does. `-` reads stdin, and
+[`POST /typesafe/v1/systemone`](serving.md#system-one-decisions) does. `-` reads stdin, and
 `--systemone-jsonl` treats each nonblank line as one request:
 
 ```bash

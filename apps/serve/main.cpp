@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
                 const std::string binding = server.systemone_alias_binding();
                 ninfer::serve::write_console_log(
                     ninfer::serve::ConsoleLogLevel::Info,
-                    "System One: POST /systemone/v1/systemone, default model " +
+                    "System One: POST /typesafe/v1/systemone, default model " +
                         std::string(ninfer::product::systemone::kDefaultModel) + " -> " +
                         (binding.empty() ? std::string("unbound (pass --systemone-default)")
                                          : binding));

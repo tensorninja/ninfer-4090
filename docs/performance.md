@@ -723,7 +723,7 @@ Decisions were measured on the same card and toolchain with the decision adapter
 `systemone-decision-v7` (rank 16 on the six registered modules, plus its pointer head). The KV
 cache was BF16, the configuration decisions are qualified on
 ([System One fidelity](serving.md#system-one-fidelity)), with one lane and a 73,728-token context.
-`scripts/decision_probe.py` drives `/systemone/v1/systemone` and reads every decision's
+`scripts/decision_probe.py` drives `/typesafe/v1/systemone` and reads every decision's
 `decision_done` record. Latency is the response's `latency_ms`: the restore of a cached state, if
 any, plus execution, which splits into state and branch time. A point is a state of pseudo-text
 calibrated to a token count, and Q questions that cycle `noul`, a four-option `choice`, and a

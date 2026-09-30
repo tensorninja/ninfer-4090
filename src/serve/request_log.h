@@ -36,7 +36,7 @@ inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log
 // (`count`, `rank`, `slots`, `device_bytes`, `file_bytes`) and `pool`, every discovered adapter in
 // pool order with its kind and the model id that selects it. A generative adapter is the chat
 // model `<public model id>-<name>` on /v1; a decision adapter is the System One model `<name>` on
-// /systemone and carries its calibration and model-card fields.
+// /typesafe and carries its calibration and model-card fields.
 [[nodiscard]] nlohmann::json adapter_inventory_json(const ninfer::LoadSummary& load,
                                                     const std::string& public_model_id);
 // The System One surface: whether the target serves decisions, and the decision adapter the

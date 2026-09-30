@@ -209,7 +209,7 @@ export const GLOSSARY = {
   // --- System One --------------------------------------------------------------------------
   systemOne: {
     title: 'System One',
-    body: 'TypeSafe’s classification API, served under /systemone with kev’s semantics. A decision is one state and a set of typed questions: the engine prefills the state once, then one branch per question that sees the state and itself, and a pointer head turns the readouts at each option into calibrated probabilities. It is prefill-only — it never samples, decodes or drafts — and runs on the same weights, lanes, KV pool and adapter bank as chat.',
+    body: 'TypeSafe’s classification API, served under /typesafe with kev’s semantics. A decision is one state and a set of typed questions: the engine prefills the state once, then one branch per question that sees the state and itself, and a pointer head turns the readouts at each option into calibrated probabilities. It is prefill-only — it never samples, decodes or drafts — and runs on the same weights, lanes, KV pool and adapter bank as chat.',
   },
   decisionLatency: {
     title: 'Decision latency',
@@ -229,7 +229,7 @@ export const GLOSSARY = {
   },
   decisionAdapter: {
     title: 'Decision adapter',
-    body: 'A LoRA adapter plus a pointer head, converted with --decision-head. It is a System One model named by its file stem, selected on /systemone and refused on the chat routes, just as a chat adapter is refused on /systemone.',
+    body: 'A LoRA adapter plus a pointer head, converted with --decision-head. It is a System One model named by its file stem, selected on /typesafe and refused on the chat routes, just as a chat adapter is refused on /typesafe.',
   },
   chatAdapter: {
     title: 'Chat adapter',
