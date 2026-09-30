@@ -1156,6 +1156,16 @@ structured request log, as `finish_reason: "repetition_cycle"`.
 Disable it with `--no-repetition-guard` when comparing against a reference implementation, since a
 terminated cycle is a behavioral difference from an engine that has no guard.
 
+### Generated text
+
+The model generates byte-level tokens, so the bytes it writes need not be well-formed UTF-8: a
+multi-byte character can be interrupted or cut short, and a token can carry a byte UTF-8 never uses.
+Published text is always well-formed UTF-8. Each maximal subpart of an ill-formed sequence becomes
+one U+FFFD replacement character, the substitution the Unicode Standard recommends and Python's
+`errors="replace"` applies, and so does a character cut short when generation ends. The bytes alone
+decide the text, not how tokens or decode rounds split them, so streamed deltas and a
+non-streaming response agree; token IDs and usage counts are the tokens generated.
+
 ### Abandoned rounds
 
 A decode round resolves each lane into a licensed prefix: how many of the tokens it produced are
