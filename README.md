@@ -1,18 +1,167 @@
 # NInfer-4090
 
-NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
-[NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
-[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine
-written from scratch — no PyTorch, no TensorRT, no llama.cpp. The engine loads the official
-groupwise `.ninfer` artifact and serves OpenAI- and Anthropic-compatible APIs from a single
-process, with paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, and ReplaySSM state transactions for the model's Gated DeltaNet layers.
+NInfer-4090 serves **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090 as two systems in one
+process. **System One** answers TypeSafe's classification API: a decision reads a state and its
+questions by prefill alone and returns calibrated probabilities, in about 100 ms once the state is
+cached, without generating a token. **System Two** is chat: OpenAI- and Anthropic-compatible
+generation with MTP speculative decoding. Both run on one resident copy of the weights, one
+scheduler and one paged KV pool, and requests select LoRA adapters by model name — generative
+adapters for chat, decision adapters for System One — from a pool that costs no VRAM and swaps into
+a small device bank per request. [One model, two systems](#one-model-two-systems)
+
+The engine is an `sm_89` port of [NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which
+derives from [Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference
+engine written from scratch — no PyTorch, no TensorRT, no llama.cpp. It loads the official
+groupwise `.ninfer` artifact and brings paged KV, compatible-prefix reuse, CUDA Graphs, MTP
+speculative decoding, reasoning-effort control, and ReplaySSM state transactions for the model's
+Gated DeltaNet layers.
 
 This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
 engine uses the same groupwise-int path as the 3090 base.
 
+## One model, two systems
+
+TypeSafe names its classification API after System One, the fast and automatic mode of
+dual-process psychology; open-ended generation is the slow, deliberate System Two. In NInfer both
+are ordinary requests to one engine: they wait in the same bounded FIFO, run on the same lanes over
+the same KV pool, and reuse state through the same continuation cache, so a decision's state is
+kept and restored the way a conversation's prefix is.
+
+```mermaid
+flowchart LR
+    chat["System Two: chat<br/>/v1/chat/completions, /v1/responses, /v1/messages"] --> fifo
+    decide["System One: decisions<br/>/systemone/v1/systemone"] --> fifo
+    fifo["one bounded FIFO<br/>one scheduler"] --> lanes["1-8 lanes<br/>one paged KV pool"]
+    weights["Qwen3.8-27B weights<br/>16.67 GiB, resident once"] --- lanes
+    bank["LoRA bank<br/>--lora-slots device slabs"] --- lanes
+    pool["adapter pool in --lora-dir<br/>chat and decision adapters"] -.->|"staged at admission"| bank
+    lanes -->|"prefill, then decode rounds with MTP"| text["streamed text"]
+    lanes -->|"prefill only: the state, then one branch per question"| head["pointer head<br/>calibrated probabilities"]
+```
+
+| | System One: decisions | System Two: chat |
+|---|---|---|
+| API | `POST /systemone/v1/systemone`; the TypeSafe SDK 0.6 and 0.7 work unchanged | OpenAI Chat Completions and Responses, Anthropic Messages |
+| `model` selects | a decision adapter; `jev-latest` answers with the default one | the base weights or a generative adapter |
+| GPU work | prefill only: the state once, then one branch per question continuing it | prefill, then decode rounds that draft and verify with MTP |
+| Returns | an answer and calibrated option probabilities per question | streamed text, reasoning, and tool calls |
+| Sampling | none: the same state and questions return the same probabilities | greedy or sampled |
+| Measured | 101 ms for six questions on a retained 8K-token state, 3.98 s with the state cold | 104-128 tok/s per stream, two streams at once |
+| KV codec | `bf16`, qualified to kev's fidelity bars; `int8` meets them too | any; `rk4v4` holds the full 262K context |
+
+What the two systems share:
+
+- **One copy of the weights.** The artifact's 16.67 GiB of device weights are resident once. A
+  decision adapter is a LoRA adapter plus a pointer head, not a second model.
+- **One adapter bank.** Every adapter in `--lora-dir`, generative or decision, is registered at
+  startup, and the pool costs no VRAM. `--lora-slots` device slabs hold the adapters in use: a
+  rank-16 slot is 80.5 MiB of LoRA weights plus a 5 MiB pointer-head region when the pool holds a
+  decision adapter, 171 MiB for two slots. A request for an adapter no slot holds stages it in at
+  admission, least recently used first, in about 47 ms, and a slot is never taken from a request
+  still running on it.
+- **Unchanged chat output.** A decision never samples and never joins a decode batch. Beside a
+  closed loop of decisions, each chat stream's decode rounds kept their speed and MTP acceptance,
+  and all 42 chat responses matched the same stream served alone byte for byte.
+
+Run together on one card, the two systems share time, not speed. Measured with decisions submitted
+back to back (six questions on a retained 8,162-token state) beside two greedy chat streams, one on
+the base weights and one on a chat adapter, with BF16 KV, MTP and two adapter slots:
+
+| | Alone | Together |
+|---|---:|---:|
+| Decision latency, p50 | 100.9 ms | 100.9 ms |
+| Decision end to end, with queueing, p50 | 116.3 ms | 125.8 ms |
+| Decisions per second | 8.50 | 7.55 |
+| Chat output rate, base weights | 104.1 tok/s | 21.6 tok/s |
+| Chat output rate, chat adapter | 127.6 tok/s | 26.5 tok/s |
+| Adapter swaps and slot waits | 0 | 0 |
+
+The execution thread runs one unit at a time and alternates decode rounds with prefill units, and a
+decision on a retained state is one 101 ms unit. Back to back, the decisions held about 76% of the
+thread, so the chat streams kept their decode-round speed but got one round per decision. A lighter
+decision load takes proportionally less from chat.
+[Method, cold states and reading the rates](docs/performance.md#chat-and-system-one-together)
+
+### Run it
+
+Put a chat adapter and a decision adapter, both converted from PEFT with
+`tools/convert/qwen3_8_27b/convert_lora.py` (`--decision-head` for the decision adapter), in one
+directory, and start one server:
+
+```bash
+./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer --kv-dtype bf16 \
+  --max-context 32768 --max-concurrency 4 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --lora-dir lora --lora-slots 2
+```
+
+System Two, through the chat adapter `lora/caveman7.lora.ninfer`:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "qwen3.8-27b-caveman7", "enable_thinking": false,
+  "messages": [{"role": "user", "content": "Explain register renaming in two sentences."}]}'
+```
+
+```text
+Hrrm. Register renaming copy each source register into free physical register before instruction
+run, so write to same logical name no longer wait on read. That clear away false dependence, and
+let machine run more instructions at once, matey.
+```
+
+System One, from the same process and weights, through the pool's decision adapter:
+
+```bash
+curl -s http://127.0.0.1:8080/systemone/v1/systemone -H 'content-type: application/json' -d '{
+  "state": "I was charged twice this month. Please refund one charge before Friday.",
+  "questions": {
+    "billing": {"type": "noul", "instructions": "Is this message about billing?"},
+    "tone": {"type": "choice", "instructions": "What is the tone?",
+             "criteria": {"calm": null, "angry": null}},
+    "urgency": {"type": "score", "instructions": "How urgent is it?",
+                "criteria": ["Can wait", "Today"]}}}'
+```
+
+```json
+{"model": "systemone-decision-v7",
+ "answers": {"billing": {"type": "noul", "noul": 0.939},
+             "tone": {"type": "choice", "choice": "calm", "confidence": 0.4149,
+                      "probabilities": {"calm": 0.7075, "angry": 0.2925}},
+             "urgency": {"type": "score", "score": 0.7477, "legend": {"0": "Can wait", "1": "Today"},
+                         "probabilities": {"0": 0.2523, "1": 0.7477}, "confidence": 0.4953}},
+ "usage": {"input_tokens": 58, "output_tokens": 150}, "latency_ms": 105.9}
+```
+
+The TypeSafe SDK needs only `base_url="http://127.0.0.1:8080/systemone"`; see
+[System One decisions](docs/serving.md#system-one-decisions) for the SDK example, the routes and the
+error contract. In the Docker image, mount the adapter directory and pass the same flags after the
+image name, as in the [quick start](#quick-start-linux) profiles.
+
+### Limits
+
+- **Qualified on BF16 KV.** Decisions meet kev's per-question tolerance on `bf16` KV, the
+  configuration they are qualified on, and on `int8`. The rotated codecs, including the 262K
+  `rk4v4` profile, keep task-level quality but miss the probability bar on a few questions
+  ([System One fidelity](docs/serving.md#system-one-fidelity)).
+- **Qwen3.8-27B only.** The Qwen3.6-35B-A3B target has no adapter pool and serves no System One
+  model.
+- **The pool is fixed at startup.** `--lora-dir` is read once, so adding or removing an adapter
+  takes a restart; within the pool, adapters swap into the bank per request.
+- **Decisions and chat share one execution thread.** While decisions arrive back to back, chat
+  keeps about a fifth of its output rate. `--prefill-decode-balance` does not change that split,
+  because a decision on a retained state completes within the unit that admits it.
+- **Concurrent identical states are computed twice.** Two decisions on the same new state
+  submitted together each prefill it; only a later decision reuses it.
+- **Long states need L1 room.** A 65K-token BF16 state stays resident between decisions only with
+  `--continuation-cache-l1-mib 8192`; at the default budget each repeat restores it from host
+  memory in about 3 s ([decision latency](docs/performance.md#system-one-decision-latency)).
+
+## Dashboard
+
 The engine serves its own [dashboard](docs/dashboard.md) on the API port — no second process, no
-exporter, no time-series database.
+exporter, no time-series database. It shows both systems: System One decisions with their latency
+split and state reuse beside chat requests, which lanes run chat or decision work under which
+adapter, the adapter bank's live residency, and prefill split between the two. The screenshots and
+recordings below predate the System One view.
 
 ![NInfer dashboard under a light agent workload: three lanes with one running, reuse served from
 resident VRAM, and an empty disk cache tier.](media/dashboard-steady.png)
@@ -54,6 +203,14 @@ being waited on.
 
 The work specific to this branch, each with the measurement that established it:
 
+- **One model, two systems.** One process answers TypeSafe's System One protocol (`noul`, `choice`
+  and `score` questions over one state) under `/systemone` beside OpenAI- and Anthropic-compatible
+  chat, on one resident copy of the weights, one KV pool and one LoRA bank. A decision adapter — a
+  LoRA adapter plus a calibrated pointer head — answers six questions on a retained 8K-token state
+  in 101 ms by prefill alone. It never samples or decodes, and reproduces kev's request rendering,
+  token layout and answer arithmetic exactly, so the TypeSafe SDK works against it unchanged. Beside
+  a closed loop of decisions, chat's decode rounds kept their speed and all 42 chat responses stayed
+  byte-identical to the same streams served alone. [Details](#one-model-two-systems)
 - **The full native 262,144-token (262K) context on 24 GB.** The rotated midrise 4-bit KV mode
   (`rk4v4`) is the shipping default and leaves 1.37 GiB of slack. A 5-needle retrieval probe at
   248K tokens returns all five codes, and vision fits alongside it. [Details](#the-tradeoff)
@@ -82,28 +239,25 @@ The work specific to this branch, each with the measurement that established it:
   drive aggregate and per-sequence throughput, decode batch size, lane occupancy and queue depth,
   the execution thread's wall-clock split, TTFT decomposition, continuation-cache fill against
   configured capacity, cache churn — whether reuse is drifting down the tiers and how much prefill
-  recomputed state the cache demonstrably held — per-adapter usage, NVML board telemetry, and the
-  VRAM budget. Every reading
-  carries a tooltip explaining what it measures and what it means when it moves. The same page
-  replays a `--request-log-jsonl` file offline, and says so where a panel is live-only rather than
-  drawing zeros. [Guide](docs/dashboard.md)
+  recomputed state the cache demonstrably held — per-adapter usage, System One decisions with their
+  queue, restore, state and branch latency split and their state reuse, each lane's system and
+  adapter, the adapter bank's live residency and swaps, NVML board telemetry, and the VRAM budget.
+  Every reading carries a tooltip explaining what it measures and what it means when it moves. The
+  same page replays a `--request-log-jsonl` file offline, and says so where a panel is live-only
+  rather than drawing zeros. [Guide](docs/dashboard.md)
 - **Runtime LoRA adapters.** A directory of externally trained QLoRA adapters is served beside the
   base artifact and selected per request by model id, so one process exposes the base weights and
-  every pooled adapter without reload. Requests for the resident adapters mix in one decode batch;
-  admission waits when all slots are pinned by other adapters. A resident but unselected bank
-  costs nothing measurable in prefill; selecting one costs about 7-8%. Adapter identity is carried
-  through prefix reuse, the continuation cache, and saved slot images, so cached state produced
-  under one adapter can never be replayed under another. [Details](#runtime-lora-adapters)
+  every pooled adapter without reload. Chat adapters and System One decision adapters share the
+  pool and the slots. Requests for the resident adapters mix in one decode batch; admission waits
+  when all slots are pinned by other adapters. A resident but unselected bank costs nothing
+  measurable in prefill; selecting one costs about 7-8%. Adapter identity is carried through prefix
+  reuse, the continuation cache, and saved slot images, so cached state produced under one adapter
+  can never be replayed under another. [Details](#runtime-lora-adapters)
 - **Training-method agnostic.** NInfer consumes a standard PEFT LoRA directory whether an external
   producer fitted it with supervised or reinforcement learning. A measured rank-16 GRPO adapter
   moved held-out reward on unseen puzzles from 0.6029 to 0.8624, then converted, banked and served
   through exactly the same runtime path as an SFT adapter. Adapter training and its evaluation are
   owned by the separate `llm-datasets` repository. [Details](#runtime-lora-adapters)
-- **System One decisions.** A decision adapter — a LoRA adapter plus a calibrated pointer head —
-  answers TypeSafe's System One protocol (`noul`, `choice` and `score` questions over one state)
-  under `/systemone`, so the TypeSafe SDK works against it unchanged. Decisions share the chat
-  process's weights, KV pool and adapter slots, never sample or decode, and reproduce kev's request
-  rendering, token layout and answer arithmetic exactly. [Details](docs/serving.md#system-one-decisions)
 
 ## Measured results on the RTX 4090
 
@@ -552,7 +706,7 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   zero; persistence is the streaming success point, so a cancelled request is not stored; and
   unsupported capabilities — non-viable tool choices, strict tools, nonempty `logit_bias`, unknown
   fields — fail explicitly instead of being silently accepted. Cancellation is represented as
-  `response.failed` with `request_cancelled`. Request logs are at schema v12.
+  `response.failed` with `request_cancelled`.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
 - **llama.cpp-compatible `timings` on chat completions.** Responses and final stream chunks carry
@@ -576,11 +730,13 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   express — NVML board sensors and decoded clock-throttle reasons, the scheduler's own
   running/prefilling/decode-ready/waiting occupancy, the execution thread's wall-clock split with
   its admission decomposition, the `MemorySummary` VRAM budget including the resident LoRA bank,
-  cache occupancy paired with the configured tier capacities and per-tier capacity evictions, and
-  the registered adapter inventory — plus an SSE stream of the same schema-17 records
+  cache occupancy paired with the configured tier capacities and per-tier capacity evictions, each
+  lane's work (chat or System One) and adapter, the adapter pool with the bank's live residency and
+  swap counts, and the System One binding — plus an SSE stream of the same schema-22 records
   `--request-log-jsonl` appends. Records are formatted once and fanned out to both sinks, so a
-  live reader and a file reader see identical lines. These back the
-  [web dashboard](docs/dashboard.md).
+  live reader and a file reader see identical lines. The engine readings come from the snapshot
+  the execution thread publishes at every unit boundary, so the endpoint answers in milliseconds
+  under full load. These back the [web dashboard](docs/dashboard.md).
 - **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the
   [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) and sizes the vision
   encode workspace (default 8192 tokens, formerly hardcoded 32768). This fork additionally wires
@@ -629,6 +785,11 @@ same pool options are available in the CLI, where `--adapter NAME` selects one a
   adapters being added to or removed from the directory; one that no longer resolves is refused
   rather than replayed against a neighbour. Reusing one `prompt_cache_key` across adapters is a safe
   miss.
+- **Decision adapters in the same bank.** A System One decision adapter is a LoRA adapter plus a
+  pointer head, converted with `convert_lora.py --decision-head`. It is pooled, staged and evicted
+  like a generative adapter; when the pool holds one, every slot reserves a 5 MiB region for a head.
+  Its name answers only under `/systemone`, and generative adapters and the base model answer only
+  through the chat APIs. See [One model, two systems](#one-model-two-systems).
 - **Measured cost.** With one adapter selected, prefill runs at 3,307 tok/s on a 9,411-token prompt
   and 3,017 tok/s on 37,798, against 3,601 and 3,247 for a base request in the same process — about
   8.2% and 7.1%. A resident bank costs base requests nothing measurable. The cost is activation
@@ -690,13 +851,17 @@ same pool options are available in the CLI, where `--adapter NAME` selects one a
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
-  untested here, and the published cohort results in the
-  [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
-- Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
-  starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
-  measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
-  prefixes, not for prefill fairness.
+- `--max-concurrency` 2 to 4 is measured on the 4090 (see Quick start and
+  [performance](docs/performance.md)); higher lane counts are untested here, and the published
+  cohort results in the [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer
+  directly.
+- One execution thread runs one unit at a time. Prefill chunks of different lanes interleave
+  shortest-remaining-first and decode rounds alternate with prefill units, so an 8k-token prompt
+  behind a 131k-token one starts in 2.4 s
+  ([admission during prefill](docs/performance.md#admission-during-prefill)), but prefill still
+  takes turns rather than running beside decode. System One decisions are prefill units too:
+  back-to-back decisions leave each chat stream one decode round per decision
+  ([chat and System One together](docs/performance.md#chat-and-system-one-together)).
 - The Windows path and the Qwen3.6-35B-A3B target are inherited from the 3090 base but untested
   on the RTX 4090.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
@@ -745,7 +910,9 @@ switch with the thinking mode.
 
 OpenAI Chat Completions, OpenAI Responses with streaming and local continuation state, Anthropic
 Messages, prompt-rendered function tools with parsed tool calls, compatible-prefix reuse, and
-JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli.md).
+JSONL request logs — and, from the same process, TypeSafe's System One decisions under
+`/systemone` for the TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
+[System One decisions](docs/serving.md#system-one-decisions) and [CLI usage](docs/cli.md).
 
 ## Upstream and credits
 
