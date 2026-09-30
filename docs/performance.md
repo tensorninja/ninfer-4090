@@ -780,6 +780,71 @@ route. Those are the routes the prefill ladder above starts from (1,739 tok/s at
 not the INT8 routes that take chat prefill to 2,496 tok/s. Decisions give up that throughput to
 stay within kev's per-question tolerance.
 
+### Chat and System One together
+
+One `ninfer-serve` process served chat and decisions at once on the same card and toolchain,
+2026-09-30: BF16 KV, MTP with three draft tokens, four lanes, a 32,768-token context, prefix reuse
+and the continuation cache at their defaults, and a two-slot adapter bank. The pool held
+`systemone-decision-v7` and one generative adapter, a rank-16 style adapter on the same seven sites,
+so both stayed resident and no measured phase swapped. `scripts/dual_load_probe.py` ran three 90 s
+phases. Decisions alone is a closed loop: each decision is submitted as soon as the previous one
+returns, with six questions over one 8,162-token state that stays retained. Chat alone is two greedy
+streams with thinking off, the base weights writing 1,024 tokens per request and the adapter 519.
+Together runs both; its chat streams stop first and finish their requests beside the decisions, so
+every measured chat request ran beside decisions from start to end. Every figure comes from the
+request log. The SM clock held 2,715 MHz throughout, and board power peaked at 383 W.
+
+```bash
+./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer --kv-dtype bf16 --spec mtp \
+  --draft-tokens 3 --lm-head-draft --max-concurrency 4 --max-context 32768 \
+  --lora-dir <chat and decision adapters> --lora-slots 2 --request-log-jsonl dual.jsonl
+python3 scripts/dual_load_probe.py --url http://127.0.0.1:8080 --log dual.jsonl \
+  --chat-adapter <chat adapter>
+```
+
+| Phase | Decisions | Latency p50 | End-to-end p50 | Decisions/s | Swaps | Slot waits |
+|---|---:|---:|---:|---:|---:|---:|
+| Decisions alone | 765 | 100.9 ms | 116.3 ms | 8.50 | 0 | 0 |
+| Together | 757 | 100.9 ms | 125.8 ms | 7.55 | 0 | 0 |
+
+| Chat stream | Output rate alone | Output rate together | Decode-round rate alone / together | MTP acceptance |
+|---|---:|---:|---:|---:|
+| Base weights | 104.1 tok/s | 21.6 tok/s | 105.1 / 105.2 tok/s | 60.3% |
+| Chat adapter | 127.6 tok/s | 26.5 tok/s | 127.9 / 128.0 tok/s | 80.3% |
+
+Latency is the response's `latency_ms` and end-to-end adds the queue wait; p90 is within 1% of the
+median. The output rate is completion tokens over the wall time after the first token, what a
+streaming client sees. The decode-round rate divides the same tokens by the seconds of the decode
+rounds the request joined, the dashboard's decode rate.
+
+A decision never joins a decode batch, and the decode rounds show it: each stream's round rate and
+MTP acceptance are the same with and without decisions. Every chat response, 13 on the base weights
+and 29 on the adapter across the chat-alone, together and cold phases, is byte-identical to its
+stream's first measured response. Midway through the combined phase `/telemetry` showed three lanes
+busy at once: a decision on the decision adapter, the base stream, and the adapter stream, with both
+adapters in the bank.
+
+What decisions take from chat is time on the one execution thread. The scheduler alternates units:
+after each decode round, a waiting request is admitted and runs its first unit, and a decision on a
+retained state is a single 101 ms unit with all six branches in one pass. Back to back, the
+decisions held the thread for 7.55 × 100.9 ms, about 76% of every second, and each chat stream got
+one decode round per decision. Its output rate fell to 21% of its rate alone: a 1,024-token answer
+took 48 s instead of 9.9 s. The decisions lost less. Their latency is unchanged; waiting for the
+decode round between them added 9.5 ms end to end and cost 11% of their rate. A lighter decision
+load takes proportionally less, because chat gets whatever time the decisions leave.
+`--prefill-decode-balance` does not move this split. It spaces the chunks of a request that is still
+prefilling, and a decision on a retained state completes within the unit that admits it.
+
+A cold decision prefills its state first (3 per condition, six questions):
+
+| Cold 8K decision | Latency | State prefill | State rate | Branches |
+|---|---:|---:|---:|---:|
+| Idle | 3.98 s | 3.88 s | 2,159 tok/s | 101.1 ms |
+| Beside the two chat streams | 4.15 s | 3.80 s | 2,165 tok/s | 100.9 ms |
+
+The state spans several prefill units and a decode round runs between them, so beside chat a cold
+decision takes 4% longer while its state rate is unchanged.
+
 ### Energy measurement
 
 Energy per token is reported alongside throughput. A watt-second is a joule, so tokens per
