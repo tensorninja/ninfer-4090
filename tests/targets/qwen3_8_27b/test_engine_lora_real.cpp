@@ -329,13 +329,13 @@ int verify_slot_restore_keeps_adapter_identity(ninfer::Engine& engine) {
     const char* text = "Compute the greatest common divisor of 1071 and 462.";
     const std::filesystem::path path =
         std::filesystem::temp_directory_path() / "ninfer_lora_slot_identity.bin";
-    auto warm = [&](const std::optional<std::string>& adapter) {
+    auto warm = [&](const char* prompt, const std::optional<std::string>& adapter) {
         ninfer::RequestOptions options       = greedy(kTokens, adapter);
         options.execution.allow_prefix_reuse = true;
-        return engine.generate(engine.prepare(chat_prompt(text)), options);
+        return engine.generate(engine.prepare(chat_prompt(prompt)), options);
     };
 
-    const ninfer::GenerationResult produced = warm(kTrainedName);
+    const ninfer::GenerationResult produced = warm(text, kTrainedName);
     if (produced.slot < 0 || produced.session_digest.empty()) {
         std::cerr << "the adapter request did not retain a session to save\n";
         return 1;
@@ -350,8 +350,10 @@ int verify_slot_restore_keeps_adapter_identity(ninfer::Engine& engine) {
         // Restore into a lane whose last request was base, so the lane's own adapter field is -1
         // and disagrees with the image. Restoring into the producing lane proves nothing: that
         // lane already carries the right value, so a restore that dropped the identity entirely
-        // would still look correct.
-        const ninfer::GenerationResult unadapted = warm(std::nullopt);
+        // would still look correct. That base request runs another prompt: on this one it would
+        // publish a base-scoped L2 image of the prompt, which the negative arm could then restore
+        // legitimately, and the arm could no longer tell a leak from a correct hit.
+        const ninfer::GenerationResult unadapted = warm(kMathPrompt, std::nullopt);
         if (unadapted.slot < 0) {
             std::cerr << "the base request did not report a slot\n";
             return 1;
@@ -359,16 +361,18 @@ int verify_slot_restore_keeps_adapter_identity(ninfer::Engine& engine) {
         const auto lane = static_cast<std::uint32_t>(unadapted.slot);
         (void)engine.restore_slot(lane, path.string());
 
-        const ninfer::GenerationResult same = warm(kTrainedName);
+        const ninfer::GenerationResult same = warm(text, kTrainedName);
         if (same.reused_prompt_tokens == 0) {
             std::cerr << "a restored slot did not reuse under the adapter that produced it: the "
                          "restore lost the adapter identity\n";
             failures = 1;
         }
-        const ninfer::GenerationResult crossed = warm(std::nullopt);
+        const ninfer::GenerationResult crossed = warm(text, std::nullopt);
         if (failures == 0 && crossed.reused_prompt_tokens != 0) {
             std::cerr << "a base request reused " << crossed.reused_prompt_tokens
-                      << " prompt tokens from a slot saved under an adapter\n";
+                      << " prompt tokens ("
+                      << ninfer::continuation_source_name(crossed.continuation.source)
+                      << ") from a slot saved under an adapter\n";
             failures = 1;
         }
         if (failures == 0) {
