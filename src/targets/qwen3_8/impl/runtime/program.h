@@ -416,6 +416,14 @@ public:
     [[nodiscard]] std::string adapter_scope(std::int32_t adapter) const;
     [[nodiscard]] std::uint64_t lora_stage_count() const noexcept { return lora_stage_count_; }
 
+    [[nodiscard]] double lora_stage_seconds() const noexcept { return lora_stage_seconds_; }
+
+    [[nodiscard]] std::vector<LoraSlotState> lora_slot_states() const;
+
+    [[nodiscard]] std::int32_t retained_lane_adapter(std::uint32_t lane) const noexcept {
+        return lane < max_concurrency && sequences[lane].retained ? sequences[lane].adapter : -1;
+    }
+
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -584,9 +592,10 @@ private:
     // resident is a scheduling fault, not a recoverable condition, because admission is the only
     // place residency is decided.
     [[nodiscard]] std::int32_t lora_slot(std::int32_t adapter) const;
-    // A slot is pinned while any lane holds KV or GDN state its occupant produced, whether the
-    // lane is generating or merely retained. Evicting such a slot would leave that state
-    // uninterpretable.
+    // A slot is pinned while a lane that is prefilling, decoding or deciding executes against its
+    // occupant: swapping the bytes underneath would change that lane's arithmetic mid-request. A
+    // lane that merely retains state its occupant produced does not pin it; ensure_adapter_resident
+    // demotes such a lane through the caller before the swap.
     [[nodiscard]] bool lora_slot_pinned(std::size_t slot) const noexcept;
 
     // Pool index resident in each slot, or -1 when the slot has never been staged. Parallel LRU
@@ -596,6 +605,9 @@ private:
     std::vector<std::uint64_t> lora_slot_used_;
     std::uint64_t lora_clock_       = 0;
     std::uint64_t lora_stage_count_ = 0;
+    // Execution-thread time of the stages counted above, from preparing the slab through the
+    // demotion of retained lanes to the completed upload.
+    double lora_stage_seconds_ = 0.0;
 
     [[nodiscard]] cache::ContinuationImage
     export_stable_continuation(const SequenceState& sequence, const PreparedPromptData& prompt,

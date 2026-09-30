@@ -8,6 +8,8 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -17,12 +19,30 @@
 
 namespace ninfer::serve {
 
-// Schema 21 adds the System One decision records (decision_start, decision_done, decision_error).
-inline constexpr int kRequestLogSchemaVersion = 21;
+// Schema 22 reports chat and System One side by side: server_start lists the adapter pool with each
+// adapter's kind and served model id plus the System One surface, and the throughput record splits
+// out decision prefill and counts LoRA bank swaps and slot waits.
+inline constexpr int kRequestLogSchemaVersion        = 22;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 // The --kv-dtype spelling of a KV storage.
 [[nodiscard]] const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept;
+
+// A float widened to the double that prints as the float's shortest decimal: 1.1F becomes 1.1,
+// not 1.100000023841858.
+[[nodiscard]] double shortest_double(float value) noexcept;
+
+// The LoRA pool as server_start and /telemetry both report it, so the two cannot drift: the bank
+// (`count`, `rank`, `slots`, `device_bytes`, `file_bytes`) and `pool`, every discovered adapter in
+// pool order with its kind and the model id that selects it. A generative adapter is the chat
+// model `<public model id>-<name>` on /v1; a decision adapter is the System One model `<name>` on
+// /systemone and carries its calibration and model-card fields.
+[[nodiscard]] nlohmann::json adapter_inventory_json(const ninfer::LoadSummary& load,
+                                                    const std::string& public_model_id);
+// The System One surface: whether the target serves decisions, and the decision adapter the
+// SDK-default model name answers with (empty when that name is unbound).
+[[nodiscard]] nlohmann::json systemone_json(const ninfer::LoadSummary& load,
+                                            const std::string& binding);
 
 struct RequestLogContext {
     std::uint64_t id = 0;
@@ -105,6 +125,8 @@ struct BoardEnergySample {
 struct ThroughputReport {
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
+    // The part of computed_prefill_tokens System One decisions evaluated.
+    std::uint64_t decision_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
@@ -136,14 +158,13 @@ std::string format_decision_error(const DecisionLogContext& context, int status,
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
-std::string format_server_start_json(const std::string& server_instance_id,
-                                     std::uint64_t timestamp_unix_ms, const ServeOptions& options,
-                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
-                                     const std::string& public_model_id,
-                                     const ninfer::LoadSummary& load,
-                                     const ninfer::MemorySummary& memory,
-                                     const ServerLogEnvironment& environment,
-                                     std::optional<std::uint64_t> artifact_size_bytes);
+// `systemone_binding` is the resolved SDK-default binding, not the --systemone-default flag.
+std::string format_server_start_json(
+    const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
+    const ServeOptions& options, const ninfer::ModelSamplingDefaults& sampling_defaults,
+    const std::string& public_model_id, const std::string& systemone_binding,
+    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);

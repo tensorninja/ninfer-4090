@@ -453,7 +453,7 @@ curl -s http://127.0.0.1:8080/metrics | \
 ```
 
 The completion log deterministically prints `cache_source`, `cache_alias`, `cache_miss`, all three
-phase latencies, restored tokens/bytes, rollback, and publication-queued state. JSONL schema v12
+phase latencies, restored tokens/bytes, rollback, and publication-queued state. The JSONL request log
 carries the same data in `continuation_cache`, in integer microseconds, without raw
 routing/session/stable-alias values. Alias values are `none`, `routed_session`, and `stable_prefix`.
 After a process restart, a successful durable lookup increments the L3 lookup and restore series;

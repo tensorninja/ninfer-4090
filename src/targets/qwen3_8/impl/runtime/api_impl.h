@@ -171,6 +171,21 @@ std::uint64_t Program<Variant>::lora_stage_count() const noexcept {
 }
 
 template <>
+double Program<Variant>::lora_stage_seconds() const noexcept {
+    return impl_->lora_stage_seconds();
+}
+
+template <>
+std::vector<LoraSlotState> Program<Variant>::lora_slot_states() const {
+    return impl_->lora_slot_states();
+}
+
+template <>
+std::int32_t Program<Variant>::retained_lane_adapter(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_adapter(lane);
+}
+
+template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane_after_retained_eviction(lane, plan);

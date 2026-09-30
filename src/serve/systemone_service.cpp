@@ -5,7 +5,6 @@
 #include "serve/request_log.h"
 
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <optional>
@@ -21,17 +20,6 @@ using Clock  = std::chrono::steady_clock;
 
 std::string error_message(const Json& detail) {
     return detail.is_string() ? detail.get<std::string>() : detail.dump();
-}
-
-// The FP32 temperature as the double its shortest decimal form reads back as, so the card shows
-// the calibrated value (1.203) rather than its binary widening (1.2029999494552612).
-double shortest_double(float value) {
-    std::array<char, 32> buffer{};
-    const std::to_chars_result text =
-        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-    double widened = value;
-    std::from_chars(buffer.data(), text.ptr, widened);
-    return widened;
 }
 
 [[noreturn]] void throw_engine_error(const ninfer::RequestError& error) {

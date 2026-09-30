@@ -4,7 +4,8 @@
 // through the CLI: a repeated cold decision is bit-identical; a state published to L2 at completion
 // restores bit-identically once L1 lost it; a decision that continues a retained
 // state, whole or as a prefix of a longer one, took the restore path and is behaviourally
-// equivalent to computing it cold; chat greedy output is bit-identical while decisions prefill
+// equivalent to computing it cold; lanes, the LoRA bank and the prefill counters tell a decision
+// from a chat; chat greedy output is bit-identical while decisions prefill
 // beside it, and so are those decisions; a cancelled or abandoned decision releases its lane;
 // adapter kinds do not cross; a state that cannot fit a lane is rejected before submission.
 //
@@ -299,6 +300,58 @@ int verify_restored_state_is_equivalent(ninfer::Engine& engine) {
     return 0;
 }
 
+// Telemetry tells the two systems apart. A lane that ran a decision retains a decision state under
+// its adapter and a chat lane retains a generation under the base weights; the bank reports the
+// decision adapter resident and unpinned once nothing runs; decision prefill is counted apart from
+// chat prefill, which the same counter's total includes.
+int verify_lanes_report_their_work(ninfer::Engine& engine) {
+    const ninfer::RuntimeStats before        = engine.runtime_stats();
+    const ninfer::DecisionResult decided     = decide(engine, mixed_decision(40, 11), true);
+    const ninfer::RuntimeStats decided_stats = engine.runtime_stats();
+    const std::uint64_t decision_tokens =
+        decided_stats.decision_prefill_tokens - before.decision_prefill_tokens;
+    if (decision_tokens == 0 ||
+        decision_tokens != decided_stats.computed_prefill_tokens - before.computed_prefill_tokens) {
+        return fail("a decision's prefill was not counted as decision prefill");
+    }
+
+    ninfer::RequestOptions chat_options       = greedy(4, std::nullopt);
+    chat_options.execution.allow_prefix_reuse = true;
+    static_cast<void>(engine.generate(engine.prepare(chat_prompt()), std::move(chat_options)));
+    const ninfer::RuntimeStats chatted = engine.runtime_stats();
+    if (chatted.decision_prefill_tokens != decided_stats.decision_prefill_tokens ||
+        chatted.computed_prefill_tokens <= decided_stats.computed_prefill_tokens ||
+        chatted.decision_prefill_tokens > chatted.computed_prefill_tokens) {
+        return fail("chat prefill was counted as decision prefill");
+    }
+
+    const std::vector<ninfer::SlotState> lanes = engine.slot_states();
+    bool chat_retained                         = false;
+    for (const ninfer::SlotState& lane : lanes) {
+        if ((lane.processing || lane.retained) != (lane.work != ninfer::SlotWork::None)) {
+            return fail("a lane's work does not match its occupancy");
+        }
+        chat_retained =
+            chat_retained ||
+            (lane.retained && lane.work == ninfer::SlotWork::Generation && lane.adapter.empty());
+    }
+    const ninfer::SlotState& decision_lane = lanes.at(static_cast<std::size_t>(decided.slot));
+    if (!decision_lane.retained || decision_lane.work != ninfer::SlotWork::Decision ||
+        decision_lane.adapter != kDeciderName) {
+        return fail("the lane that ran a decision does not report its decision state and adapter");
+    }
+    if (!chat_retained) { return fail("no lane reports the retained chat on the base weights"); }
+
+    const std::vector<ninfer::AdapterSlotState> bank = engine.adapter_slot_states();
+    if (bank.size() != 1 || bank[0].adapter != kDeciderName || bank[0].pinned) {
+        return fail("the LoRA bank does not report the idle decision adapter resident");
+    }
+    if (chatted.lora_stages < 1 || chatted.lora_stage_seconds <= 0.0) {
+        return fail("staging the decision adapter was not counted");
+    }
+    return 0;
+}
+
 // Decisions are prefill-only lanes: their chunks interleave with a chat prompt's chunks and decode
 // rounds, but never join a call of another lane, so neither side's arithmetic may change. The
 // long decision is submitted first so that its later chunks run after the chat lane has started.
@@ -422,6 +475,7 @@ int exercise(const char* artifact, const char* decision_path) {
     if (const int result = verify_restored_state_is_equivalent(engine); result != 0) {
         return result;
     }
+    if (const int result = verify_lanes_report_their_work(engine); result != 0) { return result; }
     if (const int result = verify_chat_and_decisions_are_independent(engine); result != 0) {
         return result;
     }

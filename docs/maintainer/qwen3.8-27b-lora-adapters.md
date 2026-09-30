@@ -590,7 +590,7 @@ LoraOptions lora;
 std::optional<std::string> adapter;             // nullopt => base weights only
 
 // LoadSummary
-std::vector<std::string> lora_adapter_names;    // pool order; unbounded
+std::vector<LoraAdapterInfo> lora_adapters;     // pool order; unbounded; name, kind, rank
 std::uint32_t lora_slots;                       // resident slots the bank committed
 ```
 
@@ -715,7 +715,10 @@ any backfill.
 contiguous upload: **46.8 ms** for an 80 MiB union slab without a fingerprint sidecar cache on this
 target, measured by `ninfer_qwen3_8_27b_lora_pool_test`. It runs on the worker thread between rounds,
 with no replay in flight, and is amortized against the prefill of the request that caused it.
-`lora_stage_count` counts swaps for anyone who wants to confirm a workload is not thrashing.
+`lora_stage_count` counts swaps and `lora_stage_seconds` their execution-thread time; serving
+publishes both, the per-slot occupant and pin, and the count of admissions that waited for a slot as
+`/telemetry` `adapters.resident`/`stages`/`stage_seconds`/`slot_waits` and per interval on the
+throughput record, so thrashing is visible without instrumentation.
 
 ## 7. Serving and model routing
 
@@ -725,7 +728,7 @@ Adapter names are registered as bare names; the served model id for each is
 | File | Change |
 |---|---|
 | `src/serve/http_server.h` | `+ adapter_model_ids_` and `+ adapter_names_` beside `public_model_id_`; `+ resolve_model()` returning `std::optional<std::string>` (nullopt = 404, empty = base) |
-| `src/serve/http_server.cpp` `attach` | build `adapter_model_ids_` from `load_summary().lora_adapter_names` |
+| `src/serve/http_server.cpp` `attach` | build `adapter_model_ids_` from the generative entries of `load_summary().lora_adapters` |
 | `src/serve/http_server.cpp` chat completions | exact-match 404 → `resolve_model`, writing `request.adapter` |
 | `src/serve/http_server.cpp` `handle_model`/`handle_models` | `resolve_model` gate; `/v1/models` lists base + every adapter |
 | `src/serve/openai_schema.{h,cpp}` | `make_models_list` takes the adapter model ids |
@@ -1221,4 +1224,4 @@ behaviour transfers, not that downstream task quality is unaffected by the base 
 | Base-model performance regresses for users who do not use adapters | topology is unchanged when `lora_slots == 0`; asserted by the base-route tests |
 | A slot swap corrupts a generating lane's state | a slot is pinned while any lane in `Prefilling`/`Active`/`Pending` names it, and admission refuses rather than displacing (§6.8) |
 | A restored continuation is replayed against the wrong adapter after the directory changes | identity is the artifact's SHA-256, not a pool position; an adapter that has left the directory fails to resolve and the image is refused (§6.6) |
-| A large pool thrashes its slots | `lora_stage_count` exposes the swap count; `--lora-slots` up to `--max-concurrency` removes admission stalls |
+| A large pool thrashes its slots | `/telemetry` and the throughput record expose swaps, their time, and slot waits; `--lora-slots` up to `--max-concurrency` removes admission stalls |

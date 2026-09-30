@@ -144,6 +144,10 @@ public:
         return engine_->slot_states();
     }
 
+    [[nodiscard]] std::vector<ninfer::AdapterSlotState> adapter_slot_states() const {
+        return engine_->adapter_slot_states();
+    }
+
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,

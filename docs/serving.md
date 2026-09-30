@@ -60,8 +60,8 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
-| `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE stream of the schema-21 records `--request-log-jsonl` writes |
+| `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, lane work, VRAM, cache fill, adapter pool and bank residency, System One surface |
+| `GET /events` | SSE stream of the schema-22 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -74,18 +74,40 @@ cannot express: NVML board readings (utilization, temperature, power, clocks, an
 clock-throttle reasons), the scheduler's own `running`/`prefilling`/`decode_ready`/`waiting`
 occupancy, the execution thread's wall-clock split with its admission decomposition, the
 `MemorySummary` VRAM budget, continuation-cache occupancy paired with the configured tier
-capacities it is measured against, and the resident LoRA bank (`adapters`: names, served model
-ids, shared rank, and device/file bytes). NVML failure is reported as `gpu.available = false`
-with an `error` string rather than failing the request.
+capacities it is measured against, the per-lane table (`slots`), the LoRA pool and bank
+(`adapters`), and the [System One](#system-one-decisions) surface (`systemone`). NVML failure is
+reported as `gpu.available = false` with an `error` string rather than failing the request. The
+engine's readings (scheduler occupancy, lanes, bank residency and `MemorySummary`) are the ones the
+execution thread published at its last unit boundary, so the endpoint never waits for the unit in
+flight and stays responsive while chat and decisions keep the GPU busy.
+
+Each `slots[]` entry adds to the `/slots` occupancy what the lane is doing for which system:
+`work` is `generation` or `decision` for the request a lane runs, or the kind of state it retains
+when idle, and `none` for an empty lane; `adapter` names the adapter that request or state belongs
+to, empty for the base weights. A lane retaining a decision state therefore reads as System One
+work even between decisions.
 
 The adapter bank is one device arena committed at startup, outside the weights arena and before
 KV capacity is resolved. It holds `--lora-slots` slabs, not one per servable adapter: the pool
 discovered from `--lora-dir` is unbounded and costs no device memory, and an adapter outside the
-slots is swapped in when a request for it is admitted. `adapters.slots` reports the resident count
-beside the pool, and `memory.lora_bank_bytes` reports the arena so the division of the board
-accounts for it; without that field the bank is visible only as reduced free memory. Adapter
-names come from the load summary rather than from served model ids, so an adapter that has taken
-no traffic is still reported.
+slots is swapped in when a request for it is admitted. `memory.lora_bank_bytes` reports the arena
+so the division of the board accounts for it; without that field the bank is visible only as
+reduced free memory. `adapters` carries:
+
+| Field | Meaning |
+|---|---|
+| `count`, `rank`, `slots` | pool size, the shared bank rank, and the number of device slots |
+| `device_bytes`, `file_bytes` | the bank arena and the pool's adapter files on disk |
+| `pool[]` | every discovered adapter in pool order: `name`, `kind` (`generative` or `decision`), `rank`, and the served `model_id`; a decision adapter adds `temperature`, `pointer_dim`, `description`, and `release_date` |
+| `resident[]` | one entry per device slot: the `adapter` it holds (empty while unfilled) and whether a running lane `pinned` it |
+| `stages`, `stage_seconds` | adapters staged into a slot since startup, a swap or the first fill of an empty slot, and the execution-thread time they took |
+| `slot_waits` | requests whose admission waited because every slot was pinned by a running lane using another adapter |
+
+A generative adapter's `model_id` is `<model>-<name>` on `/v1`; a decision adapter's is its bare
+name on `/systemone`. The pool comes from the load summary rather than from served model ids, so an
+adapter that has taken no traffic is still reported. `systemone` carries `supported` (the target
+can answer decisions), `alias` (`jev-latest`), and `binding`, the decision adapter the alias
+resolves to, empty when it is unbound.
 
 `cache.l2` and `cache.l3` additionally carry `evictions` and `evicted_bytes`, counting only
 entries pushed out because the live working set exceeded that tier's byte budget. A TTL expiry is
@@ -95,7 +117,7 @@ reported apart from `restore_failures` because a deferral leaves the candidate l
 and a failure does not. The same counters appear on the throughput record as cumulative totals
 paired with interval deltas, so churn is readable from a replayed log as well as live.
 
-`GET /events` streams the same schema-21 records `--request-log-jsonl` appends, as named SSE
+`GET /events` streams the same schema-22 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
@@ -976,21 +998,21 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-21 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-22 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, the adapter pool (`adapters`, as in [telemetry](#telemetry-and-events) without residency), the System One surface (`systemone`), and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call counts, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
 | `decision_start` | a submitted System One decision: `model`, the answering `adapter`, reuse flag, question/option counts, state/branch/longest-branch tokens, and state truncation |
 | `decision_done` | output tokens, reused and computed state tokens with their `state_source`, branch passes, long-branch chunks, slot, unrounded `prepare`/`queue`/`restore`/`state`/`branch`/`execution`/`total` seconds, and state/branch prefill rates |
 | `decision_error` | the submitted decision and the client-visible status and message |
-| `throughput` | interval token deltas and rates, board energy, scheduler occupancy, decode-round batch statistics, and cumulative/delta continuation tier and latency summaries |
+| `throughput` | interval token deltas and rates with the System One share of computed prefill (`tokens.decision_prefill`), board energy, scheduler occupancy, decode-round batch statistics, cumulative/delta LoRA bank `stages` and `slot_waits` (`adapters`), and cumulative/delta continuation tier and latency summaries |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `queue`, `restore`, `publish`,
 `prefill`, `decode`, and `total` as full-precision JSON numbers. `publish` is only the completion
@@ -1029,18 +1051,20 @@ but are rounded and are not the aggregation source. Console lines use local
 prepared OpenAI Responses, OpenAI Chat, and Anthropic generation requests and errors during their
 generation, and System One decisions once submitted; schema rejection
 and token-count-only calls are not measurement requests and do not receive request IDs. A decision
-record's `x_request_id` is its `x-typesafe-request-id`. `server_start.adapters` names the
-`decision_names` among the pool and the configured `systemone_default`.
+record's `x_request_id` is its `x-typesafe-request-id`. `server_start.adapters.pool` gives each
+adapter's `kind` and served `model_id`, and `server_start.systemone.binding` the decision adapter
+`jev-latest` resolves to, so a replayed log reads both systems without a live server.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
-suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
-tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
-and DFlash this is the accepted committed output, not draft or rejected tokens.
-`avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
-`running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
-the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
-the raw token and round deltas as well as derived rates; downstream measurement should prefer those
-raw values.
+suffix tokens actually computed during the interval, excluding prefix-cache hits; the record's
+`tokens.decision_prefill` is the part of it System One decisions evaluated, state chunks and branch
+passes alike, and the remainder is chat prefill. `decode` counts tokens finally committed by decode
+rounds, excluding the first token produced by prefill. For MTP and DFlash this is the accepted
+committed output, not draft or rejected tokens. `avg_decode_batch` is decode row-rounds divided by
+decode rounds during the same interval. The `running`, `prefilling`, `decode_ready`, and `waiting`
+fields are the Engine scheduler snapshot at the end of the interval. Fully idle zero intervals are
+omitted. The JSONL `throughput` event keeps the raw token and round deltas as well as derived
+rates; downstream measurement should prefer those raw values.
 
 The throughput `continuation_cache` object reports cumulative values and interval deltas for tier
 restore counts/tokens/bytes, routed-session/stable-prefix selections, terminal miss reasons,

@@ -52,6 +52,18 @@ nlohmann::json arena_json(const ninfer::ArenaMemorySummary& arena) {
             {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
+const char* slot_work_name(ninfer::SlotWork work) {
+    switch (work) {
+    case ninfer::SlotWork::None:
+        return "none";
+    case ninfer::SlotWork::Generation:
+        return "generation";
+    case ninfer::SlotWork::Decision:
+        return "decision";
+    }
+    return "unknown";
+}
+
 nlohmann::json gpu_json(const GpuTelemetry& gpu, const ServerEnergyTotals& energy) {
     if (!gpu.available) { return {{"available", false}, {"error", gpu.error}}; }
     // Null where the board implements no cumulative energy counter. Many GeForce parts do not, and
@@ -88,7 +100,7 @@ nlohmann::json gpu_json(const GpuTelemetry& gpu, const ServerEnergyTotals& energ
             {"throttle_reasons", gpu.throttle_reasons}};
 }
 
-// One SSE frame carrying a complete schema-21 record. The record's own `event` field names the
+// One SSE frame carrying a complete request-log record. The record's own `event` field names the
 // frame so a browser can attach one listener per record type.
 std::string event_frame(std::string_view event, std::string_view payload) {
     std::string frame;
@@ -374,6 +386,8 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
     NINFER_DELTA(admission_rejected_overloaded);
     NINFER_DELTA(admission_rejected_queue_timeout);
     NINFER_DELTA(admitted_requests);
+    NINFER_DELTA(lora_stages);
+    NINFER_DELTA(lora_slot_waits);
 #undef NINFER_DELTA
     delta.queue_seconds_total = current.queue_seconds_total >= previous.queue_seconds_total
                                     ? current.queue_seconds_total - previous.queue_seconds_total
@@ -391,13 +405,14 @@ ThroughputReport make_throughput_report_impl(const ninfer::RuntimeStats& previou
         .interval_seconds = interval_seconds,
         .computed_prefill_tokens =
             monotonic_delta(previous.computed_prefill_tokens, current.computed_prefill_tokens),
+        .decision_prefill_tokens =
+            monotonic_delta(previous.decision_prefill_tokens, current.decision_prefill_tokens),
         .committed_decode_tokens =
             monotonic_delta(previous.committed_decode_tokens, current.committed_decode_tokens),
-        .decode_rounds = monotonic_delta(previous.decode_rounds, current.decode_rounds),
-        .decode_row_rounds = monotonic_delta(previous.decode_row_rounds,
-                                             current.decode_row_rounds),
-        .energy = reconcile_interval_energy(previous, current, interval_seconds, board_energy),
-        .scheduler          = current,
+        .decode_rounds     = monotonic_delta(previous.decode_rounds, current.decode_rounds),
+        .decode_row_rounds = monotonic_delta(previous.decode_row_rounds, current.decode_row_rounds),
+        .energy    = reconcile_interval_energy(previous, current, interval_seconds, board_energy),
+        .scheduler = current,
         .continuation_delta = delta,
     };
 }
@@ -776,7 +791,7 @@ void HttpServer::register_routes() {
     server_.Get("/telemetry", [this](const httplib::Request& req, httplib::Response& res) {
         handle_telemetry(req, res);
     });
-    // The schema-21 record stream, identical to what --request-log-jsonl appends, as named SSE
+    // The request-log record stream, identical to what --request-log-jsonl appends, as named SSE
     // events. A new reader is replayed the retained server_start record and the recent ring
     // before live delivery begins.
     server_.Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -987,6 +1002,8 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
         {"persistence_successes", stats.continuation_persistence_successes},
         {"persistence_failures", stats.continuation_persistence_failures}};
 
+    // `work` is what a lane runs, or the kind of state it retains; `adapter` is empty for the base
+    // weights.
     nlohmann::json slots = nlohmann::json::array();
     if (service_ != nullptr) {
         for (const ninfer::SlotState& state : service_->slot_states()) {
@@ -995,29 +1012,30 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
                              {"prompt_tokens", state.prompt_tokens},
                              {"cached_tokens", state.cached_tokens},
                              {"session_digest", state.session_digest},
-                             {"checkpoints", state.checkpoints.size()}});
+                             {"checkpoints", state.checkpoints.size()},
+                             {"work", slot_work_name(state.work)},
+                             {"adapter", state.adapter}});
         }
     }
 
-    // Adapter inventory. Names come from the load summary rather than from the served model ids,
-    // so an adapter that has taken no traffic is still reported. `count` is the whole discovered
-    // pool and every entry is selectable; `slots` is how many are device-resident at once, which
-    // is a residency detail clients never see.
-    nlohmann::json adapters = nlohmann::json::object();
+    // The whole discovered pool from the load summary, so an adapter that has taken no traffic is
+    // still reported, then the bank's live residency: which adapter each device slot holds and
+    // whether a running lane pins it, the swaps so far and their cost, and the requests that
+    // waited because every slot was pinned.
+    const ninfer::LoadSummary load =
+        service_ != nullptr ? service_->load_summary() : ninfer::LoadSummary{};
+    nlohmann::json adapters = adapter_inventory_json(load, public_model_id_);
     {
-        nlohmann::json names = nlohmann::json::array();
-        for (const std::string& name : adapter_names_) { names.push_back(name); }
-        nlohmann::json ids = nlohmann::json::array();
-        for (const std::string& id : adapter_model_ids_) { ids.push_back(id); }
-        const ninfer::LoadSummary load =
-            service_ != nullptr ? service_->load_summary() : ninfer::LoadSummary{};
-        adapters = {{"count", adapter_names_.size()},
-                    {"names", std::move(names)},
-                    {"model_ids", std::move(ids)},
-                    {"rank", load.lora_rank},
-                    {"slots", load.lora_slots},
-                    {"device_bytes", load.lora_device_bytes},
-                    {"file_bytes", load.lora_file_bytes}};
+        nlohmann::json resident = nlohmann::json::array();
+        if (service_ != nullptr) {
+            for (const ninfer::AdapterSlotState& slot : service_->adapter_slot_states()) {
+                resident.push_back({{"adapter", slot.adapter}, {"pinned", slot.pinned}});
+            }
+        }
+        adapters["resident"]      = std::move(resident);
+        adapters["stages"]        = stats.lora_stages;
+        adapters["stage_seconds"] = stats.lora_stage_seconds;
+        adapters["slot_waits"]    = stats.lora_slot_waits;
     }
 
     const nlohmann::json payload = {
@@ -1032,6 +1050,7 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
         {"cache", std::move(cache)},
         {"slots", std::move(slots)},
         {"adapters", std::move(adapters)},
+        {"systemone", systemone_json(load, systemone_alias_binding())},
         {"memory",
          {{"device", memory.device},
           {"max_context", memory.max_context},
@@ -1053,8 +1072,9 @@ void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& re
           {"available_after_startup_bytes", memory.available_after_startup_bytes},
           {"available_after_weights_bytes", memory.available_after_weights_bytes},
           {"lora_bank_bytes", memory.lora_bank_bytes}}},
-        {"events", {{"jsonl_enabled", events_.jsonl_enabled()},
-                    {"subscribers", events_.subscriber_count()}}}};
+        {"events",
+         {{"jsonl_enabled", events_.jsonl_enabled()},
+          {"subscribers", events_.subscriber_count()}}}};
     res.set_content(payload.dump(), "application/json");
 }
 
@@ -1591,8 +1611,8 @@ void HttpServer::attach(GenerationService& service) {
     }
     systemone_.emplace(service, options_, public_model_id_);
     service_                       = &service;
-    events_.emit_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                              service.memory_summary());
+    events_.emit_server_start(options_, service.sampling_defaults(), public_model_id_,
+                              systemone_->alias_binding(), load, service.memory_summary());
 }
 
 bool HttpServer::listen() {

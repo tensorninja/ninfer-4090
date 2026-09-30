@@ -296,7 +296,7 @@ public:
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 using TargetExecutor = runtime::ConcurrentExecutor<Instance>;
-                return std::make_unique<TargetExecutor>(*target_ptr, options);
+                return std::make_unique<TargetExecutor>(*target_ptr, options, load.lora_adapters);
             },
             active);
         if (options.auto_save_evicted) {
@@ -781,6 +781,20 @@ std::vector<SlotState> Engine::slot_states() const {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
                 return executor->slot_states();
+            }
+        },
+        impl_->executor);
+}
+
+std::vector<AdapterSlotState> Engine::adapter_slot_states() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::vector<AdapterSlotState> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->adapter_slot_states();
             }
         },
         impl_->executor);

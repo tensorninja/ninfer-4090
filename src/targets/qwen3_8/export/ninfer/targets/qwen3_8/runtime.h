@@ -70,6 +70,13 @@ struct CapturedContinuation {
     cache::ContinuationImage image;
 };
 
+// One device slot of the LoRA bank: the pool index staged into it (-1 when never staged), and
+// whether a lane executing against it pins it against a swap.
+struct LoraSlotState {
+    std::int32_t adapter = -1;
+    bool pinned          = false;
+};
+
 namespace detail {
 template <class Variant>
 struct SequencePlanImpl;
@@ -215,7 +222,15 @@ public:
     // fingerprint. Continuation state produced under one adapter is invalid under any other, and
     // this is what keeps their aliases disjoint across swaps, pool reordering and restarts.
     [[nodiscard]] std::string adapter_scope(std::int32_t adapter) const;
+    // Bank residency for telemetry: adapters staged into a slot so far, the execution-thread time
+    // those stages took (slab preparation, demotion of displaced retained lanes, upload), and each
+    // slot's occupant in bank order. The slot list is empty for a Program without a LoRA bank.
     [[nodiscard]] std::uint64_t lora_stage_count() const noexcept;
+    [[nodiscard]] double lora_stage_seconds() const noexcept;
+    [[nodiscard]] std::vector<LoraSlotState> lora_slot_states() const;
+    // Pool index of the adapter whose state a retained lane holds; -1 for the base weights and
+    // for a lane that retains nothing.
+    [[nodiscard]] std::int32_t retained_lane_adapter(std::uint32_t lane) const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,

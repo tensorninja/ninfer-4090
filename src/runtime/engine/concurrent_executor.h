@@ -71,7 +71,10 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
+    // `adapters` is the LoRA pool in index order; telemetry names a lane's or a bank slot's adapter
+    // through it.
+    ConcurrentExecutor(Instance& instance, const EngineOptions& options,
+                       const std::vector<LoraAdapterInfo>& adapters)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -79,6 +82,7 @@ public:
           auto_save_evicted_(options.auto_save_evicted),
           repetition_guard_(options.repetition_guard),
           admission_capacity_(instance.program->admission_capacity()),
+          adapter_names_(adapter_names(adapters)),
           prefill_decode_balance_(options.prefill_decode_balance),
           continuation_cache_(make_continuation_cache(options.continuation_cache)),
           l1_policy_active_(options.continuation_cache.tiers != ContinuationCacheTiers::Off),
@@ -96,6 +100,9 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        // Readers are served from the published snapshot, so it must describe the startup state
+        // before the first unit runs.
+        publish_runtime_stats();
         if (continuation_cache_) {
             publication_worker_ = std::thread([this] { publication_loop(); });
             try {
@@ -354,22 +361,13 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    // Served from the snapshot the worker publishes at every unit boundary and before a completion
+    // wakes its client, like slot_states(): a scraper waiting on the execution mutex would starve
+    // for as long as the worker keeps it busy, because the worker reacquires it between units
+    // before a blocked reader is scheduled.
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
-        out.request_transient                  = instance_.request_memory.summary();
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
+        std::lock_guard lock(stats_mutex_);
+        return published_memory_;
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
@@ -467,6 +465,7 @@ public:
             std::scoped_lock lock(execution_mutex_);
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
+            publish_runtime_stats();
         } catch (...) {}
     }
 
@@ -551,7 +550,26 @@ public:
         return states;
     }
 
+    // The LoRA bank's slots from the same published snapshot, so a reader sees residency and lane
+    // occupancy of one boundary.
+    [[nodiscard]] std::vector<AdapterSlotState> adapter_slot_states() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_adapter_slots_;
+    }
+
 private:
+    static std::vector<std::string> adapter_names(const std::vector<LoraAdapterInfo>& adapters) {
+        std::vector<std::string> names;
+        names.reserve(adapters.size());
+        for (const LoraAdapterInfo& adapter : adapters) { names.push_back(adapter.name); }
+        return names;
+    }
+
+    // Empty for the base weights (-1).
+    [[nodiscard]] std::string adapter_name(std::int32_t adapter) const {
+        return adapter < 0 ? std::string{} : adapter_names_.at(static_cast<std::size_t>(adapter));
+    }
+
     static std::size_t mib_to_bytes(std::size_t mib, const char* field) {
         constexpr std::size_t mib_bytes = 1024U * 1024U;
         if (mib > std::numeric_limits<std::size_t>::max() / mib_bytes) {
@@ -1369,6 +1387,9 @@ private:
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
 
+        snapshot.lora_stages        = instance_.program->lora_stage_count();
+        snapshot.lora_stage_seconds = instance_.program->lora_stage_seconds();
+
         // Per-lane occupancy for /slots-style readers. Digests come from the cache the
         // completion and restore paths maintain, so publishing costs no ledger hashing.
         std::vector<SlotState> slot_snapshot(max_concurrency_);
@@ -1379,18 +1400,46 @@ private:
                 state.processing    = true;
                 state.prompt_tokens = request->prompt_summary.prompt_tokens;
                 if (request->begin) { state.cached_tokens = request->begin->reused_prompt_tokens; }
+                state.work    = request->decision ? SlotWork::Decision : SlotWork::Generation;
+                state.adapter = adapter_name(request->options.execution.adapter);
             } else if (instance_.program->has_retained_lane(lane)) {
                 state.retained       = true;
                 state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
                 state.cached_tokens  = state.prompt_tokens;
                 state.session_digest = retained_digest_cache_[lane];
                 state.checkpoints    = retained_checkpoints_cache_[lane];
+                state.work           = instance_.program->retained_lane_holds_decision(lane)
+                                           ? SlotWork::Decision
+                                           : SlotWork::Generation;
+                state.adapter        = adapter_name(instance_.program->retained_lane_adapter(lane));
             }
         }
 
+        std::vector<AdapterSlotState> adapter_snapshot;
+        for (const targets::qwen3_8::LoraSlotState& slot : instance_.program->lora_slot_states()) {
+            adapter_snapshot.push_back(
+                AdapterSlotState{.adapter = adapter_name(slot.adapter), .pinned = slot.pinned});
+        }
+
+        MemorySummary memory                     = instance_.program->memory_summary();
+        memory.request_transient                 = instance_.request_memory.summary();
+        const KvCapacityResolution& resolution   = instance_.kv_capacity_resolution;
+        memory.kv_capacity_mode                  = resolution.mode;
+        memory.kv_capacity_page_groups           = resolution.main_page_groups;
+        memory.kv_capacity_max_page_groups       = resolution.maximum_main_page_groups;
+        memory.minimum_runtime_reservation_bytes = resolution.minimum_runtime_reservation_bytes;
+        memory.kv_capacity_increment_bytes       = resolution.bytes_per_additional_main_page_group;
+        memory.runtime_reservation_bytes         = resolution.runtime_reservation_bytes;
+        memory.available_after_weights_bytes     = resolution.available_after_weights_bytes;
+        memory.available_after_startup_bytes     = resolution.available_after_startup_bytes;
+        memory.kv_capacity_headroom_bytes        = resolution.automatic_headroom_bytes;
+        memory.planned_slack_bytes               = resolution.planned_slack_bytes;
+
         std::lock_guard lock(stats_mutex_);
-        published_stats_ = snapshot;
-        published_slots_ = std::move(slot_snapshot);
+        published_stats_         = snapshot;
+        published_slots_         = std::move(slot_snapshot);
+        published_adapter_slots_ = std::move(adapter_snapshot);
+        published_memory_        = memory;
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
@@ -1655,6 +1704,8 @@ private:
         ContinuationDiagnostics continuation;
         // Set for a System One decision, whose prompt/output/budget fields stay empty.
         std::optional<DecisionWork> decision;
+        // Set the first time admission found every LoRA bank slot pinned by another adapter.
+        bool adapter_slot_waited = false;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -2530,6 +2581,7 @@ private:
         if (!request->lane) { throw std::logic_error("decision step has no request lane"); }
         const std::uint32_t lane = *request->lane;
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        cumulative_stats_.decision_prefill_tokens += step.processed_prompt_tokens;
         request->prefill_processed.fetch_add(step.processed_prompt_tokens,
                                              std::memory_order_relaxed);
         request->prefill_reused.store(step.summary.reused_prompt_tokens,
@@ -2901,9 +2953,14 @@ private:
     // its own deadline. It cannot deadlock, because an idle engine holds no slot.
     [[nodiscard]] bool ensure_adapter_resident(const std::shared_ptr<Request>& request) {
         PhaseTimer timer(cumulative_stats_.worker_admission_plan_seconds);
-        return instance_.program->ensure_adapter_resident(
+        const bool resident = instance_.program->ensure_adapter_resident(
             request->options.execution.adapter,
             [this](std::uint32_t lane) { evict_retained_lane(lane); });
+        if (!resident && !request->adapter_slot_waited) {
+            request->adapter_slot_waited = true;
+            ++cumulative_stats_.lora_slot_waits;
+        }
+        return resident;
     }
 
     void try_restore_continuation(const std::shared_ptr<Request>& request) noexcept {
@@ -4119,6 +4176,8 @@ private:
     const bool auto_save_evicted_;
     const RepetitionGuardOptions repetition_guard_;
     const AdmissionResources admission_capacity_;
+    // Pool adapter names by pool index.
+    const std::vector<std::string> adapter_names_;
     std::unique_ptr<cache::ContinuationCache> continuation_cache_;
     // Off preserves historical unmanaged same-lane prefix reuse. Every active tier applies this
     // policy; zero capacity or zero TTL therefore retains no inactive GPU continuation.
@@ -4159,6 +4218,8 @@ private:
     AtomicContinuationStats continuation_stats_;
     StablePrefixFlights stable_flights_;
     std::vector<SlotState> published_slots_;
+    std::vector<AdapterSlotState> published_adapter_slots_;
+    MemorySummary published_memory_;
     // Digest of each lane's retained session, maintained by the completion and restore paths
     // (the only ones that set `retained`) so publishing needs no ledger hashing.
     std::array<std::string, kMaximumConcurrency> retained_digest_cache_{};

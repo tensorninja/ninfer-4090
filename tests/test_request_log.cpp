@@ -86,7 +86,15 @@ int main() {
     load.tensor_count         = 42;
     load.resource_count       = 6;
     load.lora_adapters        = {ninfer::LoraAdapterInfo{.name = "caveman", .rank = 16},
-                                 ninfer::LoraAdapterInfo{.name = "sudoku", .rank = 16}};
+                                 ninfer::LoraAdapterInfo{.name = "sudoku", .rank = 16},
+                                 ninfer::LoraAdapterInfo{.name         = "decider",
+                                                         .kind         = ninfer::LoraAdapterKind::Decision,
+                                                         .rank         = 8,
+                                                         .temperature  = 1.1F,
+                                                         .pointer_dim  = 256,
+                                                         .description  = "routing decisions",
+                                                         .release_date = "2026-09-20"}};
+    load.decisions_supported  = true;
     load.lora_rank            = 16;
     load.lora_device_bytes    = 176947200;
     load.lora_file_bytes      = 88473600;
@@ -126,7 +134,7 @@ int main() {
 
     const Json server = Json::parse(
         format_server_start_json("serve-test", 1000, options, sampling_defaults, "deployment-alias",
-                                 load, memory, environment, std::uint64_t{123456}));
+                                 "decider", load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
@@ -138,9 +146,25 @@ int main() {
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
-    failures += check(server.at("adapters").at("count") == 2, "adapter count missing");
-    failures += check(server.at("adapters").at("names").at(1) == "sudoku",
-                      "adapter names missing or out of bank order");
+    // The pool in pool order, each adapter with its kind and the model id that selects it: a chat
+    // model on /v1, or a System One model with its calibration on /systemone.
+    const Json& pool = server.at("adapters").at("pool");
+    failures +=
+        check(server.at("adapters").at("count") == 3 && pool.size() == 3, "adapter pool missing");
+    failures += check(pool.at(1).at("name") == "sudoku" && pool.at(1).at("kind") == "generative" &&
+                          pool.at(1).at("model_id") == "deployment-alias-sudoku" &&
+                          !pool.at(1).contains("temperature"),
+                      "generative adapter missing, out of pool order or not a chat model");
+    failures +=
+        check(pool.at(2).at("name") == "decider" && pool.at(2).at("kind") == "decision" &&
+                  pool.at(2).at("model_id") == "decider" && pool.at(2).at("rank") == 8 &&
+                  pool.at(2).at("temperature") == 1.1 && pool.at(2).at("pointer_dim") == 256 &&
+                  pool.at(2).at("release_date") == "2026-09-20",
+              "decision adapter missing its System One model id or calibration");
+    failures += check(server.at("systemone").at("supported") == true &&
+                          server.at("systemone").at("alias") == "jev-latest" &&
+                          server.at("systemone").at("binding") == "decider",
+                      "System One surface missing from server_start");
     failures += check(server.at("adapters").at("rank") == 16, "adapter rank missing");
     failures += check(server.at("adapters").at("device_bytes") == 176947200,
                       "adapter bank device bytes missing");
@@ -455,7 +479,12 @@ int main() {
     ThroughputReport throughput;
     throughput.interval_seconds                            = 2.0;
     throughput.computed_prefill_tokens                     = 100;
+    throughput.decision_prefill_tokens                                 = 30;
     throughput.committed_decode_tokens                     = 40;
+    throughput.scheduler.lora_stages                                   = 5;
+    throughput.scheduler.lora_slot_waits                               = 2;
+    throughput.continuation_delta.lora_stages                          = 1;
+    throughput.continuation_delta.lora_slot_waits                      = 1;
     throughput.decode_rounds                               = 10;
     throughput.decode_row_rounds                           = 18;
     throughput.scheduler.running_requests                  = 2;
@@ -495,8 +524,14 @@ int main() {
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
+                          throughput_json.at("tokens").at("decision_prefill") == 30 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
+    failures += check(throughput_json.at("adapters").at("stages") == 5 &&
+                          throughput_json.at("adapters").at("delta_stages") == 1 &&
+                          throughput_json.at("adapters").at("slot_waits") == 2 &&
+                          throughput_json.at("adapters").at("delta_slot_waits") == 1,
+                      "throughput LoRA bank counters mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
     failures += check(throughput_json.at("continuation_cache").at("lookup_hits") == 7 &&
@@ -624,6 +659,24 @@ int main() {
                           restarted.continuation_delta.continuation_l2_restore_successes == 2 &&
                           restarted.continuation_delta.continuation_miss_no_alias == 1,
                       "counter restart deltas use the current snapshot without underflow");
+
+    // Decision prefill and the LoRA bank counters are interval deltas like every other counter.
+    ninfer::RuntimeStats decisions_before;
+    decisions_before.computed_prefill_tokens = 500;
+    decisions_before.decision_prefill_tokens = 200;
+    decisions_before.lora_stages             = 3;
+    ninfer::RuntimeStats decisions_after     = decisions_before;
+    decisions_after.computed_prefill_tokens  = 900;
+    decisions_after.decision_prefill_tokens  = 450;
+    decisions_after.lora_stages              = 4;
+    decisions_after.lora_slot_waits          = 1;
+    const ThroughputReport decisions =
+        make_throughput_report(decisions_before, decisions_after, 1.0);
+    failures += check(decisions.computed_prefill_tokens == 400 &&
+                          decisions.decision_prefill_tokens == 250 &&
+                          decisions.continuation_delta.lora_stages == 1 &&
+                          decisions.continuation_delta.lora_slot_waits == 1,
+                      "decision prefill or LoRA bank deltas mismatch");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

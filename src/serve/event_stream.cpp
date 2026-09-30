@@ -76,6 +76,7 @@ void EventStream::publish(std::string record, bool retain_as_server_start) {
 void EventStream::emit_server_start(const ServeOptions& options,
                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
                                     const std::string& public_model_id,
+                                    const std::string& systemone_binding,
                                     const ninfer::LoadSummary& load,
                                     const ninfer::MemorySummary& memory) {
     std::error_code error;
@@ -83,8 +84,9 @@ void EventStream::emit_server_start(const ServeOptions& options,
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
     publish(format_server_start_json(server_instance_id_, unix_time_ms(), options,
-                                     sampling_defaults, public_model_id, load, memory,
-                                     query_server_log_environment(options.device), artifact_size),
+                                     sampling_defaults, public_model_id, systemone_binding, load,
+                                     memory, query_server_log_environment(options.device),
+                                     artifact_size),
             true);
 }
 

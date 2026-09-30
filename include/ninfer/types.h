@@ -839,6 +839,9 @@ struct MemorySummary {
 struct RuntimeStats {
     // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
     std::uint64_t computed_prefill_tokens = 0;
+    // The part of computed_prefill_tokens that System One decisions evaluated, their state chunks
+    // and branch passes. The rest is chat prefill.
+    std::uint64_t decision_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Cumulative wall time of prefill and decode execution units. Advances with every unit,
@@ -998,6 +1001,14 @@ struct RuntimeStats {
     double worker_upkeep_seconds                     = 0.0;
     std::uint64_t worker_decode_rounds               = 0;
     std::uint64_t worker_prefill_steps               = 0;
+    // LoRA bank residency. `lora_stages` counts adapters staged into a device slot, a swap or the
+    // first fill of an empty slot, and `lora_stage_seconds` the execution-thread time they took,
+    // including the demotion of retained lanes that held the displaced adapter. `lora_slot_waits`
+    // counts requests whose admission waited at least once because every slot was held by a
+    // running lane using another adapter.
+    std::uint64_t lora_stages                        = 0;
+    double lora_stage_seconds                        = 0.0;
+    std::uint64_t lora_slot_waits                    = 0;
     std::uint32_t running_requests                   = 0;
     std::uint32_t prefilling_requests                = 0;
     std::uint32_t decode_ready_requests              = 0;
@@ -1028,11 +1039,22 @@ struct SlotCheckpoint {
     std::string session_digest;
 };
 
+// Which of the two request kinds an Engine lane runs, or produced the state it retains: a chat
+// generation, or a System One decision, whose retained state only a later decision of the same
+// adapter continues.
+enum class SlotWork : std::uint8_t {
+    None,
+    Generation,
+    Decision,
+};
+
 // One Engine lane's occupancy for /slots-style reporting: an active request's prompt size, or
 // the retained resident session. session_digest is a stable identifier of the exact resident
 // token ledger (FNV-1a 64 as 16 hex chars) - equal digests mean the identical session; clients
 // treat it as opaque and may pass it back as a slot-operation precondition. checkpoints lists
-// the retained turn checkpoints (oldest first) a diverging prompt can restore from.
+// the retained turn checkpoints (oldest first) a diverging prompt can restore from. `work` and
+// `adapter` say what the lane runs or retains and under which pool adapter; `adapter` is empty
+// for the base weights and for an empty lane.
 struct SlotState {
     bool processing              = false;
     bool retained                = false;
@@ -1040,6 +1062,17 @@ struct SlotState {
     std::uint32_t cached_tokens  = 0;
     std::string session_digest;
     std::vector<SlotCheckpoint> checkpoints;
+    SlotWork work = SlotWork::None;
+    std::string adapter;
+};
+
+// One device slot of the LoRA bank. `adapter` is the pool name of the adapter staged into it,
+// empty when the slot has never been staged. `pinned` means a running lane executes against the
+// slot's bytes, so admission cannot swap it out until that lane finishes; the next swap takes
+// the least recently used slot that is not pinned.
+struct AdapterSlotState {
+    std::string adapter;
+    bool pinned = false;
 };
 
 // Raised when a slot operation's session precondition (if_digest) does not match the lane's

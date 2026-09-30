@@ -176,6 +176,9 @@ public:
 
     // Truthful per-lane occupancy, read at a request boundary.
     [[nodiscard]] std::vector<SlotState> slot_states() const;
+    // The LoRA bank's device slots, one entry per `--lora-slots`, read at the same boundary.
+    // Empty when the Engine was loaded without a LoRA pool.
+    [[nodiscard]] std::vector<AdapterSlotState> adapter_slot_states() const;
 
 private:
     class Impl;

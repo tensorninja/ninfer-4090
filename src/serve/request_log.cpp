@@ -1,12 +1,15 @@
 #include "serve/request_log.h"
 #include "product/prefix_checkpoint_options.h"
 #include "product/speculative_options.h"
+#include "product/systemone/request.h"
 #include "serve/console_log.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -48,6 +51,46 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
     if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) { return "rk4v4"; }
     if (storage == ninfer::KvCacheStorage::RK2V4E8) { return "rk2v4-e8"; }
     return "int8-group64";
+}
+
+double shortest_double(float value) noexcept {
+    std::array<char, 32> buffer{};
+    const std::to_chars_result text =
+        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    double widened = value;
+    std::from_chars(buffer.data(), text.ptr, widened);
+    return widened;
+}
+
+nlohmann::json adapter_inventory_json(const ninfer::LoadSummary& load,
+                                      const std::string& public_model_id) {
+    nlohmann::json pool = nlohmann::json::array();
+    for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
+        if (adapter.kind == ninfer::LoraAdapterKind::Decision) {
+            pool.push_back({{"name", adapter.name},
+                            {"kind", "decision"},
+                            {"rank", adapter.rank},
+                            {"model_id", adapter.name},
+                            {"temperature", shortest_double(adapter.temperature)},
+                            {"pointer_dim", adapter.pointer_dim},
+                            {"description", adapter.description},
+                            {"release_date", adapter.release_date}});
+        } else {
+            pool.push_back({{"name", adapter.name},
+                            {"kind", "generative"},
+                            {"rank", adapter.rank},
+                            {"model_id", public_model_id + "-" + adapter.name}});
+        }
+    }
+    return {{"count", load.lora_adapters.size()}, {"rank", load.lora_rank},
+            {"slots", load.lora_slots},           {"device_bytes", load.lora_device_bytes},
+            {"file_bytes", load.lora_file_bytes}, {"pool", std::move(pool)}};
+}
+
+nlohmann::json systemone_json(const ninfer::LoadSummary& load, const std::string& binding) {
+    return {{"supported", load.decisions_supported},
+            {"alias", std::string(product::systemone::kDefaultModel)},
+            {"binding", binding}};
 }
 
 namespace {
@@ -649,8 +692,9 @@ std::string format_throughput(const ThroughputReport& report) {
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
     const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
+    const std::string& systemone_binding, const ninfer::LoadSummary& load,
+    const ninfer::MemorySummary& memory, const ServerLogEnvironment& environment,
+    std::optional<std::uint64_t> artifact_size_bytes) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
 
     Json artifact_size = nullptr;
@@ -678,26 +722,10 @@ std::string format_server_start_json(
                               {"resource_count", load.resource_count},
                               {"load_seconds", load.load_seconds},
                               {"upload_seconds", load.upload_seconds}};
-    // The discovered adapter pool, so a replayed log can name every selectable adapter even
-    // when no request used one. `count` is the pool; `slots` is how many are resident at once.
-    // `decision_names` are the System One models; `systemone_default` is the configured binding of
-    // the SDK-default model name (empty: the only decision adapter, if there is exactly one).
-    Json adapter_names  = Json::array();
-    Json decision_names = Json::array();
-    for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
-        adapter_names.push_back(adapter.name);
-        if (adapter.kind == ninfer::LoraAdapterKind::Decision) {
-            decision_names.push_back(adapter.name);
-        }
-    }
-    record["adapters"] = Json{{"count", load.lora_adapters.size()},
-                              {"names", std::move(adapter_names)},
-                              {"decision_names", std::move(decision_names)},
-                              {"systemone_default", options.systemone_default},
-                              {"rank", load.lora_rank},
-                              {"slots", load.lora_slots},
-                              {"device_bytes", load.lora_device_bytes},
-                              {"file_bytes", load.lora_file_bytes}};
+    // The discovered adapter pool, so a replayed log can name and classify every selectable
+    // adapter even when no request used one, and the System One surface it serves.
+    record["adapters"]  = adapter_inventory_json(load, public_model_id);
+    record["systemone"] = systemone_json(load, systemone_binding);
     record["engine"]   = Json{
           {"device", options.device},
           {"max_context", options.max_context},
@@ -888,10 +916,17 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                         static_cast<double>(report.decode_rounds);
     }
     record["interval_seconds"] = report.interval_seconds;
-    record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
-                                      {"committed_decode", report.committed_decode_tokens}};
+    // decision_prefill is the System One part of computed_prefill; the rest is chat prefill.
+    record["tokens"] = Json{{"computed_prefill", report.computed_prefill_tokens},
+                            {"decision_prefill", report.decision_prefill_tokens},
+                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    // LoRA bank residency: adapters staged into a slot, and requests that waited for one.
+    record["adapters"] = Json{{"stages", report.scheduler.lora_stages},
+                              {"delta_stages", report.continuation_delta.lora_stages},
+                              {"slot_waits", report.scheduler.lora_slot_waits},
+                              {"delta_slot_waits", report.continuation_delta.lora_slot_waits}};
     // Null on boards with no cumulative energy counter, so a replayed log distinguishes "this
     // server could not measure energy" from "this server used none".
     record["energy"] = energy_json(report);

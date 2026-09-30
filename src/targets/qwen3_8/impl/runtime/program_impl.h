@@ -561,6 +561,7 @@ bool ProgramImplCore::ensure_adapter_resident(
 
     // File open, identity verification and host assembly can fail for ordinary input reasons.
     // Complete them before demoting retained state; commit below is then only one device upload.
+    const Clock::time_point stage_started = Clock::now();
     prepare_lora_slot<Variant>(model, static_cast<std::size_t>(adapter));
     const std::int32_t evicted = lora_slot_pool_[victim];
     if (evicted >= 0) {
@@ -585,7 +586,20 @@ bool ProgramImplCore::ensure_adapter_resident(
     lora_slot_pool_[victim] = adapter;
     lora_slot_used_[victim] = lora_clock_;
     ++lora_stage_count_;
+    lora_stage_seconds_ += std::chrono::duration<double>(Clock::now() - stage_started).count();
     return true;
+}
+
+std::vector<LoraSlotState> ProgramImplCore::lora_slot_states() const {
+    std::vector<LoraSlotState> states;
+    states.reserve(lora_slot_pool_.size());
+    for (std::size_t slot = 0; slot < lora_slot_pool_.size(); ++slot) {
+        states.push_back(LoraSlotState{
+            .adapter = lora_slot_pool_[slot],
+            .pinned  = lora_slot_pinned(slot),
+        });
+    }
+    return states;
 }
 
 std::string ProgramImplCore::adapter_scope(std::int32_t adapter) const {
