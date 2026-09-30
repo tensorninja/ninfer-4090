@@ -1,10 +1,16 @@
-import { BandChart } from '../components/charts'
+import { BandChart, Legend } from '../components/charts'
 import { CHART } from '../components/echart'
 import { Info, Term } from '../components/tooltip'
 import { Empty, Panel } from '../components/ui'
 import { rate, seconds } from '../lib/format'
 import type { ThroughputRecord } from '../lib/records'
 import { bands, span, weightedRate } from '../lib/series'
+
+/** System One's share of an interval's prefill rate; zero in a log that predates the split. */
+function decisionPrefillRate(record: ThroughputRecord): number {
+  const tokens = record.tokens.decision_prefill ?? 0
+  return record.interval_seconds > 0 ? tokens / record.interval_seconds : 0
+}
 
 export function ThroughputPanel({
   records,
@@ -14,6 +20,14 @@ export function ThroughputPanel({
   /** Configured lane count, used as the ceiling for the batch chart. */
   lanes: number | undefined
 }) {
+  // Prefill is one rate over both systems. A schema-22 record splits out the System One part, so
+  // the chart stacks chat under System One and their sum is the rate the engine reported.
+  const split = records.some((record) => record.tokens.decision_prefill !== undefined)
+  const decisionPrefill = bands(records, decisionPrefillRate)
+  const chatPrefill = bands(
+    records,
+    (record) => record.throughput_tokens_per_second.prefill - decisionPrefillRate(record),
+  )
   const prefill = bands(records, (record) => record.throughput_tokens_per_second.prefill)
   const decode = bands(records, (record) => record.throughput_tokens_per_second.decode)
   const window = span(records)
@@ -36,10 +50,17 @@ export function ThroughputPanel({
   const batch = bands(records, (record) => record.decode_batch.average_size ?? 0)
 
   const report = [
-    { name: 'prefill', bands: prefill, color: CHART.violet },
+    ...(split
+      ? [
+          { name: 'chat prefill', bands: chatPrefill, color: CHART.violet },
+          { name: 'System One prefill', bands: decisionPrefill, color: CHART.systemOne },
+        ]
+      : [{ name: 'prefill', bands: prefill, color: CHART.violet }]),
     { name: 'decode (all lanes)', bands: decode, color: CHART.accent },
     { name: 'decode batch', bands: batch, color: CHART.blue },
   ]
+  const meanPrefill = weightedRate(records, (r) => r.throughput_tokens_per_second.prefill)
+  const meanDecisionPrefill = weightedRate(records, decisionPrefillRate)
 
   // Both decode figures are taken over the intervals that actually ran a decode round. A mean
   // across the whole window would divide by idle time and report a rate the engine never
@@ -69,8 +90,13 @@ export function ThroughputPanel({
               <Term k="prefillRate">prefill</Term>
             </span>
             <span className="chart__caption">
-              mean {rate(weightedRate(records, (r) => r.throughput_tokens_per_second.prefill))}{' '}
-              tok/s
+              mean {rate(meanPrefill)} tok/s
+              {split ? (
+                <>
+                  {' '}
+                  · <Term k="decisionPrefill">{rate(meanDecisionPrefill)} System One</Term>
+                </>
+              ) : null}
             </span>
           </div>
           <BandChart
@@ -79,7 +105,39 @@ export function ThroughputPanel({
             height={86}
             domain={domain}
             report={report}
-            series={[{ name: 'prefill', bands: prefill, color: CHART.violet, opacity: 0.85 }]}
+            stack={split}
+            series={
+              split
+                ? [
+                    {
+                      name: 'chat prefill',
+                      bands: chatPrefill,
+                      color: CHART.violet,
+                      opacity: 0.85,
+                    },
+                    {
+                      name: 'System One prefill',
+                      bands: decisionPrefill,
+                      color: CHART.systemOne,
+                      opacity: 0.85,
+                    },
+                  ]
+                : [{ name: 'prefill', bands: prefill, color: CHART.violet, opacity: 0.85 }]
+            }
+            legend={
+              split ? (
+                <Legend
+                  items={[
+                    { label: 'chat', color: CHART.violet },
+                    {
+                      label: 'System One',
+                      color: CHART.systemOne,
+                      hint: 'Decision state and branch prefill, stacked on chat prefill.',
+                    },
+                  ]}
+                />
+              ) : undefined
+            }
           />
 
           <div className="throughput__row">

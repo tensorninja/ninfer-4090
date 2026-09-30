@@ -1,4 +1,4 @@
-// Record shapes, as emitted by src/serve/request_log.cpp (schema 17).
+// Record shapes, as emitted by src/serve/request_log.cpp (schema 22).
 //
 // GET /events streams these live and `--request-log-jsonl` appends the identical lines, so one
 // set of types serves both the live dashboard and file replay. Only the fields the dashboard
@@ -7,6 +7,10 @@
 //
 // Records are discriminated on `event`, never on `schema_version`, so an older log still
 // replays: fields added by a later schema are declared optional and read as absent.
+//
+// One process serves two systems. Chat (OpenAI/Anthropic, `request_*`) generates text; System
+// One (`/systemone`, `decision_*`, schema 21 on) answers multiple-choice questions over a state
+// with a prefill-only pass. Both run on the same weights, lanes, KV pool and adapter bank.
 
 export interface RequestContext {
   request_id: number
@@ -95,7 +99,31 @@ export interface SpeculativeStats {
 }
 
 /**
- * The resident adapter bank, as reported by `server_start` and `/telemetry`.
+ * A chat adapter corrects generation and is selected on `/v1` and the Anthropic route; a decision
+ * adapter adds a System One pointer head and is selected on `/systemone`. Both kinds share one
+ * pool and one device bank.
+ */
+export type AdapterKind = 'generative' | 'decision'
+
+/** One discovered adapter, schema 22. */
+export interface PooledAdapter {
+  name: string
+  kind: AdapterKind
+  rank: number
+  /**
+   * The id a client selects it by: `<model>-<name>` for a chat adapter, the bare name for a
+   * decision adapter, which is a System One model in its own right.
+   */
+  model_id: string
+  /** Decision adapters only: the head's calibration temperature and model-card fields. */
+  temperature?: number
+  pointer_dim?: number
+  description?: string
+  release_date?: string
+}
+
+/**
+ * The adapter pool and its device bank, as reported by `server_start` and `/telemetry`.
  *
  * Every registered adapter shares one rank by construction, so a single rank and one bank byte
  * count describe the whole set. `device_bytes` is the bank's own arena, which sits outside the
@@ -104,14 +132,27 @@ export interface SpeculativeStats {
 export interface AdapterInventory {
   /** Discovered pool size. Every entry is selectable regardless of what is resident. */
   count: number
-  names: string[]
   rank: number
   /** Device-resident slots the pool is swapped through. Absent in logs written before slots. */
   slots?: number
   device_bytes: number
   file_bytes: number
-  /** Served model ids, `/telemetry` only; `server_start` reports names alone. */
-  model_ids?: string[]
+  /** Present from schema 22: every pooled adapter with its kind and served id. */
+  pool?: PooledAdapter[]
+  /** Schema 15–21: pooled names of every kind, without kind or served id. */
+  names?: string[]
+  /** Schema 21: the subset of `names` that are decision adapters. */
+  decision_names?: string[]
+}
+
+/** The System One surface, schema 22. */
+export interface SystemOneSurface {
+  /** Whether this target runs decisions at all. */
+  supported: boolean
+  /** The SDK's default model name, served as an alias. */
+  alias: string
+  /** The decision adapter the alias resolves to; empty when none is bound. */
+  binding: string
 }
 
 interface RecordEnvelope {
@@ -163,6 +204,8 @@ export interface ServerStartRecord extends RecordEnvelope {
   }
   /** Discovered LoRA pool, present from schema 15. Names appear even with no adapter traffic. */
   adapters?: AdapterInventory
+  /** Present from schema 22. */
+  systemone?: SystemOneSurface
   environment: {
     device: number
     gpu_name: string
@@ -217,6 +260,78 @@ export interface RequestErrorRecord extends RecordEnvelope {
   error: { message: string }
 }
 
+/** A System One decision as submitted: its layout, before anything ran. */
+export interface DecisionContext {
+  request_id: number
+  /** The `x-typesafe-request-id` the response carries. */
+  x_request_id: string
+  protocol: 'systemone'
+  /** The requested model name, which may be the SDK alias. */
+  model: string
+  /** The decision adapter it resolved to. */
+  adapter: string
+  allow_prefix_reuse: boolean
+  questions: number
+  /** Options summed over every question. */
+  options: number
+  state_tokens: number
+  state_truncated: boolean
+  /** Question and option tokens summed over every branch. */
+  branch_tokens: number
+  longest_branch: number
+  input_tokens: number
+}
+
+/**
+ * Decision phases, in seconds.
+ *
+ * `queue` runs from submission to admission and includes `restore`, the import of a cached state
+ * just before admission. `execution` runs from admission to the result and decomposes into
+ * `state` (state prefill) and `branch` (the branch passes, readout and head). System One's own
+ * `latency_ms` is `restore + execution`: the engine's time without the wait for a lane. `total`
+ * is receipt to response, including `prepare` on the HTTP side.
+ */
+export interface DecisionTimings {
+  prepare: number
+  queue: number
+  restore: number
+  state: number
+  branch: number
+  execution: number
+  total: number
+}
+
+export interface DecisionStartRecord extends RecordEnvelope {
+  event: 'decision_start'
+  request: DecisionContext
+}
+
+export interface DecisionDoneRecord extends RecordEnvelope {
+  event: 'decision_done'
+  request: DecisionContext
+  result: {
+    output_tokens: number
+    /** State tokens resident in the lane or restored from a tier, rather than computed. */
+    reused_state_tokens: number
+    computed_state_tokens: number
+    state_source: ContinuationSource
+    branch_passes: number
+    long_branch_chunks: number
+    /** The lane that ran it. */
+    slot: number
+  }
+  timings_seconds: DecisionTimings
+  /** Null where the phase computed no tokens, or none measurably. */
+  rates: { state_tok_s: number | null; branch_tok_s: number | null }
+}
+
+export interface DecisionErrorRecord extends RecordEnvelope {
+  event: 'decision_error'
+  request: DecisionContext
+  /** `status` is the HTTP status System One answered with. */
+  error: { status: number; message: string }
+}
+
 /**
  * One reporting interval. The reporter only emits when the interval had activity, so samples are
  * irregularly spaced and `interval_seconds` — not the gap between timestamps — is the authority
@@ -250,7 +365,23 @@ export interface ThroughputRecord extends RecordEnvelope {
       decode: number | null
     }
   } | null
-  tokens: { computed_prefill: number; committed_decode: number }
+  tokens: {
+    /** Every prefilled token, chat and System One together. */
+    computed_prefill: number
+    /** Present from schema 22: the System One part of `computed_prefill`. */
+    decision_prefill?: number
+    committed_decode: number
+  }
+  /**
+   * Present from schema 22. Adapters staged into a device slot, and requests whose admission
+   * waited because every slot held an adapter that a running lane needed.
+   */
+  adapters?: {
+    stages: number
+    delta_stages: number
+    slot_waits: number
+    delta_slot_waits: number
+  }
   decode_batch: { rounds: number; row_rounds: number; average_size: number | null }
   scheduler: {
     running: number
@@ -322,20 +453,33 @@ export interface ThroughputRecord extends RecordEnvelope {
 }
 
 export type EngineRecord =
-  ServerStartRecord | RequestStartRecord | RequestDoneRecord | RequestErrorRecord | ThroughputRecord
+  | ServerStartRecord
+  | RequestStartRecord
+  | RequestDoneRecord
+  | RequestErrorRecord
+  | DecisionStartRecord
+  | DecisionDoneRecord
+  | DecisionErrorRecord
+  | ThroughputRecord
 
 export type RecordEvent = EngineRecord['event']
+
+/** Every record event, which is also the SSE frame name `/events` sends it under. */
+export const RECORD_EVENTS: readonly RecordEvent[] = [
+  'server_start',
+  'request_start',
+  'request_done',
+  'request_error',
+  'decision_start',
+  'decision_done',
+  'decision_error',
+  'throughput',
+]
 
 export function isEngineRecord(value: unknown): value is EngineRecord {
   if (typeof value !== 'object' || value === null) return false
   const event = (value as { event?: unknown }).event
-  return (
-    event === 'server_start' ||
-    event === 'request_start' ||
-    event === 'request_done' ||
-    event === 'request_error' ||
-    event === 'throughput'
-  )
+  return RECORD_EVENTS.includes(event as RecordEvent)
 }
 
 /**

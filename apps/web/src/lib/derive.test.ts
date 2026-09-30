@@ -1,14 +1,24 @@
 import { expect, test } from 'bun:test'
 
 import {
+  adapterPool,
   percentile,
   summarizeByAdapter,
   summarizeChurn,
+  summarizeDecisions,
+  summarizeDecisionsByAdapter,
   summarizeEnergy,
   summarizeRequests,
 } from './derive'
 import { energyPerMillionTokens, WH_PER_MILLION_TOKENS_PER_JOULE } from './format'
-import { parseRecordLine, type RequestDoneRecord, type ThroughputRecord } from './records'
+import {
+  parseRecordLine,
+  type AdapterInventory,
+  type ContinuationSource,
+  type DecisionDoneRecord,
+  type RequestDoneRecord,
+  type ThroughputRecord,
+} from './records'
 
 // Fixture shaped like real schema-19 records: a mix of tier sources, one cold miss, one restore
 // failure. Expected values below were produced by the reference implementation
@@ -608,4 +618,251 @@ test('energy per million tokens reports absence rather than a zero cost', () => 
   expect(energyPerMillionTokens(Number.NaN)).toBe('—')
   expect(energyPerMillionTokens(-1)).toBe('—')
   expect(energyPerMillionTokens(0)).toBe('0 Wh')
+})
+
+// --- System One ------------------------------------------------------------------------------
+
+// A decision shaped like a real schema-22 `decision_done` record. Only the layout, reuse and
+// timing inputs vary.
+function decided(
+  id: number,
+  values: {
+    adapter: string
+    model?: string
+    questions: number
+    options: number
+    stateTokens: number
+    truncated?: boolean
+    reused: number
+    source: ContinuationSource
+    branchTokens: number
+    passes: number
+    prepare: number
+    queue: number
+    restore: number
+    state: number
+    branch: number
+    execution: number
+    total: number
+  },
+): DecisionDoneRecord {
+  return {
+    event: 'decision_done',
+    schema_version: 22,
+    server_instance_id: 'serve-test-1',
+    timestamp_unix_ms: 1_700_000_000_000 + id * 1000,
+    artifact_type: 'ninfer_serve_request_log',
+    request: {
+      request_id: id,
+      x_request_id: `ts_${id}`,
+      protocol: 'systemone',
+      model: values.model ?? values.adapter,
+      adapter: values.adapter,
+      allow_prefix_reuse: true,
+      questions: values.questions,
+      options: values.options,
+      state_tokens: values.stateTokens,
+      state_truncated: values.truncated ?? false,
+      branch_tokens: values.branchTokens,
+      longest_branch: 64,
+      input_tokens: values.stateTokens + values.branchTokens,
+    },
+    result: {
+      output_tokens: 40,
+      reused_state_tokens: values.reused,
+      computed_state_tokens: values.stateTokens - values.reused,
+      state_source: values.source,
+      branch_passes: values.passes,
+      long_branch_chunks: 0,
+      slot: 0,
+    },
+    timings_seconds: {
+      prepare: values.prepare,
+      queue: values.queue,
+      restore: values.restore,
+      state: values.state,
+      branch: values.branch,
+      execution: values.execution,
+      total: values.total,
+    },
+    rates: { state_tok_s: null, branch_tok_s: null },
+  }
+}
+
+// A cold state cut to kev's 65,536-token limit, a repeat of another state still resident in its
+// lane, and a smaller state restored from host memory. The restore sits inside `queue`.
+const DECISIONS: DecisionDoneRecord[] = [
+  decided(1, {
+    adapter: 'decision-v7',
+    questions: 6,
+    options: 18,
+    stateTokens: 65_536,
+    truncated: true,
+    reused: 0,
+    source: 'none',
+    branchTokens: 300,
+    passes: 1,
+    prepare: 0.05,
+    queue: 0.1,
+    restore: 0,
+    state: 16.384,
+    branch: 0.3,
+    execution: 16.7,
+    total: 16.85,
+  }),
+  decided(2, {
+    adapter: 'decision-v7',
+    model: 'jev-latest',
+    questions: 6,
+    options: 18,
+    stateTokens: 8000,
+    reused: 8000,
+    source: 'l1',
+    branchTokens: 300,
+    passes: 1,
+    prepare: 0.05,
+    queue: 0.02,
+    restore: 0,
+    state: 0,
+    branch: 0.3,
+    execution: 0.32,
+    total: 0.39,
+  }),
+  decided(3, {
+    adapter: 'pilot',
+    questions: 2,
+    options: 4,
+    stateTokens: 1000,
+    reused: 1000,
+    source: 'l2',
+    branchTokens: 100,
+    passes: 1,
+    prepare: 0.03,
+    queue: 0.25,
+    restore: 0.2,
+    state: 0,
+    branch: 0.1,
+    execution: 0.12,
+    total: 0.4,
+  }),
+]
+
+test('decision summary reports System One latency, phase shares and state reuse', () => {
+  const summary = summarizeDecisions(DECISIONS)
+  expect(summary.count).toBe(3)
+  expect(summary.questions).toBe(14)
+  expect(summary.options).toBe(40)
+  expect(summary.truncatedStates).toBe(1)
+
+  // latency_ms is restore + execution: 16.7, 0.32 and 0.2 + 0.12. The queue wait is excluded.
+  expect(summary.latency.p50).toBeCloseTo(0.32, 12)
+  expect(summary.latency.p90).toBeCloseTo(16.7, 12)
+  expect(summary.latency.max).toBeCloseTo(16.7, 12)
+  expect(summary.latency.mean).toBeCloseTo(17.34 / 3, 12)
+  expect(summary.total.p50).toBeCloseTo(0.4, 12)
+  expect(summary.total.p90).toBeCloseTo(16.85, 12)
+
+  // Engine time is queue + execution = 16.8 + 0.34 + 0.37. The wait is the queue without the
+  // restore it contains: 0.1 + 0.02 + 0.05.
+  const engine = 17.51
+  expect(summary.phaseShare.wait).toBeCloseTo(0.17 / engine, 12)
+  expect(summary.phaseShare.restore).toBeCloseTo(0.2 / engine, 12)
+  expect(summary.phaseShare.state).toBeCloseTo(16.384 / engine, 12)
+  expect(summary.phaseShare.branch).toBeCloseTo(0.7 / engine, 12)
+
+  expect(summary.stateTokens).toBe(74_536)
+  expect(summary.reusedStateTokens).toBe(9000)
+  expect(summary.stateReuse).toBeCloseTo(9000 / 74_536, 12)
+  expect(summary.bySource).toEqual({ none: 1, l1: 1, l2: 1 })
+  expect(summary.branchTokens).toBe(700)
+  expect(summary.branchPasses).toBe(3)
+  // Pooled over the phases that ran: only the cold state was prefilled.
+  expect(summary.stateTokensPerSecond).toBeCloseTo(4000, 9)
+  expect(summary.branchTokensPerSecond).toBeCloseTo(1000, 9)
+})
+
+test('an empty decision window has no rates rather than zero ones', () => {
+  const summary = summarizeDecisions([])
+  expect(summary.count).toBe(0)
+  expect(summary.latency.p50).toBe(0)
+  expect(summary.stateReuse).toBe(0)
+  expect(summary.phaseShare).toEqual({ wait: 0, restore: 0, state: 0, branch: 0 })
+  expect(summary.stateTokensPerSecond).toBeNull()
+  expect(summary.branchTokensPerSecond).toBeNull()
+})
+
+test('decisions group by the resolved adapter, not the requested model', () => {
+  // Decision 2 asked for the SDK alias; it ran on the adapter the alias is bound to.
+  const usage = summarizeDecisionsByAdapter(DECISIONS)
+  expect(usage.map((entry) => entry.name)).toEqual(['decision-v7', 'pilot'])
+  expect(usage[0]!.summary.count).toBe(2)
+  expect(usage[0]!.summary.questions).toBe(12)
+  expect(usage[0]!.summary.latency.p50).toBeCloseTo(16.7, 12)
+  expect(usage[1]!.summary.stateReuse).toBe(1)
+  expect(usage.reduce((total, entry) => total + entry.summary.count, 0)).toBe(DECISIONS.length)
+})
+
+test('the adapter pool reads schema-22 kinds and older name lists alike', () => {
+  const bank = { count: 2, rank: 16, slots: 2, device_bytes: 168_800_000, file_bytes: 80_000_000 }
+  const current: AdapterInventory = {
+    ...bank,
+    pool: [
+      { name: 'math7', kind: 'generative', rank: 16, model_id: 'qwen3.8-27b-math7' },
+      {
+        name: 'decision-v7',
+        kind: 'decision',
+        rank: 16,
+        model_id: 'decision-v7',
+        temperature: 1.25,
+        pointer_dim: 256,
+        description: 'triage',
+        release_date: '2026-09-29',
+      },
+    ],
+  }
+  expect(adapterPool(current)).toEqual([
+    { name: 'math7', kind: 'generative', modelId: 'qwen3.8-27b-math7', temperature: null },
+    { name: 'decision-v7', kind: 'decision', modelId: 'decision-v7', temperature: 1.25 },
+  ])
+
+  // Schema 21 named the decision adapters separately and carried no served ids.
+  const schema21: AdapterInventory = {
+    ...bank,
+    names: ['decision-v7', 'math7'],
+    decision_names: ['decision-v7'],
+  }
+  expect(adapterPool(schema21).map((entry) => [entry.name, entry.kind, entry.modelId])).toEqual([
+    ['decision-v7', 'decision', null],
+    ['math7', 'generative', null],
+  ])
+
+  // Before schema 21 every adapter was a chat adapter.
+  const schema19: AdapterInventory = { ...bank, count: 1, names: ['math7'] }
+  expect(adapterPool(schema19).map((entry) => entry.kind)).toEqual(['generative'])
+  expect(adapterPool(undefined)).toEqual([])
+})
+
+test('decision records pass through the line reader as the server writes them', () => {
+  const done = parseRecordLine(
+    '{"artifact_type":"ninfer_serve_request_log","event":"decision_done","rates":' +
+      '{"branch_tok_s":1234.5,"state_tok_s":null},"request":{"adapter":"decision-v7",' +
+      '"allow_prefix_reuse":true,"branch_tokens":310,"input_tokens":8310,"longest_branch":58,' +
+      '"model":"jev-latest","options":17,"protocol":"systemone","questions":6,"request_id":42,' +
+      '"state_tokens":8000,"state_truncated":false,"x_request_id":"0f5c"},"result":' +
+      '{"branch_passes":1,"computed_state_tokens":0,"long_branch_chunks":0,"output_tokens":61,' +
+      '"reused_state_tokens":8000,"slot":2,"state_source":"l1"},"schema_version":22,' +
+      '"server_instance_id":"serve-1-2","timestamp_unix_ms":1700000000000,"timings_seconds":' +
+      '{"branch":0.25,"execution":0.26,"prepare":0.004,"queue":0.001,"restore":0.0,"state":0.0,' +
+      '"total":0.265}}',
+  )
+  expect(done?.event).toBe('decision_done')
+  const summary = summarizeDecisions([done as DecisionDoneRecord])
+  expect(summary.stateReuse).toBe(1)
+  expect(summary.latency.p50).toBeCloseTo(0.26, 12)
+
+  expect(parseRecordLine('{"event":"decision_start","request":{}}')?.event).toBe('decision_start')
+  expect(parseRecordLine('{"event":"decision_error","error":{"status":503}}')?.event).toBe(
+    'decision_error',
+  )
+  expect(parseRecordLine('{"event":"decision_progress"}')).toBeNull()
 })

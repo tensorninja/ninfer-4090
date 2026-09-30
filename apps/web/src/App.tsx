@@ -1,8 +1,10 @@
 import { useMemo, useRef } from 'react'
 
+import { Legend } from './components/charts'
 import { Pill, StatusDot, type Tone } from './components/ui'
-import { summarizeRequests } from './lib/derive'
+import { adapterPool, KIND_COLOR, summarizeDecisions, summarizeRequests } from './lib/derive'
 import { duration } from './lib/format'
+import { GLOSSARY } from './lib/glossary'
 import { latest } from './lib/series'
 import { cacheFromRecords } from './lib/telemetry'
 import { useEngine } from './lib/use-engine'
@@ -17,6 +19,7 @@ import { MemoryPanel } from './panels/MemoryPanel'
 import { RequestsPanel } from './panels/RequestsPanel'
 import { SchedulerPanel } from './panels/SchedulerPanel'
 import { SlotsPanel } from './panels/SlotsPanel'
+import { SystemOnePanel } from './panels/SystemOnePanel'
 import { ThroughputPanel } from './panels/ThroughputPanel'
 
 const CONNECTION_TONE: Record<string, Tone> = {
@@ -33,6 +36,7 @@ export function App() {
   // Summaries are pure over the retained record window; recomputing them on every 1 Hz telemetry
   // poll would be wasted work on a list that only changes when a request completes.
   const summary = useMemo(() => summarizeRequests(state.requests), [state.requests])
+  const decisionSummary = useMemo(() => summarizeDecisions(state.decisions), [state.decisions])
 
   const engine = state.serverStart?.engine
   const server = state.serverStart?.server
@@ -41,7 +45,11 @@ export function App() {
   // Live inventory wins; a replayed log carries the same block on its own server_start, so a
   // registered-but-unused adapter is still named offline.
   const adapters = state.telemetry?.adapters ?? state.serverStart?.adapters
+  const pool = useMemo(() => adapterPool(adapters), [adapters])
+  const surface = state.telemetry?.systemone ?? state.serverStart?.systemone
   const lanes = state.telemetry?.scheduler.max_concurrency ?? engine?.max_concurrency
+  // System One earns its readings when this server can answer a decision or a log recorded one.
+  const systemOne = pool.some((entry) => entry.kind === 'decision') || state.decisions.length > 0
 
   // Live telemetry wins; a replayed log reconstructs the same cache view from its own records.
   const cache = useMemo(
@@ -63,6 +71,28 @@ export function App() {
               {engine.cuda_graph ? ' · graphs' : ''}
             </span>
           ) : null}
+          <span className="topbar__surfaces">
+            <Legend
+              items={[
+                {
+                  label: 'chat /v1',
+                  color: KIND_COLOR.generative,
+                  hint: 'OpenAI and Anthropic generation, on the base weights or a chat adapter.',
+                },
+                ...(systemOne || surface?.supported
+                  ? [
+                      {
+                        label: `System One /systemone${
+                          surface?.binding ? ` → ${surface.binding}` : ''
+                        }`,
+                        color: KIND_COLOR.decision,
+                        hint: GLOSSARY.systemOne.body,
+                      },
+                    ]
+                  : []),
+              ]}
+            />
+          </span>
         </div>
 
         <div className="topbar__actions">
@@ -98,6 +128,8 @@ export function App() {
         telemetry={state.telemetry}
         records={state.throughput}
         summary={summary}
+        decisions={decisionSummary}
+        systemOne={systemOne}
         engine={engine}
       />
 
@@ -116,7 +148,24 @@ export function App() {
           replay={replay}
         />
         <RequestsPanel requests={state.requests} active={state.active} />
-        <AdaptersPanel inventory={adapters} requests={state.requests} />
+        <SystemOnePanel
+          decisions={state.decisions}
+          summary={decisionSummary}
+          active={state.activeDecisions}
+          errors={state.decisionErrors}
+          pool={pool}
+          surface={surface}
+          replay={replay}
+        />
+        <AdaptersPanel
+          inventory={adapters}
+          bank={replay ? undefined : state.telemetry?.adapters}
+          pool={pool}
+          binding={surface?.binding}
+          requests={state.requests}
+          decisions={state.decisions}
+          records={state.throughput}
+        />
       </main>
     </div>
   )

@@ -3,7 +3,13 @@
 // This is a complete snapshot rather than a delta, which is what lets the dashboard resynchronize
 // after dropped stream records without replaying anything.
 
-import type { AdapterInventory, ServerStartRecord, ThroughputRecord } from './records'
+import type {
+  AdapterInventory,
+  PooledAdapter,
+  ServerStartRecord,
+  SystemOneSurface,
+  ThroughputRecord,
+} from './records'
 
 export interface GpuTelemetry {
   available: boolean
@@ -136,6 +142,9 @@ export interface MemoryTelemetry {
   lora_bank_bytes: number
 }
 
+/** What a lane is running, or the kind of state it retains once idle. */
+export type LaneWork = 'none' | 'generation' | 'decision'
+
 export interface SlotTelemetry {
   processing: boolean
   retained: boolean
@@ -143,6 +152,29 @@ export interface SlotTelemetry {
   cached_tokens: number
   session_digest: string
   checkpoints: number
+  /** `generation` is chat; `decision` is System One. `none` for an empty lane. */
+  work: LaneWork
+  /** The adapter the lane runs or retains state under; empty for the base weights. */
+  adapter: string
+}
+
+/** One device slot of the adapter bank. */
+export interface BankSlot {
+  /** Pool name of the occupant; empty for a slot never staged. */
+  adapter: string
+  /** A running lane executes against the occupant, so admission cannot swap it out. */
+  pinned: boolean
+}
+
+/** The live bank: the whole pool, what each device slot holds, and what swapping has cost. */
+export interface AdapterTelemetry extends AdapterInventory {
+  pool: PooledAdapter[]
+  resident: BankSlot[]
+  /** Adapters staged into a slot since startup, and the execution-thread time they took. */
+  stages: number
+  stage_seconds: number
+  /** Requests whose admission waited at least once because every slot was pinned. */
+  slot_waits: number
 }
 
 export interface Telemetry {
@@ -157,7 +189,8 @@ export interface Telemetry {
   memory: MemoryTelemetry
   slots: SlotTelemetry[]
   events: { jsonl_enabled: boolean; subscribers: number }
-  adapters: AdapterInventory
+  adapters: AdapterTelemetry
+  systemone: SystemOneSurface
 }
 
 /**

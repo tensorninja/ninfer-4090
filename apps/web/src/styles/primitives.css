@@ -274,6 +274,11 @@
   font-weight: 500;
 }
 
+/* A multi-line record summary: one fact per line, as the detail builders join them. */
+.tipwrap {
+  white-space: pre-line;
+}
+
 /* First paint happens off-screen so the bubble can be measured before it is placed. */
 .tip__bubble--measuring {
   left: -9999px;

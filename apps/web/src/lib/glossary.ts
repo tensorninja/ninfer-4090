@@ -206,10 +206,52 @@ export const GLOSSARY = {
     body: 'An idle lane still holding a resident session in VRAM. A matching prompt reuses it with no import at all; a non-matching one evicts or demotes it.',
   },
 
+  // --- System One --------------------------------------------------------------------------
+  systemOne: {
+    title: 'System One',
+    body: 'TypeSafe’s classification API, served under /systemone with kev’s semantics. A decision is one state and a set of typed questions: the engine prefills the state once, then one branch per question that sees the state and itself, and a pointer head turns the readouts at each option into calibrated probabilities. It is prefill-only — it never samples, decodes or drafts — and runs on the same weights, lanes, KV pool and adapter bank as chat.',
+  },
+  decisionLatency: {
+    title: 'Decision latency',
+    body: 'What System One reports as latency_ms: the restore of a cached state plus execution, from admission to the probabilities. The wait for a lane is excluded, as it is in kev. Total is receipt to response as the client saw it, including that wait and request preparation.',
+  },
+  decisionPhases: {
+    title: 'Decision phases',
+    body: 'Summed engine time split into waiting for a lane, restoring a cached state from host memory or disk, prefilling the state, and the branch passes with their readout. State-dominated means states are being computed rather than reused; wait-dominated means the lanes are busy with chat or other decisions.',
+  },
+  stateReuse: {
+    title: 'State reuse',
+    body: 'Share of state tokens that were not prefilled because a lane still held the state (L1) or a tier restored it byte for byte (L2, L3). New questions over a known state cost only their branches.',
+  },
+  branchPasses: {
+    title: 'Branch passes',
+    body: 'Questions are packed first-fit into passes of at most --prefill-chunk columns, and each pass streams the weights once. Branch tokens per second is the rate of that phase, pooled over the window.',
+  },
+  decisionAdapter: {
+    title: 'Decision adapter',
+    body: 'A LoRA adapter plus a pointer head, converted with --decision-head. It is a System One model named by its file stem, selected on /systemone and refused on the chat routes, just as a chat adapter is refused on /systemone.',
+  },
+  chatAdapter: {
+    title: 'Chat adapter',
+    body: 'A generative LoRA adapter, selected on /v1 and the Anthropic route as <model>-<name>. Requests without one run on the base weights.',
+  },
+  sdkAlias: {
+    title: 'SDK alias',
+    body: 'The model name the TypeSafe SDK sends by default. It resolves to one decision adapter: the one named by --systemone-default, or the only decision adapter when the pool holds exactly one.',
+  },
+  decisionPrefill: {
+    title: 'System One prefill',
+    body: 'Decision state and branch tokens evaluated over the interval — the System One part of the prefill rate. Chat prefill is the rest. Both share one execution thread, so a burst of cold states shows up as slower chat decode in the same interval.',
+  },
+  laneWork: {
+    title: 'Lane work',
+    body: 'What a lane is running — a chat generation or a System One decision — and under which adapter. An idle lane keeps the kind of state it retains: a chat session or a decision state, reusable only by the next request of the same kind on the same adapter.',
+  },
+
   // --- adapters ----------------------------------------------------------------------------
   adapterBank: {
     title: 'Adapter bank',
-    body: 'A fixed number of device slots in one arena, drawn from an unbounded pool discovered from --lora-dir. Every slot shares one rank and one site geometry, so both are kernel constants; a narrower or lower-rank adapter is zero-padded into them, which contributes nothing. Selection is a per-row index at execution time, and the engine stages an adapter into the least recently used free slot at admission — the slot address never moves, so a swap is invisible to the captured graph.',
+    body: 'A fixed number of device slots in one arena, drawn from an unbounded pool discovered from --lora-dir. Chat and decision adapters share the pool and the slots. Every slot shares one rank and one site geometry, so both are kernel constants; a narrower or lower-rank adapter is zero-padded into them, which contributes nothing. Selection is a per-row index at execution time, and the engine stages an adapter into an empty or least recently used unpinned slot at admission — the slot address never moves, so a swap is invisible to the captured graph.',
   },
   adapterVram: {
     title: 'Adapter VRAM',
@@ -218,6 +260,22 @@ export const GLOSSARY = {
   adapterUsage: {
     title: 'Per-adapter usage',
     body: 'Completed requests grouped by the adapter that actually served them. A pooled adapter with no rows costs disk and a directory entry, not VRAM — only the resident slots are committed.',
+  },
+  bankSlot: {
+    title: 'Bank slot',
+    body: 'One device-resident adapter slab and its current occupant. Colour gives the occupant’s kind; an empty slot has never been staged.',
+  },
+  pinned: {
+    title: 'Pinned',
+    body: 'A running lane — prefilling, decoding or deciding — executes against this slot’s occupant, so admission cannot swap it out. A lane that merely retains state under it does not pin it: that state is released before the swap, demoted to L2 or L3 where those tiers are on.',
+  },
+  swaps: {
+    title: 'Adapter swaps',
+    body: 'Adapters staged into a slot since startup, and the execution-thread time they took: reading and verifying the adapter file, demoting retained lanes that depended on the old occupant, and the upload.',
+  },
+  slotWaits: {
+    title: 'Slot waits',
+    body: 'Requests whose admission waited at least once because every slot was pinned by a running lane on another adapter. Non-zero under load means --lora-slots is smaller than the set of adapters in concurrent use.',
   },
 
   // --- GPU ---------------------------------------------------------------------------------
@@ -333,7 +391,7 @@ export const GLOSSARY = {
   },
   replayMode: {
     title: 'Replay',
-    body: 'Showing a loaded request log instead of the live engine. Throughput, latency, per-request detail, and cache occupancy against configured capacity all come from the file. Board telemetry and live lane occupancy are sampled, never recorded, so those panels stay empty.',
+    body: 'Showing a loaded request log instead of the live engine. Throughput, latency, per-request detail, System One decisions, and cache occupancy against configured capacity all come from the file. Board telemetry, live lane occupancy and bank residency are sampled, never recorded, so those readings stay empty.',
   },
   eventStream: {
     title: 'Live data',

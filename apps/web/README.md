@@ -1,8 +1,10 @@
 # ninfer-web
 
-Observability dashboard for a running `ninfer-serve` instance. It shows throughput, scheduler
-occupancy, TTFT decomposition, continuation-cache behaviour, VRAM budget, board telemetry, and
-per-request detail, either live or replayed from a request log.
+Observability dashboard for a running `ninfer-serve` instance and both systems it serves, chat
+generation and System One decisions. It shows throughput, scheduler occupancy and lane work, TTFT
+decomposition, decision latency and state reuse, the shared adapter bank, continuation-cache
+behaviour, VRAM budget, board telemetry, and per-request and per-decision detail, either live or
+replayed from a request log.
 
 `docs/dashboard.md` describes what each panel means and how to read it. This file covers building
 and developing the app itself.
@@ -58,13 +60,14 @@ Two engine endpoints, added for this dashboard:
 
 - `GET /telemetry` — a complete snapshot, not a delta: NVML board sensors, scheduler gauges and
   the execution thread's wall-clock split, the `MemorySummary` VRAM budget including the resident
-  LoRA bank, per-slot state, the registered adapter inventory, and cache occupancy paired with the
-  configured capacities. Polled at 1 Hz. Because it is complete,
-  the client resynchronizes by simply fetching it again.
-- `GET /events` — Server-Sent Events carrying the same schema-20 records that
-  `--request-log-jsonl` writes, byte for byte. A late subscriber receives the retained
-  `server_start` plus a bounded backlog, so a browser opened mid-run still knows the engine
-  configuration.
+  LoRA bank, per-slot state with each lane's work kind and adapter, the adapter pool with each
+  adapter's kind, which adapter each bank slot holds, swap and slot-wait counters, the System One
+  alias binding, and cache occupancy paired with the configured capacities. Polled at 1 Hz.
+  Because it is complete, the client resynchronizes by simply fetching it again.
+- `GET /events` — Server-Sent Events carrying the same schema-22 records that
+  `--request-log-jsonl` writes, byte for byte, including the `decision_*` records. A late
+  subscriber receives the retained `server_start` plus a bounded backlog, so a browser opened
+  mid-run still knows the engine configuration.
 
 The stream is bounded and lossy by design. A subscriber that cannot keep up drops its oldest
 records and reports the count rather than applying backpressure to the execution thread; the 1 Hz
@@ -72,17 +75,18 @@ poll remains authoritative for current state.
 
 ## Replay
 
-Loading a `--request-log-jsonl` file re-derives every record-backed panel offline. Board telemetry
-and live slot occupancy are sampled and never written to the log, so those panels say so instead
-of rendering zeros — a reading that was never taken is not shown as a measurement.
+Loading a `--request-log-jsonl` file re-derives every record-backed panel offline, System One
+included. Board telemetry, live slot occupancy, and bank residency are sampled and never written to
+the log, so those panels say so instead of rendering zeros — a reading that was never taken is not
+shown as a measurement.
 
 ## Layout
 
 | Path                         | Contents                                                              |
 | ---------------------------- | --------------------------------------------------------------------- |
-| `src/lib/records.ts`         | Schema-14 record types and a tolerant line parser                     |
+| `src/lib/records.ts`         | Schema-22 record types and a tolerant line parser                     |
 | `src/lib/telemetry.ts`       | `/telemetry` payload types, cache view from records, Prometheus parse |
-| `src/lib/derive.ts`          | Request analytics: percentiles, TTFT shares, cache partitioning       |
+| `src/lib/derive.ts`          | Request and decision analytics, adapter pool, cache partitioning      |
 | `src/lib/engine-client.ts`   | Poll + stream + file replay, and the state they produce               |
 | `src/lib/glossary.ts`        | Definitions behind every tooltip                                      |
 | `src/lib/palette.ts`         | Chart colours, mirroring the CSS custom properties                    |

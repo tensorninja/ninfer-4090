@@ -18,4 +18,6 @@ export const CHART = {
   violet: '#b17aff',
   warning: '#e9bd5b',
   danger: '#f35b64',
+  /** System One, wherever the dashboard tells the two systems apart. */
+  systemOne: '#f08bd0',
 } as const

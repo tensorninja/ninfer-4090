@@ -1,9 +1,12 @@
 # Dashboard
 
 An optional single-page dashboard for one running `ninfer-serve`. It answers, at a glance, what
-the engine is doing: current prefill and decode rates, whether requests are queueing for a lane,
-where prompts are being served from, how the VRAM budget is spent, and whether the board is the
-limit. It also loads a `--request-log-jsonl` file to analyze a past session offline.
+the engine is doing for both of the systems it serves — chat generation on `/v1` and
+[System One](serving.md#system-one-decisions) decisions on `/systemone` — current prefill and
+decode rates, whether requests are queueing for a lane, which lanes and adapter slots each system
+holds, where prompts and decision states are being served from, how the VRAM budget is spent, and
+whether the board is the limit. It also loads a `--request-log-jsonl` file to analyze a past
+session offline.
 
 The application lives in [`apps/web/`](../apps/web/) and is built with Bun, Vite, and React.
 
@@ -50,24 +53,67 @@ origin, so `--cors` is not required. `NINFER_BASE_URL` is validated as an origin
 | `bun run format` | Prettier write over the app sources |
 | `bun run format:check` | Prettier check |
 
-## Adapters
+## Two systems
 
-The engine reports its adapter pool, and usage is derived from completed request records, so the
-panel distinguishes three states that a traffic-only view would conflate: an adapter serving
-requests, an adapter in the pool but idle (servable, carrying no traffic), and an adapter that
-appears in a replayed log but is not in the pool of the engine now reporting. When a source reports
-no inventory at all — a pre-schema-15 log, or an older engine — the panel says pool membership is
-unknown rather than claiming an adapter is absent.
+Chat and System One run in one process over one resident weight copy, one scheduler, one set of
+lanes, one KV pool, and one adapter bank, so the dashboard shows them side by side rather than as
+two services. The top bar names both surfaces and the SDK alias binding. `Chat requests` and
+`Chat latency` cover generation; the System One panel covers decisions. The Slots panel's `work`
+column says which system each lane serves and under which adapter, and a lane retaining a decision
+state reads as System One work between decisions, because that state is what makes the next
+decision on it cheap. The Throughput panel stacks System One prefill on chat prefill whenever the
+record carries `tokens.decision_prefill`; the two sum to the engine's reported prefill rate, and
+decisions never decode. The headline adds decisions and their p50 latency once the pool holds a
+decision adapter or a log recorded a decision.
 
-Pool membership is not device residency. The header reports the pool size beside `slots`, the number
-of adapters the bank holds on the device at once; a pool larger than its slot count is normal and
-means admission swaps adapters in as requests select them. The panel does not track which adapters
-are in slots right now, because that changes between polls and says nothing a user can act on — the
-actionable number is how much of the pool is competing for how few slots.
+## System One
 
-Rows are keyed on the resolved `request.adapter`, never on the requested model id: the Anthropic
-route passes the client's own model string through and silently falls back to the base weights
-when it does not resolve, so only the resolved name identifies what actually ran.
+A decision is a prefill-only request: the state, then one branch per question, each read out by
+the adapter's pointer head. The panel reports decisions, questions, latency p50/p90, the share of
+state tokens reused, decisions in flight, and errors, then decomposes the engine time into four
+phases:
+
+- **wait** — queued for a lane in the bounded FIFO shared with chat, which is where the two systems
+  contend;
+- **restore** — importing a cached state from L2 or L3;
+- **state** — prefilling the state tokens that no lane or tier already held;
+- **branches** — the branch passes, their readouts, and the pointer head.
+
+Latency is System One's own `latency_ms`, restore plus execution, which excludes the wait: it is
+the figure the decision response carries, so the panel and a client agree. The recent-decision table
+lists each decision's adapter, question and option counts, state size, reused share and source, and
+branch tokens with a per-decision phase bar; hovering a timestamp shows the full record. The empty
+state distinguishes a pool with no decision adapter from one that has answered no decision yet, and
+a target that cannot answer decisions at all says so.
+
+## Adapter bank
+
+Chat adapters and decision adapters are discovered from the same `--lora-dir` and staged through
+the same device slots, so the panel shows one bank with two tables. The chat table lists the base
+weights and every generative adapter with its requests, generated tokens, TTFT, decode rate, reuse,
+and MTP acceptance; the System One table lists every decision adapter with its decisions,
+questions, latency, state reuse, and calibrated temperature, and marks the one `jev-latest` binds.
+
+The engine reports its pool, and usage is derived from completed records, so the panel
+distinguishes three states that a traffic-only view would conflate: an adapter serving requests,
+an adapter in the pool but idle (servable, carrying no traffic), and an adapter that appears in a
+replayed log but is not in the pool of the engine now reporting. When a source reports no inventory
+at all — a pre-schema-15 log, or an older engine — the panel says pool membership is unknown rather
+than claiming an adapter is absent. A log from before schema 22 has no adapter kinds; its
+`decision_names` still separate the two tables, and before schema 21 every adapter is a chat
+adapter.
+
+Pool membership is not device residency. A strip above the tables shows which adapter each slot
+holds right now, colored by kind, and whether a running lane pins it; beside it are the swaps so
+far with their mean cost and the admissions that waited because every slot was pinned. The strip is
+the visible form of the shared bank: a chat request and a decision on different adapters trade
+slots exactly as two chat adapters do. A pool larger than its slot count is normal, and a swap count
+that climbs with traffic says the working set of adapters exceeds `--lora-slots`.
+
+Rows are keyed on the resolved adapter, never on the requested model id: the Anthropic route passes
+the client's own model string through and falls back to the base weights when it does not resolve,
+and a decision's `model` may be the SDK alias, so only the resolved name identifies what actually
+ran.
 
 The bank is one device arena committed at startup, outside the weights arena and before KV
 capacity is resolved. It is reported as its own segment in the VRAM panel; without that it would
@@ -79,8 +125,8 @@ The dashboard reads two channels because they answer different questions.
 
 | Channel | Kind | Carries |
 |---|---|---|
-| `GET /telemetry` | polled at 1 Hz | levels: board sensors, scheduler occupancy, VRAM, cache fill, adapter inventory |
-| `GET /events` | SSE | history: throughput samples, board energy, and completed requests |
+| `GET /telemetry` | polled at 1 Hz | levels: board sensors, scheduler occupancy, lane work, VRAM, cache fill, adapter pool and slot residency, System One binding |
+| `GET /events` | SSE | history: throughput samples, board energy, completed requests, and System One decisions |
 
 Levels cannot be reconstructed by replaying deltas, and the event stream is bounded and lossy
 under backpressure, so the poll is always authoritative for current state. `/metrics` is not read
@@ -146,7 +192,7 @@ table are not a partition of the aggregate — every lane in a round is charged 
 time — so they do not sum to it.
 
 There is no per-lane throughput breakdown, because the engine keeps no per-lane token or round
-counter; `SlotState` publishes occupancy only.
+counter; `SlotState` publishes occupancy and each lane's work kind and adapter only.
 
 Prefill and decode are plotted on separate rate scales over one shared time axis. On this target
 prefill runs roughly an order of magnitude faster than decode, so a single linear axis renders
@@ -208,10 +254,11 @@ file contains records from more than one server instance — it is opened in app
 last instance is kept, because mixing two configurations on one axis would misattribute every
 derived figure.
 
-A log carries request and throughput history plus the `server_start` configuration, so throughput,
-latency, cache occupancy against configured capacity, and per-request analysis are all available
-offline. Board telemetry and live lane occupancy are sampled, never recorded, and those panels say
-so rather than showing a stale or zero reading.
+A log carries request, decision, and throughput history plus the `server_start` configuration,
+adapter pool, and System One binding, so throughput, latency, cache occupancy against configured
+capacity, per-request and per-decision analysis, and swap and slot-wait counts are all available
+offline. Board telemetry, live lane occupancy, and which adapter holds which slot are sampled,
+never recorded, and those panels say so rather than showing a stale or zero reading.
 
 ## Derived analytics
 
@@ -220,6 +267,10 @@ restore-failure partitioning, TTFT decomposition, and restore statistics — fol
 in the maintainer script `cache_health.py`, including its truncating nearest-rank percentile rule.
 `src/lib/derive.test.ts` pins the agreement on a fixture whose expected values were produced by
 that script, so the dashboard and the script cannot report different numbers for the same log.
+Decision summaries use the same percentile rule over `latency_ms`, restore plus execution; their
+phase shares divide each phase's summed seconds by the window's summed queue plus execution time,
+and state reuse divides reused state tokens by all state tokens, so a long state weighs as much as
+the tokens it costs.
 
 Churn and recomputed coverage are summed from the interval deltas the throughput record already
 carries, rather than by differencing the cumulative endpoints of the window, so a server restart

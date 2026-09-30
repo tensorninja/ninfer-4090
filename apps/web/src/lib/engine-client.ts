@@ -1,15 +1,20 @@
 // Transport to a running ninfer-serve, plus the equivalent offline path for a JSONL file.
 //
-// Two channels with different jobs. GET /events carries the schema-20 record stream, which is
-// append-only history: throughput samples and completed requests. GET /telemetry is polled for
-// instantaneous state - board sensors, scheduler occupancy, VRAM, cache fill - because those are
-// levels rather than events and a snapshot cannot be reconstructed by replaying deltas.
+// Two channels with different jobs. GET /events carries the schema-22 record stream, which is
+// append-only history: throughput samples, completed chat requests and completed System One
+// decisions. GET /telemetry is polled for instantaneous state - board sensors, scheduler
+// occupancy, lane work, the adapter bank, VRAM, cache fill - because those are levels rather than
+// events and a snapshot cannot be reconstructed by replaying deltas.
 //
 // Because the stream is lossy under backpressure, nothing derived from it is treated as
 // authoritative for current state; the poll always wins for levels.
 
 import {
   parseRecordLine,
+  RECORD_EVENTS,
+  type DecisionDoneRecord,
+  type DecisionErrorRecord,
+  type DecisionStartRecord,
   type EngineRecord,
   type RequestDoneRecord,
   type RequestStartRecord,
@@ -40,8 +45,19 @@ export interface EngineState {
   telemetry: Telemetry | null
   serverStart: ServerStartRecord | null
   throughput: ThroughputRecord[]
+  /** Completed chat requests. */
   requests: RequestDoneRecord[]
+  /** Chat requests started and not yet finished. */
   active: RequestStartRecord[]
+  /** Completed System One decisions. */
+  decisions: DecisionDoneRecord[]
+  /** Decisions started and not yet answered. */
+  activeDecisions: DecisionStartRecord[]
+  /**
+   * Decisions that passed validation and then failed: refused at ingress, timed out in the queue,
+   * cancelled by a disconnect, or faulted. A body kev would reject never gets this far.
+   */
+  decisionErrors: DecisionErrorRecord[]
   gpu: GpuSample[]
   droppedRecords: number
 }
@@ -56,6 +72,9 @@ export const initialEngineState: EngineState = {
   throughput: [],
   requests: [],
   active: [],
+  decisions: [],
+  activeDecisions: [],
+  decisionErrors: [],
   gpu: [],
   droppedRecords: 0,
 }
@@ -64,6 +83,8 @@ export const initialEngineState: EngineState = {
 // ten minutes at the 1s poll. Both are bounded so an overnight session cannot grow without limit.
 const MAX_THROUGHPUT = 720
 const MAX_REQUESTS = 500
+const MAX_DECISIONS = 500
+const MAX_DECISION_ERRORS = 100
 const MAX_GPU = 600
 const TELEMETRY_INTERVAL_MS = 1000
 
@@ -162,13 +183,7 @@ export class EngineClient {
     this.events = source
     // The server names each frame after the record's own `event` field, so one listener per
     // record type replaces a discriminating switch on the client.
-    for (const name of [
-      'server_start',
-      'request_start',
-      'request_done',
-      'request_error',
-      'throughput',
-    ]) {
+    for (const name of RECORD_EVENTS) {
       source.addEventListener(name, (message) => {
         const record = parseRecordLine((message as MessageEvent<string>).data)
         if (record !== null) this.ingest(record)
@@ -191,7 +206,16 @@ export class EngineClient {
           this.state.serverStart !== null &&
           this.state.serverStart.server_instance_id !== record.server_instance_id
         ) {
-          this.update({ serverStart: record, throughput: [], requests: [], active: [], gpu: [] })
+          this.update({
+            serverStart: record,
+            throughput: [],
+            requests: [],
+            active: [],
+            decisions: [],
+            activeDecisions: [],
+            decisionErrors: [],
+            gpu: [],
+          })
           return
         }
         this.update({ serverStart: record })
@@ -213,6 +237,25 @@ export class EngineClient {
       case 'request_error':
         this.update({
           active: this.state.active.filter(
+            (started) => started.request.request_id !== record.request.request_id,
+          ),
+        })
+        return
+      case 'decision_start':
+        this.update({ activeDecisions: [...this.state.activeDecisions, record] })
+        return
+      case 'decision_done':
+        this.update({
+          decisions: ring(this.state.decisions, record, MAX_DECISIONS),
+          activeDecisions: this.state.activeDecisions.filter(
+            (started) => started.request.request_id !== record.request.request_id,
+          ),
+        })
+        return
+      case 'decision_error':
+        this.update({
+          decisionErrors: ring(this.state.decisionErrors, record, MAX_DECISION_ERRORS),
+          activeDecisions: this.state.activeDecisions.filter(
             (started) => started.request.request_id !== record.request.request_id,
           ),
         })
@@ -247,6 +290,8 @@ export class EngineClient {
           ServerStartRecord | undefined) ?? null,
       throughput: scoped.filter((r): r is ThroughputRecord => r.event === 'throughput'),
       requests: scoped.filter((r): r is RequestDoneRecord => r.event === 'request_done'),
+      decisions: scoped.filter((r): r is DecisionDoneRecord => r.event === 'decision_done'),
+      decisionErrors: scoped.filter((r): r is DecisionErrorRecord => r.event === 'decision_error'),
       droppedRecords: droppedInstances,
       // `lastInstance` is taken from a record that exists, so an empty scope means nothing parsed
       // at all rather than a run that was filtered out.

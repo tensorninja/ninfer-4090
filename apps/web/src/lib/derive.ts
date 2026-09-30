@@ -1,12 +1,21 @@
 // Derived request analytics.
 //
-// These aggregations are a port of the maintainer script `cache_health.py`, which is the checked
-// reference for their definitions: same percentile rule, same denominators, same partitioning of
-// misses and restore failures. `derive.test.ts` pins the agreement, so the dashboard and the
-// script cannot drift into reporting different numbers for the same log.
+// The chat aggregations are a port of the maintainer script `cache_health.py`, which is the
+// checked reference for their definitions: same percentile rule, same denominators, same
+// partitioning of misses and restore failures. `derive.test.ts` pins the agreement, so the
+// dashboard and the script cannot drift into reporting different numbers for the same log. The
+// System One summaries have no reference script; they use the same percentile rule and are
+// pinned against hand-computed values instead.
 
 import { CHART } from './palette'
-import type { ContinuationSource, RequestDoneRecord, ThroughputRecord } from './records'
+import type {
+  AdapterInventory,
+  AdapterKind,
+  ContinuationSource,
+  DecisionDoneRecord,
+  RequestDoneRecord,
+  ThroughputRecord,
+} from './records'
 
 /**
  * Nearest-rank percentile with truncating index selection. Deliberately identical to the
@@ -273,6 +282,178 @@ export function summarizeByAdapter(records: readonly RequestDoneRecord[]): Adapt
 }
 
 /**
+ * One pooled adapter, whichever schema reported the pool.
+ *
+ * Schema 22 lists every adapter with its kind and served id. Schema 21 lists names and,
+ * separately, which of them are decision adapters; schemas 15–20 list names alone, and those are
+ * all chat adapters because decision adapters did not exist yet. `modelId` is null where the
+ * record did not carry it.
+ */
+export interface PoolEntry {
+  name: string
+  kind: AdapterKind
+  modelId: string | null
+  /** A decision adapter's calibration temperature, where reported. */
+  temperature: number | null
+}
+
+export function adapterPool(inventory: AdapterInventory | undefined): PoolEntry[] {
+  if (inventory === undefined) return []
+  if (inventory.pool !== undefined) {
+    return inventory.pool.map((entry) => ({
+      name: entry.name,
+      kind: entry.kind,
+      modelId: entry.model_id,
+      temperature: entry.temperature ?? null,
+    }))
+  }
+  const decisions = new Set(inventory.decision_names ?? [])
+  return (inventory.names ?? []).map((name) => ({
+    name,
+    kind: decisions.has(name) ? 'decision' : 'generative',
+    modelId: null,
+    temperature: null,
+  }))
+}
+
+/**
+ * System One decisions over the retained window.
+ *
+ * `latency` is what System One itself reports as `latency_ms`: restore plus execution, the
+ * engine's time on a decision without its wait for a lane. `total` is what the client saw, from
+ * receipt to response. The phase shares divide summed engine time (queue plus execution) into
+ * waiting for a lane, importing a cached state, prefilling the state, and the branch passes; the
+ * record's `queue` includes the restore, so the wait is the difference.
+ */
+export interface DecisionSummary {
+  count: number
+  questions: number
+  options: number
+  latency: Spread
+  total: Spread
+  phaseShare: { wait: number; restore: number; state: number; branch: number }
+  stateTokens: number
+  reusedStateTokens: number
+  /** Share of state tokens resident in a lane or restored from a tier instead of prefilled. */
+  stateReuse: number
+  bySource: Record<string, number>
+  branchTokens: number
+  branchPasses: number
+  /** Computed state tokens over summed state seconds; null when no state was prefilled. */
+  stateTokensPerSecond: number | null
+  /** Branch tokens over summed branch seconds; null when no branch ran measurably. */
+  branchTokensPerSecond: number | null
+  /** States cut to their first 65,536 tokens, as kev cuts them. */
+  truncatedStates: number
+}
+
+/** Pooled tokens per second: summed tokens over summed seconds, or null with nothing to divide. */
+function pooledRate(tokens: number, seconds: number): number | null {
+  return tokens === 0 || !(seconds > 0) ? null : tokens / seconds
+}
+
+/** One decision's engine time by phase. The record's `queue` contains the restore. */
+export function decisionPhases(record: DecisionDoneRecord): {
+  wait: number
+  restore: number
+  state: number
+  branch: number
+} {
+  const timings = record.timings_seconds
+  return {
+    wait: Math.max(0, timings.queue - timings.restore),
+    restore: timings.restore,
+    state: timings.state,
+    branch: timings.branch,
+  }
+}
+
+/** System One's `latency_ms`, in seconds: the restore plus execution, without the lane wait. */
+export function decisionLatency(record: DecisionDoneRecord): number {
+  return record.timings_seconds.restore + record.timings_seconds.execution
+}
+
+export function summarizeDecisions(records: readonly DecisionDoneRecord[]): DecisionSummary {
+  let questions = 0
+  let options = 0
+  let wait = 0
+  let restore = 0
+  let state = 0
+  let branch = 0
+  let engine = 0
+  let stateTokens = 0
+  let reusedStateTokens = 0
+  let computedStateTokens = 0
+  let branchTokens = 0
+  let branchPasses = 0
+  let truncatedStates = 0
+  for (const record of records) {
+    const phases = decisionPhases(record)
+    questions += record.request.questions
+    options += record.request.options
+    wait += phases.wait
+    restore += phases.restore
+    state += phases.state
+    branch += phases.branch
+    engine += record.timings_seconds.queue + record.timings_seconds.execution
+    stateTokens += record.request.state_tokens
+    reusedStateTokens += record.result.reused_state_tokens
+    computedStateTokens += record.result.computed_state_tokens
+    branchTokens += record.request.branch_tokens
+    branchPasses += record.result.branch_passes
+    if (record.request.state_truncated) truncatedStates += 1
+  }
+  return {
+    count: records.length,
+    questions,
+    options,
+    latency: spread(records.map(decisionLatency)),
+    total: spread(records.map((record) => record.timings_seconds.total)),
+    phaseShare: {
+      wait: engine === 0 ? 0 : wait / engine,
+      restore: engine === 0 ? 0 : restore / engine,
+      state: engine === 0 ? 0 : state / engine,
+      branch: engine === 0 ? 0 : branch / engine,
+    },
+    stateTokens,
+    reusedStateTokens,
+    stateReuse: stateTokens === 0 ? 0 : reusedStateTokens / stateTokens,
+    bySource: tally(records.map((record) => record.result.state_source)),
+    branchTokens,
+    branchPasses,
+    stateTokensPerSecond: pooledRate(computedStateTokens, state),
+    branchTokensPerSecond: pooledRate(branchTokens, branch),
+    truncatedStates,
+  }
+}
+
+/** Decisions served by one decision adapter. */
+export interface DecisionAdapterUsage {
+  name: string
+  summary: DecisionSummary
+}
+
+/**
+ * Groups decisions by the adapter that answered them, busiest first.
+ *
+ * `request.adapter` is the resolved decision adapter; `request.model` may be the SDK alias, which
+ * names whichever adapter it is bound to, so only the adapter says what actually ran.
+ */
+export function summarizeDecisionsByAdapter(
+  records: readonly DecisionDoneRecord[],
+): DecisionAdapterUsage[] {
+  const groups = new Map<string, DecisionDoneRecord[]>()
+  for (const record of records) {
+    const bucket = groups.get(record.request.adapter)
+    if (bucket === undefined) groups.set(record.request.adapter, [record])
+    else bucket.push(record)
+  }
+  return [...groups.entries()]
+    .map(([name, group]) => ({ name, summary: summarizeDecisions(group) }))
+    .sort((a, b) => b.summary.count - a.summary.count || a.name.localeCompare(b.name))
+}
+
+/**
  * Cache churn over the retained throughput window.
  *
  * Eviction on its own is a cache doing its job, so none of these are pathological in isolation.
@@ -426,6 +607,17 @@ export function summarizeEnergy(records: readonly ThroughputRecord[]): EnergySum
     decodeJoulesPerToken: perToken(decodeJoules, decodeTokens),
     residualFraction: boardJoules === 0 ? 0 : residualJoules / boardJoules,
   }
+}
+
+/** The two systems, named and coloured the same way on every panel that tells them apart. */
+export const KIND_LABEL: Record<AdapterKind, string> = {
+  generative: 'chat',
+  decision: 'System One',
+}
+
+export const KIND_COLOR: Record<AdapterKind, string> = {
+  generative: CHART.accent,
+  decision: CHART.systemOne,
 }
 
 export const SOURCE_ORDER: readonly ContinuationSource[] = ['l1', 'l2', 'l3', 'none']

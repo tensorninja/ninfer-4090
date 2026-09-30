@@ -1,5 +1,5 @@
 import { Stat, type Tone } from '../components/ui'
-import { summarizeEnergy, type RequestSummary } from '../lib/derive'
+import { summarizeEnergy, type DecisionSummary, type RequestSummary } from '../lib/derive'
 import { count, joulesPerToken, percent, rate, seconds } from '../lib/format'
 import type { ServerStartRecord, ThroughputRecord } from '../lib/records'
 import { latest } from '../lib/series'
@@ -8,17 +8,23 @@ import type { Telemetry } from '../lib/telemetry'
 /**
  * The glance row. Every reading here is one a maintainer would otherwise reconstruct by hand:
  * current rates, whether requests are queueing, whether the cache is doing its job, and whether
- * the board is the limit.
+ * the board is the limit. With a decision adapter in the pool, System One's decisions and their
+ * latency sit beside the chat readings.
  */
 export function Headline({
   telemetry,
   records,
   summary,
+  decisions,
+  systemOne,
   engine,
 }: {
   telemetry: Telemetry | null
   records: ThroughputRecord[]
   summary: RequestSummary
+  decisions: DecisionSummary
+  /** Whether this server answers System One, so its stats earn a place in the row. */
+  systemOne: boolean
   engine: ServerStartRecord['engine'] | undefined
 }) {
   const sample = latest(records)
@@ -77,6 +83,16 @@ export function Headline({
         tone={meanQueue > 1 ? 'warning' : 'neutral'}
       />
       <Stat value={seconds(summary.ttft.p50)} label="ttft p50" hint="ttft" />
+      {systemOne ? (
+        <>
+          <Stat value={count(decisions.count)} label="decisions" hint="systemOne" />
+          <Stat
+            value={decisions.count > 0 ? seconds(decisions.latency.p50) : '—'}
+            label="decision p50"
+            hint="decisionLatency"
+          />
+        </>
+      ) : null}
       <Stat
         value={percent(summary.prefillAvoided)}
         label="prefill avoided"

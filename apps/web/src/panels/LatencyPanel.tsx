@@ -29,8 +29,8 @@ const PHASES = [
 export function LatencyPanel({ summary }: { summary: RequestSummary }) {
   if (summary.count === 0) {
     return (
-      <Panel title="Latency" hint="ttft">
-        <Empty>no completed requests in the retained window</Empty>
+      <Panel title="Chat latency" hint="ttft">
+        <Empty>no completed chat requests in the retained window</Empty>
       </Panel>
     )
   }
@@ -41,7 +41,7 @@ export function LatencyPanel({ summary }: { summary: RequestSummary }) {
   )
 
   return (
-    <Panel title="Latency" hint="ttft" note={`${summary.count} completed requests`}>
+    <Panel title="Chat latency" hint="ttft" note={`${summary.count} completed requests`}>
       <div className="stat-row">
         {/* No fixed threshold makes a TTFT "bad" here - acceptable latency depends on prompt size
             and lane count - so these report without an alarm colour. */}

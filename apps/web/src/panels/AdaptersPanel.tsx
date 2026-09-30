@@ -1,58 +1,137 @@
 import { Term, Tooltip } from '../components/tooltip'
 import { Empty, Panel, Pill } from '../components/ui'
-import { summarizeByAdapter } from '../lib/derive'
+import {
+  KIND_COLOR,
+  KIND_LABEL,
+  summarizeByAdapter,
+  summarizeDecisionsByAdapter,
+  type PoolEntry,
+} from '../lib/derive'
 import { bytes, count, percent, seconds } from '../lib/format'
-import type { AdapterInventory, RequestDoneRecord } from '../lib/records'
+import type {
+  AdapterInventory,
+  DecisionDoneRecord,
+  RequestDoneRecord,
+  ThroughputRecord,
+} from '../lib/records'
+import { latest } from '../lib/series'
+import type { AdapterTelemetry } from '../lib/telemetry'
+
+/** Pooled names first, then names only the records know, each once. */
+function union(pooled: string[], used: string[]): string[] {
+  const names = [...pooled, ...used.filter((name) => !pooled.includes(name))]
+  return names.filter((name, index) => names.indexOf(name) === index)
+}
+
+function NotInPool() {
+  return (
+    <span className="adapters__flag">
+      <Pill tone="warning">not in pool</Pill>
+    </span>
+  )
+}
+
+/** Which adapter each device slot holds right now, and whether a running lane pins it. */
+function SlotStrip({ bank, pool }: { bank: AdapterTelemetry; pool: PoolEntry[] }) {
+  return (
+    <div className="bank">
+      {bank.resident.map((slot, index) => {
+        const entry = pool.find((candidate) => candidate.name === slot.adapter)
+        const color = entry ? KIND_COLOR[entry.kind] : 'var(--line)'
+        return (
+          <Tooltip
+            key={index}
+            title={`Slot ${index}`}
+            body={
+              slot.adapter === ''
+                ? 'Never staged. The next adapter a request selects goes here first.'
+                : `${slot.adapter}, a ${entry ? KIND_LABEL[entry.kind] : 'pooled'} adapter. ${
+                    slot.pinned
+                      ? 'Pinned: a running lane executes against it, so it cannot be swapped out.'
+                      : 'Unpinned: the next swap may replace it, least recently used first.'
+                  }`
+            }
+            className="bank__slot"
+          >
+            <span className="bank__swatch" style={{ background: color }} />
+            <span className={slot.adapter === '' ? 'bank__name bank__name--empty' : 'bank__name'}>
+              {slot.adapter === '' ? 'empty' : slot.adapter}
+            </span>
+            {slot.pinned ? <Pill tone="accent">pinned</Pill> : null}
+          </Tooltip>
+        )
+      })}
+    </div>
+  )
+}
 
 /**
- * LoRA adapters: what is available, and what each one served.
+ * The adapter bank: one pool and one set of device slots behind both systems.
  *
- * The two halves come from different places and are both needed. The inventory is reported by the
- * engine, so an adapter that has taken no traffic still appears. Usage is derived from completed
- * request records, so it survives replay. An adapter with no rows is discoverable and selectable
- * without ever having been used, which is exactly the case a traffic-only view would hide.
- *
- * The pool is unbounded and is not what costs VRAM; the resident slot count is. `count` adapters
- * are selectable, `slots` of them are on the device at any moment, and the engine swaps between
- * them at admission.
+ * Chat adapters and System One decision adapters are discovered from the same `--lora-dir` and
+ * staged through the same slots, so the panel shows them side by side over one residency strip.
+ * The inventory comes from the engine, so an adapter that has taken no traffic still appears;
+ * usage is derived from the chat and decision records, so it survives replay. Which adapter holds
+ * which slot is a live reading and is never recorded; the swap and wait counters are, on every
+ * throughput record.
  */
 export function AdaptersPanel({
   inventory,
+  bank,
+  pool,
+  binding,
   requests,
+  decisions,
+  records,
 }: {
   inventory: AdapterInventory | undefined
+  /** The live bank, or undefined in replay. */
+  bank: AdapterTelemetry | undefined
+  pool: PoolEntry[]
+  /** The decision adapter the SDK alias resolves to. */
+  binding: string | undefined
   requests: RequestDoneRecord[]
+  decisions: DecisionDoneRecord[]
+  records: ThroughputRecord[]
 }) {
-  const usage = summarizeByAdapter(requests)
-  const used = new Map(usage.map((entry) => [entry.name, entry]))
-  const pooled = inventory?.names ?? []
-  // Residency can only be asserted when the engine actually reported its bank. Without an
-  // inventory the correct statement is "unknown", not "not loaded".
+  const chatUsage = summarizeByAdapter(requests)
+  const chatUsed = new Map(chatUsage.map((entry) => [entry.name, entry]))
+  const decisionUsage = summarizeDecisionsByAdapter(decisions)
+  const decisionUsed = new Map(decisionUsage.map((entry) => [entry.name, entry]))
+  const pooled = new Map(pool.map((entry) => [entry.name, entry]))
+  // Membership can only be asserted when the engine actually reported its pool. Without an
+  // inventory the correct statement is "unknown", not "not in pool".
   const known = inventory !== undefined
 
-  // Union of what is loaded and what appears in the records: a replayed log may name an adapter
-  // this server no longer registers, and a live server may register one with no traffic.
-  const names = [
-    '',
-    ...pooled,
-    ...usage.map((entry) => entry.name).filter((name) => name !== '' && !pooled.includes(name)),
-  ]
-  const rows = names.filter((name, index) => names.indexOf(name) === index)
+  const chatRows = union(
+    ['', ...pool.filter((entry) => entry.kind === 'generative').map((entry) => entry.name)],
+    chatUsage.map((entry) => entry.name),
+  )
+  const decisionRows = union(
+    pool.filter((entry) => entry.kind === 'decision').map((entry) => entry.name),
+    decisionUsage.map((entry) => entry.name),
+  )
 
-  if (pooled.length === 0 && usage.every((entry) => entry.name === '')) {
+  if (pool.length === 0 && chatRows.length === 1 && decisionRows.length === 0) {
     return (
-      <Panel title="Adapters" note="LoRA">
-        <Empty>no adapters discovered</Empty>
+      <Panel title="Adapter bank" hint="adapterBank">
+        <Empty>no adapters discovered — start with --lora-dir</Empty>
       </Panel>
     )
   }
 
   const slots = inventory?.slots ?? inventory?.count ?? 0
-  const perAdapter = inventory && slots > 0 ? inventory.device_bytes / slots : 0
+  const perSlot = inventory && slots > 0 ? inventory.device_bytes / slots : 0
+
+  // Swap counters are cumulative: live from the poll, offline from the last throughput record.
+  const recorded = latest(records)?.adapters
+  const stages = bank?.stages ?? recorded?.stages
+  const slotWaits = bank?.slot_waits ?? recorded?.slot_waits
 
   return (
     <Panel
-      title="Adapters"
+      title="Adapter bank"
+      hint="adapterBank"
       className="panel--wide"
       note={
         inventory && inventory.count > 0 ? (
@@ -60,25 +139,39 @@ export function AdaptersPanel({
             {inventory.count} pooled · rank {inventory.rank} ·{' '}
             <Tooltip
               title="Adapter bank"
-              body={`${inventory.count} adapter(s) are selectable; ${slots} slot(s) at ${bytes(
-                perAdapter,
-              )} each are device-resident. The bank is committed at startup in its own device arena,
- before KV capacity is resolved, and the engine stages an adapter into the least recently used
- free slot when a request selects one that is not resident.`}
+              body={`${inventory.count} adapter(s) of both kinds are selectable; ${slots} slot(s) at ${bytes(
+                perSlot,
+              )} each are device-resident. The bank is committed at startup in its own device arena, before KV capacity is resolved, and the engine stages an adapter into an empty or least recently used unpinned slot when a request selects one that is not resident.`}
               className="tip--term"
             >
-              {slots} resident · {bytes(inventory.device_bytes)} vram
+              {slots} slots · {bytes(inventory.device_bytes)} vram
             </Tooltip>
           </>
         ) : known ? (
           'none discovered'
         ) : (
-          // A schema-19 log and a pre-inventory engine both land here: usage is derivable, the
-          // resident bank is not.
           'usage only · no inventory reported'
         )
       }
     >
+      {bank && bank.resident.length > 0 ? <SlotStrip bank={bank} pool={pool} /> : null}
+      {stages !== undefined ? (
+        <div className="bank__counters">
+          <Term k="swaps">
+            {count(stages)} swap{stages === 1 ? '' : 's'}
+            {bank && bank.stages > 0 ? ` · ${seconds(bank.stage_seconds / bank.stages)} each` : ''}
+          </Term>
+          {' · '}
+          <Term k="slotWaits">
+            {count(slotWaits ?? 0)} slot wait{slotWaits === 1 ? '' : 's'}
+          </Term>
+          {bank ? null : ' · residency is live only'}
+        </div>
+      ) : null}
+
+      <div className="eyebrow" style={{ color: KIND_COLOR.generative }}>
+        <Term k="chatAdapter">chat</Term>
+      </div>
       <table className="table">
         <thead>
           <tr>
@@ -100,12 +193,9 @@ export function AdaptersPanel({
           </tr>
         </thead>
         <tbody>
-          {rows.map((name) => {
-            const entry = used.get(name)
-            // In the pool, not in a slot: the panel deliberately does not track slot occupancy,
-            // which changes between polls and is not actionable.
-            const inPool = name === '' || pooled.includes(name)
-            const absent = known && !inPool
+          {chatRows.map((name) => {
+            const entry = chatUsed.get(name)
+            const inPool = name === '' || pooled.has(name)
             return (
               <tr key={name || '<base>'}>
                 <td className="emphasis">
@@ -116,7 +206,7 @@ export function AdaptersPanel({
                         ? 'Requests served by the base weights, with no adapter applied.'
                         : inPool
                           ? `Served as model id "${
-                              inventory?.model_ids?.[pooled.indexOf(name)] ?? name
+                              pooled.get(name)?.modelId ?? name
                             }". In the pool and always selectable; the engine stages it into a device slot on demand.`
                           : known
                             ? 'Served requests in this window but is not in the pool of the engine now reporting.'
@@ -126,11 +216,7 @@ export function AdaptersPanel({
                   >
                     {name === '' ? 'base' : name}
                   </Tooltip>
-                  {absent ? (
-                    <span className="adapters__flag">
-                      <Pill tone="warning">not in pool</Pill>
-                    </span>
-                  ) : null}
+                  {known && !inPool ? <NotInPool /> : null}
                 </td>
                 <td className="numeric emphasis">{entry ? count(entry.summary.count) : '—'}</td>
                 <td className="numeric">{entry ? count(entry.generatedTokens) : '—'}</td>
@@ -151,10 +237,77 @@ export function AdaptersPanel({
           })}
         </tbody>
       </table>
+
+      {decisionRows.length > 0 ? (
+        <>
+          <div className="eyebrow" style={{ color: KIND_COLOR.decision }}>
+            <Term k="decisionAdapter">System One</Term>
+          </div>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>adapter</th>
+                <th className="numeric">decisions</th>
+                <th className="numeric">questions</th>
+                <th className="numeric">
+                  <Term k="decisionLatency">latency p50</Term>
+                </th>
+                <th className="numeric">
+                  <Term k="stateReuse">reused</Term>
+                </th>
+                <th className="numeric">temp</th>
+              </tr>
+            </thead>
+            <tbody>
+              {decisionRows.map((name) => {
+                const entry = decisionUsed.get(name)
+                const pooledEntry = pooled.get(name)
+                return (
+                  <tr key={name}>
+                    <td className="emphasis">
+                      <Tooltip
+                        title={name}
+                        body={
+                          pooledEntry
+                            ? `System One model "${name}": a LoRA adapter plus a pointer head, in the same pool and slots as the chat adapters.`
+                            : known
+                              ? 'Answered decisions in this window but is not in the pool of the engine now reporting.'
+                              : 'Answered decisions in this window. This source reports no adapter inventory, so pool membership is unknown.'
+                        }
+                        className="tip--term"
+                      >
+                        {name}
+                      </Tooltip>
+                      {binding === name ? (
+                        <span className="adapters__flag">
+                          <Pill>sdk default</Pill>
+                        </span>
+                      ) : null}
+                      {known && !pooledEntry ? <NotInPool /> : null}
+                    </td>
+                    <td className="numeric emphasis">{entry ? count(entry.summary.count) : '—'}</td>
+                    <td className="numeric">{entry ? count(entry.summary.questions) : '—'}</td>
+                    <td className="numeric">{entry ? seconds(entry.summary.latency.p50) : '—'}</td>
+                    <td className="numeric">{entry ? percent(entry.summary.stateReuse) : '—'}</td>
+                    <td className="numeric">
+                      {pooledEntry && pooledEntry.temperature !== null
+                        ? pooledEntry.temperature.toFixed(2)
+                        : '—'}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </>
+      ) : null}
+
       <p className="panel__footnote">
-        Rows are grouped by the resolved adapter, not by the requested model id — on the Anthropic
-        route an unknown model silently falls back to the base weights. A pooled adapter with no
-        rows costs disk and a directory entry, not VRAM: only the resident slots are committed.
+        One pool, one bank: chat and decision adapters come from the same --lora-dir and are swapped
+        through the same slots, each refused on the other&apos;s route. A pooled adapter costs disk,
+        not VRAM — only the slots are committed. Rows group by the resolved adapter, not the
+        requested model id: the Anthropic route falls back to the base weights on an unknown model,
+        and the SDK alias names whichever decision adapter it is bound to.
       </p>
     </Panel>
   )

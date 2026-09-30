@@ -97,7 +97,7 @@ export function RequestsPanel({
 
   return (
     <Panel
-      title="Requests"
+      title="Chat requests"
       hint="ttftSplit"
       className="panel--wide"
       note={
@@ -109,7 +109,7 @@ export function RequestsPanel({
       }
     >
       {recent.length === 0 ? (
-        <Empty>no completed requests yet</Empty>
+        <Empty>no completed chat requests yet</Empty>
       ) : (
         <table className="table">
           <thead>
