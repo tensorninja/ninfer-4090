@@ -44,6 +44,25 @@ __global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32
     }
 }
 
+// One destination column per block; the source column is looked up, so this is the inverse
+// indexing of the scatter kernels above.
+template <class Element>
+__global__ void gather_columns_kernel(const Element* __restrict__ source,
+                                      const std::int32_t* __restrict__ indices,
+                                      Element* __restrict__ destination,
+                                      std::int32_t elements_per_column) {
+    const std::int32_t destination_column = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t source_column      = indices[destination_column];
+    const std::int64_t source_base =
+        static_cast<std::int64_t>(source_column) * elements_per_column;
+    const std::int64_t destination_base =
+        static_cast<std::int64_t>(destination_column) * elements_per_column;
+    for (std::int32_t element = static_cast<std::int32_t>(threadIdx.x);
+         element < elements_per_column; element += static_cast<std::int32_t>(blockDim.x)) {
+        destination[destination_base + element] = source[source_base + element];
+    }
+}
+
 __global__ void scatter_bf16_batch_kernel(const uint4* __restrict__ source,
                                           const std::int32_t* __restrict__ lanes,
                                           const std::int32_t* __restrict__ valid_columns,

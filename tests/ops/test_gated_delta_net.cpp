@@ -491,6 +491,146 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
     return failures;
 }
 
+struct SegmentedCase {
+    const char* name;
+    int qk_heads;
+    int value_heads;
+    std::vector<int> lengths;
+    bool normalize_qk;
+};
+
+// Packed columns [first,first+length) are the complete single-sequence input of one segment, and
+// every segment starts from the shared initial state.
+gdn_ref::Inputs segment_inputs(const gdn_ref::Inputs& in, int first, int length) {
+    const auto columns = [&](const std::vector<float>& values, std::int64_t column_size) {
+        return std::vector<float>(values.begin() + first * column_size,
+                                  values.begin() + (first + length) * column_size);
+    };
+    gdn_ref::Inputs segment;
+    segment.head_dim    = in.head_dim;
+    segment.qk_heads    = in.qk_heads;
+    segment.value_heads = in.value_heads;
+    segment.tokens      = length;
+    segment.q           = columns(in.q, in.head_dim * in.qk_heads);
+    segment.k           = columns(in.k, in.head_dim * in.qk_heads);
+    segment.v           = columns(in.v, in.head_dim * in.value_heads);
+    segment.g           = columns(in.g, in.value_heads);
+    segment.beta        = columns(in.beta, in.value_heads);
+    segment.state       = in.state;
+    return segment;
+}
+
+// Each segment is qualified as its own complete recurrence against the FP64 oracle. `parity_exact`
+// counts cases whose output bits also equal per-segment single-sequence calls; that supplementary
+// comparison is reported, not required.
+int segmented_case(const SegmentedCase& test_case, std::uint32_t seed, int& parity_exact) {
+    std::vector<int> table;
+    int columns = 0;
+    for (const int length : test_case.lengths) {
+        table.push_back(columns);
+        table.push_back(length);
+        columns += length;
+    }
+    const int segment_count  = static_cast<int>(test_case.lengths.size());
+    const gdn_ref::Inputs in = make_inputs({test_case.name, test_case.qk_heads,
+                                            test_case.value_heads, columns, test_case.normalize_qk},
+                                           seed);
+    const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    DeviceInputs device(in);
+    DeviceBuffer segments = to_device_i32(table);
+    GuardedDeviceBuffer state(in.state.size() * sizeof(float));
+    GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
+    state.copy_from_host(in.state.data(), state.bytes());
+    out.fill(0xff);
+
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, columns});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, columns});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, columns});
+    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, columns});
+    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, columns});
+    Tensor state_tensor(state.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor segments_tensor(segments.p, DType::I32, {2, segment_count});
+    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, columns});
+    const std::size_t workspace_bytes = ops::gated_delta_net_segmented_workspace_capacity_bytes(
+        test_case.qk_heads, test_case.value_heads, test_case.normalize_qk, columns);
+    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    const auto run = [&] {
+        ops::gated_delta_net_segmented(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
+                                       state_tensor, segments_tensor, out_tensor, nullptr);
+        cuda_synchronize();
+    };
+    run();
+
+    const std::string label         = test_case.name;
+    const std::int64_t value_column = static_cast<std::int64_t>(kStateDim) * test_case.value_heads;
+    const std::vector<double> got   = from_device_bf16(out.data(), in.v.size());
+    int failures                    = 0;
+    for (int s = 0; s < segment_count; ++s) {
+        const int first           = table[2 * s];
+        const int length          = table[2 * s + 1];
+        const gdn_ref::Result ref = gdn_ref::evaluate(
+            segment_inputs(in, first, length), static_cast<double>(scale), test_case.normalize_qk);
+        failures +=
+            verify_recurrence(label + " segment " + std::to_string(s) + " out",
+                              std::vector<double>(got.begin() + first * value_column,
+                                                  got.begin() + (first + length) * value_column),
+                              ref.out, gated_delta_net_output_bf16_criterion());
+    }
+    failures += verify_exact(label + " state unchanged",
+                             from_device<float>(state.data(), in.state.size()), in.state);
+    failures +=
+        verify_exact(label + " segments unchanged", from_device_i32(segments, table.size()), table);
+    failures += state.verify_guards((label + " state").c_str());
+    failures += out.verify_guards((label + " out").c_str());
+    failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
+                                               device.beta);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+
+    const std::vector<std::uint16_t> bits = from_device<std::uint16_t>(out.data(), in.v.size());
+    out.fill(0xff);
+    run();
+    failures += verify_exact(label + " repeat bits",
+                             from_device<std::uint16_t>(out.data(), in.v.size()), bits);
+
+    DeviceBuffer single_out(in.v.size() * sizeof(std::uint16_t));
+    DeviceBuffer single_state(in.state.size() * sizeof(float));
+    const int longest = *std::max_element(test_case.lengths.begin(), test_case.lengths.end());
+    WorkspaceArena single_workspace(std::max<std::size_t>(
+        ops::gated_delta_net_workspace_capacity_bytes(test_case.qk_heads, test_case.value_heads,
+                                                      test_case.normalize_qk, 1, longest),
+        256));
+    Tensor single_out_tensor(single_out.p, DType::BF16,
+                             {kStateDim, test_case.value_heads, columns});
+    Tensor single_state_tensor(single_state.p, DType::FP32,
+                               {kStateDim, kStateDim, test_case.value_heads});
+    for (int s = 0; s < segment_count; ++s) {
+        const int first    = table[2 * s];
+        const int length   = table[2 * s + 1];
+        Tensor segment_out = single_out_tensor.slice(2, first, length);
+        ops::gated_delta_net(
+            q.slice(2, first, length), k.slice(2, first, length), v.slice(2, first, length),
+            g.slice(1, first, length), beta.slice(1, first, length), scale, test_case.normalize_qk,
+            single_workspace, state_tensor, single_state_tensor, segment_out, nullptr);
+    }
+    cuda_synchronize();
+    const std::vector<std::uint16_t> single_bits =
+        from_device<std::uint16_t>(single_out, in.v.size());
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        if (bits[i] != single_bits[i]) { ++differing; }
+    }
+    if (differing == 0) {
+        ++parity_exact;
+    } else {
+        std::cout << label << ": " << differing << " of " << bits.size()
+                  << " output bits differ from per-segment single-sequence calls\n";
+    }
+    return failures;
+}
+
 int contract_rejection_cases() {
     DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
     DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
@@ -590,6 +730,31 @@ int main() {
     // Row 0's initial state is its final destination; every state tile must load it before write.
     failures += batched_snapshot_case({"35b DFlash", 16, 32, 16, true}, {15, 33}, {0, 16}, {16, 7},
                                       34, 13016u);
+
+    // Segmented form. The mixes cover the recurrent-only table (with and without an empty chunked
+    // stage), single-segment chunk boundaries, chunk-only and chunk-plus-tail segments at
+    // unaligned starts, adjacent chunk runs with tails, raw q/k, and the 35B stage geometry.
+    const std::vector<SegmentedCase> segmented_cases = {
+        {"27b segmented 1x1", 16, 48, {1}, true},
+        {"27b segmented 6x40", 16, 48, std::vector<int>(6, 40), true},
+        {"27b segmented 1x1024", 16, 48, {1024}, true},
+        {"27b segmented 255x3", 16, 48, std::vector<int>(255, 3), true},
+        {"27b segmented 1x63", 16, 48, {63}, true},
+        {"27b segmented 1x64", 16, 48, {64}, true},
+        {"27b segmented 1x65", 16, 48, {65}, true},
+        {"27b segmented 1x129", 16, 48, {129}, true},
+        {"27b segmented mixed", 16, 48, {3, 64, 1, 130, 40}, true},
+        {"27b segmented mixed raw-qk", 16, 48, {3, 64, 1, 130, 40}, false},
+        {"27b segmented adjacent tails", 16, 48, {70, 130, 65, 1}, true},
+        {"35b segmented adjacent tails", 16, 32, {70, 130, 65, 1}, true},
+    };
+    int parity_exact = 0;
+    for (std::size_t i = 0; i < segmented_cases.size(); ++i) {
+        failures += segmented_case(segmented_cases[i], 14000u + static_cast<std::uint32_t>(i),
+                                   parity_exact);
+    }
+    std::cout << "gated_delta_net segmented: per-segment single-sequence bit parity in "
+              << parity_exact << "/" << segmented_cases.size() << " cases\n";
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

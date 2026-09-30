@@ -1,14 +1,14 @@
 // Production and stage-attribution benchmark for the Gated DeltaNet Op.
 //
-// Complete running-state, snapshot, and pre-normalized chunked-pipeline measurements call the
-// public Op. There is one intentional exception to the public-benchmark rule: --breakdown calls
-// exactly the chunked algorithm's prepare_wy_wu, state_passing, and output stage launchers so that
-// optimization can attribute pipeline latency. Those stages are intrinsic parts of one production
-// algorithm, not alternative public routes or candidate dispatch controls. No other private
-// launcher belongs in this long-lived benchmark.
+// Complete running-state, snapshot, segmented, and pre-normalized chunked-pipeline measurements
+// call the public Op. There is one intentional exception to the public-benchmark rule: --breakdown
+// calls exactly the chunked algorithm's prepare_wy_wu, state_passing, and output stage launchers so
+// that optimization can attribute pipeline latency. Those stages are intrinsic parts of one
+// production algorithm, not alternative public routes or candidate dispatch controls. No other
+// private launcher belongs in this long-lived benchmark.
 //
-// Every measurement is a cold-L2 CUDA Graph replay. The 256 MiB flush happens before, and outside,
-// each timed replay.
+// Every measurement is a cold-L2 CUDA Graph replay; --segmented additionally times cold-L2 eager
+// launches. The 256 MiB flush happens before, and outside, each timed sample.
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"
@@ -48,6 +48,13 @@ enum class Mode {
     Running,
     Snapshot,
     ChunkedOnly,
+    Segmented,
+};
+
+// A segmented workload: packed segment lengths that tile N columns in order.
+struct SegmentMix {
+    std::string label;
+    std::vector<std::int32_t> lengths;
 };
 
 struct Options {
@@ -67,6 +74,7 @@ struct Options {
     int repeat              = 100;
     std::size_t flush_bytes = kDefaultFlushBytes;
     std::string qk_norm     = "fused";
+    std::vector<SegmentMix> segment_mixes;
 };
 
 struct Problem {
@@ -96,6 +104,10 @@ struct BenchRow {
     double stage_share_pct            = -1.0;
     double relative_to_e2e_pct        = -1.0;
     ColdTiming timing{};
+    const char* execution = "cuda_graph";
+    // Segmented-mode rows name their segment mix and count.
+    std::string mix;
+    std::int32_t segments = 0;
 };
 
 struct TrafficBytes {
@@ -135,6 +147,37 @@ std::vector<std::int32_t> parse_valid_columns(const char* text) {
     return values;
 }
 
+// SPEC is a comma-separated list of items, each a length L or a repeated run CxL.
+SegmentMix parse_segment_mix(const char* text) {
+    SegmentMix mix{text, {}};
+    std::string_view rest(text);
+    while (true) {
+        const std::size_t comma = rest.find(',');
+        const std::string item(rest.substr(0, comma));
+        const std::size_t times = item.find('x');
+        const std::int32_t count =
+            times == std::string::npos
+                ? 1
+                : parse_integer("--segments", item.substr(0, times).c_str(), 1);
+        const std::int32_t length = parse_integer(
+            "--segments", (times == std::string::npos ? item : item.substr(times + 1)).c_str(), 1);
+        mix.lengths.insert(mix.lengths.end(), static_cast<std::size_t>(count), length);
+        if (comma == std::string_view::npos) { break; }
+        rest.remove_prefix(comma + 1);
+    }
+    return mix;
+}
+
+std::vector<SegmentMix> default_segment_mixes() {
+    return {
+        {"1x40", {40}},
+        {"6x40", std::vector<std::int32_t>(6, 40)},
+        {"255x3", std::vector<std::int32_t>(255, 3)},
+        {"1x1024", {1024}},
+        {"16x64", std::vector<std::int32_t>(16, 64)},
+    };
+}
+
 void set_mode(Options& options, Mode mode, const char* flag) {
     if (options.mode_explicit && options.mode != mode) {
         fail(std::string(flag) + " cannot be combined with another benchmark mode");
@@ -158,6 +201,10 @@ Options parse_options(int argc, char** argv) {
             set_mode(options, Mode::Snapshot, "--snapshot");
         } else if (arg == "--chunked-only") {
             set_mode(options, Mode::ChunkedOnly, "--chunked-only");
+        } else if (arg == "--segmented") {
+            set_mode(options, Mode::Segmented, "--segmented");
+        } else if (arg == "--segments") {
+            options.segment_mixes.push_back(parse_segment_mix(take("--segments")));
         } else if (arg == "--tokens") {
             options.tokens          = parse_integer("--tokens", take("--tokens"), 1);
             options.tokens_explicit = true;
@@ -197,6 +244,12 @@ Options parse_options(int argc, char** argv) {
     if (options.sweep && options.tokens_explicit) {
         fail("--tokens and --sweep are mutually exclusive");
     }
+    if (options.mode == Mode::Segmented && (options.sweep || options.tokens_explicit)) {
+        fail("--segmented takes its widths from --segments");
+    }
+    if (!options.segment_mixes.empty() && options.mode != Mode::Segmented) {
+        fail("--segments requires --segmented");
+    }
     if (!gated_delta_net_detail::are_head_counts_valid(options.qk_heads, options.value_heads)) {
         fail("value heads must be at least q/k heads and divisible by them");
     }
@@ -226,6 +279,9 @@ void print_help(const char* program) {
                 "  --snapshot         public snapshot Gated DeltaNet; defaults to T=1..16\n"
                 "  --chunked-only     public pre-normalized BF16 chunked pipeline\n"
                 "  --breakdown        with --chunked-only, also time prepare/state/output stages\n"
+                "  --segmented        public segmented Gated DeltaNet against the per-segment\n"
+                "                     loop and one single-sequence call of the same width, each\n"
+                "                     as a CUDA Graph replay and as eager launches\n"
                 "\n"
                 "Workload:\n"
                 "  --tokens N         exact token extent (running/chunked default: 1024)\n"
@@ -236,6 +292,8 @@ void print_help(const char* program) {
                 "  --batch B          exact snapshot batch in [1,8] (default: 1)\n"
                 "  --valid-columns V  optional snapshot prefix lengths, comma-separated\n"
                 "  --qk-norm MODE     snapshot normalization: fused or composed (default: fused)\n"
+                "  --segments SPEC    segmented mix, comma-separated L or CxL items; repeatable\n"
+                "                     (default: 1x40, 6x40, 255x3, 1x1024, 16x64)\n"
                 "\n"
                 "Measurement:\n"
                 "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
@@ -855,6 +913,110 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
     return rows;
 }
 
+// One segmented workload in three forms over identical operands: the public segmented Op, the
+// per-segment loop of distinct-state single-sequence calls that it replaces, and one
+// single-sequence call over the same packed width, which is a throughput reference rather than
+// the same recurrences. Each form is timed as a cold-L2 graph replay and as cold-L2 eager launches.
+std::vector<BenchRow> run_segmented(const Options& options, const SegmentMix& mix,
+                                    DeviceBuffer& flush, cudaStream_t stream) {
+    constexpr std::int32_t kChunk = gated_delta_net_detail::kChunkSize;
+    std::vector<std::int32_t> table;
+    std::int32_t columns     = 0;
+    std::int32_t longest     = 0;
+    std::int32_t full_chunks = 0;
+    std::int32_t tail_tokens = 0;
+    for (const std::int32_t length : mix.lengths) {
+        table.push_back(columns);
+        table.push_back(length);
+        columns += length;
+        longest = std::max(longest, length);
+        full_chunks += length / kChunk;
+        tail_tokens += length % kChunk;
+    }
+    const auto segment_count = static_cast<std::int32_t>(mix.lengths.size());
+    const Problem problem{options.qk_heads, options.value_heads, columns};
+    Operands operands(problem, false);
+
+    const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
+                                       gated_delta_net_detail::kStateDim * problem.value_heads;
+    DeviceBuffer state_in  = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_out = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer segment_table(table.size() * sizeof(std::int32_t));
+    segment_table.copy_from_host(table.data(), segment_table.bytes);
+
+    Tensor q    = operands.query();
+    Tensor k    = operands.key();
+    Tensor v    = operands.value();
+    Tensor g    = operands.gate();
+    Tensor beta = operands.beta_tensor();
+    Tensor out  = operands.output();
+    const Tensor ssm_in(state_in.p, DType::FP32,
+                        {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
+                         problem.value_heads});
+    Tensor ssm_out(state_out.p, DType::FP32,
+                   {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
+                    problem.value_heads});
+    const Tensor segments(segment_table.p, DType::I32, {2, segment_count});
+
+    const std::size_t segmented_bytes = ops::gated_delta_net_segmented_workspace_capacity_bytes(
+        problem.qk_heads, problem.value_heads, true, columns);
+    const std::size_t loop_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        problem.qk_heads, problem.value_heads, true, 1, longest);
+    const std::size_t single_bytes = ops::gated_delta_net_workspace_capacity_bytes(
+        problem.qk_heads, problem.value_heads, true, columns, columns);
+    WorkspaceArena segmented_workspace(std::max<std::size_t>(segmented_bytes, 1));
+    WorkspaceArena loop_workspace(std::max<std::size_t>(loop_bytes, 1));
+    WorkspaceArena single_workspace(std::max<std::size_t>(single_bytes, 1));
+    const float scale = gated_delta_net_scale();
+
+    auto segmented = [&](cudaStream_t launch_stream) {
+        ops::gated_delta_net_segmented(q, k, v, g, beta, scale, true, segmented_workspace, ssm_in,
+                                       segments, out, launch_stream);
+    };
+    auto loop = [&](cudaStream_t launch_stream) {
+        for (std::int32_t s = 0; s < segment_count; ++s) {
+            const std::int32_t first  = table[2 * static_cast<std::size_t>(s)];
+            const std::int32_t length = table[2 * static_cast<std::size_t>(s) + 1];
+            Tensor segment_out        = out.slice(2, first, length);
+            ops::gated_delta_net(q.slice(2, first, length), k.slice(2, first, length),
+                                 v.slice(2, first, length), g.slice(1, first, length),
+                                 beta.slice(1, first, length), scale, true, loop_workspace, ssm_in,
+                                 ssm_out, segment_out, launch_stream);
+        }
+    };
+    auto single = [&](cudaStream_t launch_stream) {
+        ops::gated_delta_net(q, k, v, g, beta, scale, true, single_workspace, ssm_in, ssm_out, out,
+                             launch_stream);
+    };
+
+    std::vector<BenchRow> rows;
+    const auto append = [&](const char* form, std::size_t workspace_bytes, auto& launch) {
+        const GraphMeasurement graph = measure_graph(launch, flush, stream, options);
+        const ColdTiming eager =
+            measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+        for (const bool graphed : {true, false}) {
+            BenchRow row;
+            row.state_form      = "segmented";
+            row.normalization   = "fused";
+            row.implementation  = form;
+            row.tokens          = columns;
+            row.full_chunks     = full_chunks;
+            row.tail_tokens     = tail_tokens;
+            row.workspace_bytes = workspace_bytes;
+            row.graph_nodes     = graphed ? graph.graph_nodes : 0;
+            row.timing          = graphed ? graph.timing : eager;
+            row.execution       = graphed ? "cuda_graph" : "eager";
+            row.mix             = mix.label;
+            row.segments        = segment_count;
+            rows.push_back(row);
+        }
+    };
+    append("public.segmented", segmented_bytes, segmented);
+    append("public.per_segment_loop", loop_bytes, loop);
+    append("public.single_sequence", single_bytes, single);
+    return rows;
+}
+
 double logical_gbps(const BenchRow& row) {
     if (row.logical_bytes == 0.0 || row.timing.median_us <= 0.0) { return 0.0; }
     return row.logical_bytes / (row.timing.median_us * 1.0e3);
@@ -871,24 +1033,34 @@ void print_csv_header() {
         "batch,full_chunks,tail_tokens,workspace_bytes,logical_bytes,traffic_bytes,"
         "intermediate_traffic_bytes,graph_nodes,cache,execution,warmup,repeat,"
         "median_us,min_us,p95_us,logical_gbps,traffic_gbps,stage_share_pct,"
-        "relative_to_e2e_pct\n");
+        "relative_to_e2e_pct,mix,segments\n");
 }
 
 void print_row(const BenchRow& row, const Options& options) {
     if (options.csv) {
         std::printf("%s,%s,%s,BF16,%d,%d,%d,%d,%d,%d,%d,%zu,%.0f,%.0f,%.0f,%zu,"
-                    "cold_l2,cuda_graph,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,",
+                    "cold_l2,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,",
                     row.state_form, row.normalization, row.implementation.c_str(),
                     gated_delta_net_detail::kStateDim, options.qk_heads, options.value_heads,
                     row.tokens, options.batch, row.full_chunks, row.tail_tokens,
                     row.workspace_bytes, row.logical_bytes, row.traffic_bytes,
-                    row.intermediate_traffic_bytes, row.graph_nodes, options.warmup, options.repeat,
-                    row.timing.median_us, row.timing.min_us, row.timing.p95_us, logical_gbps(row),
-                    traffic_gbps(row));
+                    row.intermediate_traffic_bytes, row.graph_nodes, row.execution, options.warmup,
+                    options.repeat, row.timing.median_us, row.timing.min_us, row.timing.p95_us,
+                    logical_gbps(row), traffic_gbps(row));
         if (row.stage_share_pct >= 0.0) { std::printf("%.2f", row.stage_share_pct); }
         std::printf(",");
         if (row.relative_to_e2e_pct >= 0.0) { std::printf("%.2f", row.relative_to_e2e_pct); }
-        std::printf("\n");
+        std::printf(",%s,%d\n", row.mix.c_str(), row.segments);
+        return;
+    }
+
+    if (!row.mix.empty()) {
+        std::printf("mix=%-7s N=%-5d S=%-4d %-24s %-10s nodes=%-4zu ws=%7.2f MiB "
+                    "median=%9.3f us min=%9.3f us p95=%9.3f us\n",
+                    row.mix.c_str(), row.tokens, row.segments, row.implementation.c_str(),
+                    row.execution, row.graph_nodes,
+                    static_cast<double>(row.workspace_bytes) / static_cast<double>(1ULL << 20),
+                    row.timing.median_us, row.timing.min_us, row.timing.p95_us);
         return;
     }
 
@@ -920,7 +1092,9 @@ void print_banner(const Options& options, const cudaDeviceProp& device) {
     std::printf("  device      %s (sm_%d%d)\n", device.name, device.major, device.minor);
     std::printf("  geometry    state_dim=128 qk_heads=%d value_heads=%d batch=%d\n",
                 options.qk_heads, options.value_heads, options.batch);
-    std::printf("  execution   CUDA Graph replay\n");
+    std::printf("  execution   %s\n", options.mode == Mode::Segmented
+                                          ? "CUDA Graph replay and eager launches"
+                                          : "CUDA Graph replay");
     std::printf("  cache       cold L2 (%zu MiB flush before each sample)\n",
                 options.flush_bytes >> 20);
     std::printf("  traffic     kernel tensor I/O including materialized intermediates\n");
@@ -950,15 +1124,25 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(options.flush_bytes);
         print_banner(options, device);
 
-        for (const std::int32_t tokens : token_values(options)) {
-            validate_tokens(options, tokens);
-            if (options.mode == Mode::Running) {
-                print_row(run_running(options, tokens, flush, stream), options);
-            } else if (options.mode == Mode::Snapshot) {
-                print_row(run_snapshot(options, tokens, flush, stream), options);
-            } else {
-                for (const BenchRow& row : run_chunked(options, tokens, flush, stream)) {
+        if (options.mode == Mode::Segmented) {
+            const std::vector<SegmentMix> mixes =
+                options.segment_mixes.empty() ? default_segment_mixes() : options.segment_mixes;
+            for (const SegmentMix& mix : mixes) {
+                for (const BenchRow& row : run_segmented(options, mix, flush, stream)) {
                     print_row(row, options);
+                }
+            }
+        } else {
+            for (const std::int32_t tokens : token_values(options)) {
+                validate_tokens(options, tokens);
+                if (options.mode == Mode::Running) {
+                    print_row(run_running(options, tokens, flush, stream), options);
+                } else if (options.mode == Mode::Snapshot) {
+                    print_row(run_snapshot(options, tokens, flush, stream), options);
+                } else {
+                    for (const BenchRow& row : run_chunked(options, tokens, flush, stream)) {
+                        print_row(row, options);
+                    }
                 }
             }
         }

@@ -60,4 +60,21 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream);
 
+// A2 encoding of k/v [256,4,T] at host positions first_position + t of table row table_rows[0].
+void gqa_kv_append_at_launch(const Tensor& k, const Tensor& v, std::int32_t first_position,
+                             const Tensor& table_rows, PagedKVBatchLayerView cache,
+                             cudaStream_t stream);
+
+// A4 prefix-split budget: the largest split count any call with `columns` appended columns may
+// use. It is independent of the prefix, so the partial workspace is a function of columns only.
+std::int32_t gqa_attention_segmented_split_capacity(std::int32_t columns);
+
+// A4 append, split attention, and fixed-order merge. partial_acc is FP32
+// [256,24,columns,split_capacity]; partial_m/partial_l are FP32 [24,columns,split_capacity].
+void gqa_attention_segmented_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                    const Tensor& segments, const Tensor& table_rows,
+                                    std::int32_t prefix, float scale, PagedKVBatchLayerView cache,
+                                    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                    Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

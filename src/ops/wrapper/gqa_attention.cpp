@@ -1,4 +1,4 @@
-// ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
+// ninfer::ops - GQA A1/A2/A3/A4 validation and finite route dispatch.
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
@@ -338,6 +338,26 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
         });
 }
 
+// A4 registers the 27B group-6 geometry only.
+constexpr std::int32_t kSegmentedQHeads  = 24;
+constexpr std::int32_t kSegmentedKVHeads = 4;
+
+struct SegmentedWorkspace {
+    Tensor acc;
+    Tensor m;
+    Tensor l;
+};
+
+template <class Allocator>
+SegmentedWorkspace allocate_segmented_workspace(Allocator& workspace, std::int32_t columns) {
+    const std::int32_t splits = detail::gqa_attention_segmented_split_capacity(columns);
+    return {
+        workspace.alloc(DType::FP32, {kHeadDim, kSegmentedQHeads, columns, splits}),
+        workspace.alloc(DType::FP32, {kSegmentedQHeads, columns, splits}),
+        workspace.alloc(DType::FP32, {kSegmentedQHeads, columns, splits}),
+    };
+}
+
 } // namespace
 
 namespace detail {
@@ -501,6 +521,67 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         return;
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+}
+
+std::size_t gqa_attention_segmented_workspace_capacity_bytes(std::int32_t max_columns) {
+    if (max_columns <= 0 ||
+        static_cast<std::uint32_t>(max_columns) > kGqaAttentionMaximumVisibleKeys) {
+        throw std::invalid_argument("gqa_attention_segmented workspace: invalid column interval");
+    }
+    std::size_t maximum = 0;
+    for (std::int32_t columns = 1; columns <= max_columns; ++columns) {
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_segmented_workspace(layout, columns);
+        maximum = std::max(maximum, layout.peak_bytes(1));
+    }
+    return maximum;
+}
+
+void gqa_attention_segmented(const Tensor& q, const Tensor& k, const Tensor& v,
+                             const Tensor& segments, const Tensor& kv_table_rows,
+                             std::int32_t prefix, float scale, PagedKVBatchLayerView cache,
+                             WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "gqa_attention_segmented";
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16 || v.dtype != DType::BF16 ||
+        out.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_attention_segmented: q/k/v/out must be BF16");
+    }
+    if (segments.dtype != DType::I32 || kv_table_rows.dtype != DType::I32) {
+        throw std::invalid_argument("gqa_attention_segmented: segments/KV table rows must be I32");
+    }
+    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
+        throw std::invalid_argument("gqa_attention_segmented: scale must be 1/sqrt(256)");
+    }
+    const std::int32_t columns        = q.ne[2];
+    const std::int32_t segments_count = segments.ne[1];
+    if (q.ne[1] != kSegmentedQHeads) {
+        throw std::invalid_argument("gqa_attention_segmented: unsupported Q/KV head geometry");
+    }
+    if (columns <= 0 || segments_count <= 0 || segments_count > columns) {
+        throw std::invalid_argument("gqa_attention_segmented: invalid N or segment count");
+    }
+    require_shape(q, kHeadDim, kSegmentedQHeads, columns, 1, op, "q");
+    require_shape(k, kHeadDim, kSegmentedKVHeads, columns, 1, op, "k");
+    require_shape(v, kHeadDim, kSegmentedKVHeads, columns, 1, op, "v");
+    require_shape(segments, 2, segments_count, 1, 1, op, "segments");
+    require_shape(kv_table_rows, 1, 1, 1, 1, op, "KV table rows");
+    require_shape(out, kHeadDim, kSegmentedQHeads, columns, 1, op, "out");
+    require_contiguous_nonnull(q, op, "q");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    require_contiguous_nonnull(segments, op, "segments");
+    require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
+    require_contiguous_nonnull(out, op, "out");
+    const std::uint32_t capacity = validate_batch_cache(cache, kSegmentedKVHeads, op);
+    const std::int64_t end       = static_cast<std::int64_t>(prefix) + columns;
+    if (prefix < 0 || end > capacity || end > kGqaAttentionMaximumVisibleKeys) {
+        throw std::invalid_argument("gqa_attention_segmented: prefix + N exceeds the KV row");
+    }
+
+    auto scope                 = workspace.scope();
+    SegmentedWorkspace partial = allocate_segmented_workspace(workspace, columns);
+    detail::gqa_attention_segmented_launch(q, k, v, segments, kv_table_rows, prefix, scale, cache,
+                                           partial.acc, partial.m, partial.l, out, stream);
 }
 
 } // namespace ninfer::ops

@@ -31,6 +31,22 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 
 /**
+ * Segmented form for S independent continuations of one read-only window. `x` and `out` are
+ * contiguous BF16 [C,N], `conv_state` is contiguous BF16 [C,3], and `segments` is a contiguous
+ * device I32 [2,S] table whose column s is (c_s,T_s), the first column and length of segment s.
+ * The caller promises that the table tiles [0,N) in order: c_0=0, c_{s+1}=c_s+T_s, T_s>=1, and
+ * c_{S-1}+T_{S-1}=N. The host checks only the shapes and 1<=S<=N.
+ *
+ * Output columns [c_s,c_s+T_s) receive `ideal` evaluated over x[:,c_s..c_s+T_s) with
+ * u[c,-3..-1]=conv_state, so every segment restarts from the same window and no column reads
+ * another segment. The oracle and numerical criterion are those of the single-sequence form. No
+ * state is written: x, weight, conv_state, and segments are read-only, and out overlaps none of
+ * them. No caller workspace is used.
+ */
+void causal_conv1d_silu_segmented(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                                  const Tensor& segments, Tensor& out, cudaStream_t stream);
+
+/**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and
  * `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is either contiguous I32 [B],

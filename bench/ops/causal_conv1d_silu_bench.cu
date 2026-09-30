@@ -5,6 +5,7 @@
 //   ./ninfer_causal_conv1d_silu_bench --prefill --channels 8192 --tokens 1024
 //   ./ninfer_causal_conv1d_silu_bench --distinct --channels 8192 --tokens 6
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
+//   ./ninfer_causal_conv1d_silu_bench --segmented --channels 10240
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "core/device.h"
@@ -30,10 +31,11 @@ struct Options {
     std::int32_t initial_slot = 6;
     std::int32_t batch        = 1;
     std::vector<std::int32_t> valid_columns;
-    bool decode   = false;
-    bool prefill  = false;
-    bool distinct = false;
-    bool snapshot = false;
+    bool decode    = false;
+    bool prefill   = false;
+    bool distinct  = false;
+    bool snapshot  = false;
+    bool segmented = false;
 };
 
 __global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
@@ -202,9 +204,67 @@ void run_snapshot(const Options& options) {
     print_result(tag.c_str(), r);
 }
 
+// One segmented workload in three forms over identical operands: the segmented Op, the
+// per-segment loop of distinct-state ordinary calls that it replaces, and one ordinary call over
+// the same packed width, which is a throughput reference rather than the same sequences.
+void run_segmented(const Options& options, const char* mix,
+                   const std::vector<std::int32_t>& lengths) {
+    std::vector<std::int32_t> table;
+    std::int32_t N = 0;
+    for (const std::int32_t length : lengths) {
+        table.push_back(N);
+        table.push_back(length);
+        N += length;
+    }
+    const auto S              = static_cast<std::int32_t>(lengths.size());
+    const std::size_t n       = static_cast<std::size_t>(options.channels) * N;
+    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+
+    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
+    DeviceBuffer weight =
+        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
+    DeviceBuffer state     = make_varied_bf16(state_n, 0x31415926U);
+    DeviceBuffer discarded = make_zeros(state_n * 2u);
+    DeviceBuffer out       = make_zeros(n * 2u);
+    DeviceBuffer segments(table.size() * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemcpy(segments.p, table.data(), segments.bytes, cudaMemcpyHostToDevice));
+
+    const Tensor tx(x.p, DType::BF16, {options.channels, N});
+    const Tensor tw(weight.p, DType::BF16, {options.channels, 4});
+    const Tensor ts(state.p, DType::BF16, {options.channels, 3});
+    Tensor tdiscarded(discarded.p, DType::BF16, {options.channels, 3});
+    const Tensor tseg(segments.p, DType::I32, {2, S});
+    Tensor tout(out.p, DType::BF16, {options.channels, N});
+
+    // Informational compulsory traffic: x/out, the four-tap weight, and the shared window.
+    const double bytes    = 4.0 * static_cast<double>(n) + 14.0 * options.channels;
+    const std::string tag = std::string("causal_conv1d segmented ") + mix + " [" +
+                            std::to_string(options.channels) + "," + std::to_string(N) +
+                            "] S=" + std::to_string(S);
+    const Result segmented = bench_loop(
+        [&](cudaStream_t s) { ops::causal_conv1d_silu_segmented(tx, tw, ts, tseg, tout, s); },
+        bytes);
+    print_result((tag + " segmented").c_str(), segmented);
+    const Result loop = bench_loop(
+        [&](cudaStream_t s) {
+            for (std::int32_t segment = 0; segment < S; ++segment) {
+                const std::int32_t first  = table[2 * static_cast<std::size_t>(segment)];
+                const std::int32_t length = table[2 * static_cast<std::size_t>(segment) + 1];
+                Tensor segment_out        = tout.slice(1, first, length);
+                ops::causal_conv1d_silu(tx.slice(1, first, length), tw, ts, tdiscarded, segment_out,
+                                        s);
+            }
+        },
+        bytes);
+    print_result((tag + " per-segment loop").c_str(), loop);
+    const Result single = bench_loop(
+        [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tdiscarded, tout, s); }, bytes);
+    print_result((tag + " single call").c_str(), single);
+}
+
 void print_usage(const char* program) {
     std::fprintf(stderr,
-                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] "
+                 "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--segmented] "
                  "[--channels C] [--tokens T] [--batch B] [--valid-columns V0,V1,...] "
                  "[--slots S] [--initial-slot I]\n",
                  program);
@@ -242,6 +302,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.distinct = true;
         } else if (!std::strcmp(argv[i], "--snapshot")) {
             options.snapshot = true;
+        } else if (!std::strcmp(argv[i], "--segmented")) {
+            options.segmented = true;
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
             if (!parse_valid_columns(argv[++i], options.valid_columns)) { return false; }
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
@@ -264,7 +326,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             return false;
         }
     }
-    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot) {
+    if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
+        !options.segmented) {
         options.decode = options.prefill = true;
     }
     if (options.batch > 8 || (options.batch > 1 && options.tokens > 16) ||
@@ -299,5 +362,12 @@ int main(int argc, char** argv) {
     if (options.prefill) run_prefill(options, false);
     if (options.distinct) run_prefill(options, true);
     if (options.snapshot) run_snapshot(options);
+    if (options.segmented) {
+        run_segmented(options, "1x40", {40});
+        run_segmented(options, "6x40", std::vector<std::int32_t>(6, 40));
+        run_segmented(options, "255x3", std::vector<std::int32_t>(255, 3));
+        run_segmented(options, "1x1024", {1024});
+        run_segmented(options, "16x64", std::vector<std::int32_t>(16, 64));
+    }
     return 0;
 }

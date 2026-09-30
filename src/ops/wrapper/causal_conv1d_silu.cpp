@@ -119,6 +119,16 @@ void require_non_empty_accessible(const Tensor& x, const Tensor& weight, const T
     }
 }
 
+void require_segment_table_shape(const Tensor& segments, std::int32_t columns) {
+    if (segments.dtype != DType::I32) {
+        throw std::invalid_argument("causal_conv1d: segments must be I32");
+    }
+    if (segments.ne[0] != 2 || segments.ne[1] < 1 || segments.ne[1] > columns ||
+        segments.ne[2] != 1 || segments.ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: segments must have shape [2,S] with 1<=S<=N");
+    }
+}
+
 void require_metadata_accessible(const Tensor& metadata, const char* label) {
     if (!metadata.is_contiguous()) {
         throw std::invalid_argument(std::string("causal_conv1d: ") + label + " must be contiguous");
@@ -184,6 +194,15 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
     } else {
         detail::causal_conv1d_prefill_launch(x, weight, conv_state, conv_state, out, stream);
     }
+}
+
+void causal_conv1d_silu_segmented(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                                  const Tensor& segments, Tensor& out, cudaStream_t stream) {
+    (void)validate_common(x, weight, conv_state, out);
+    require_segment_table_shape(segments, x.ne[1]);
+    require_non_empty_accessible(x, weight, conv_state, out);
+    require_metadata_accessible(segments, "segments");
+    detail::causal_conv1d_segmented_launch(x, weight, conv_state, segments, out, stream);
 }
 
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,

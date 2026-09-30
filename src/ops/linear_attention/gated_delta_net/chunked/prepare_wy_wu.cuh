@@ -350,12 +350,15 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
     }
 }
 
-template <int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS>
+// SEGMENTED grids index chunk slots (see segment_table); an empty slot exits before any barrier.
+// Every chunk's inputs and W/U/g_cumsum outputs share its start column, so the private stage is
+// column-indexed exactly like the single-sequence form.
+template <int K_PANEL_COLS, int WU_PANEL_COLS, int BLOCK_WARPS, bool SEGMENTED>
 __global__ void
 prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16* __restrict__ v_in,
                      const float* __restrict__ g_in, const float* __restrict__ beta_in,
                      __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ U,
-                     float* __restrict__ g_cumsum_out, head_map qk_map) {
+                     float* __restrict__ g_cumsum_out, head_map qk_map, segment_table segments) {
     static_assert(BLOCK_WARPS == 4 || BLOCK_WARPS == 8);
     static_assert(BLOCK_WARPS % N_SUB == 0);
     static_assert(WU_PANEL_COLS % (BLOCK_WARPS / N_SUB) == 0);
@@ -389,9 +392,11 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     const int lane_g = lane >> 2;
     const int lane_t = lane & 3;
 
-    const int chunk               = static_cast<int>(blockIdx.x);
-    const int h_v                 = static_cast<int>(blockIdx.y);
-    const std::int64_t cs         = static_cast<std::int64_t>(chunk) * BT;
+    const int chunk = static_cast<int>(blockIdx.x);
+    const int h_v   = static_cast<int>(blockIdx.y);
+    const std::int64_t cs =
+        SEGMENTED ? segmented_chunk_start(segments, chunk) : static_cast<std::int64_t>(chunk) * BT;
+    if (SEGMENTED && cs < 0) { return; }
     const std::int64_t H_v        = qk_map.H_v;
     const std::int64_t k_stride_t = static_cast<std::int64_t>(qk_map.H_qk) * kStateDim;
     const std::int64_t v_stride_t = H_v * kStateDim;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ops/common/bf16_vector.cuh"
+#include "ops/common/segment_table.cuh"
+#include "ops/kernel/l2norm_row.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
@@ -221,6 +223,45 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
+__device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
+                                                const float* head_state, std::uint32_t dv_base,
+                                                std::uint32_t dqk_base) {
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        load_qk_lane(state[r], head_state + static_cast<std::int64_t>(dv_base + r) * kStateDim,
+                     dqk_base);
+    }
+}
+
+// Advances one warp's state tile over `width` consecutive packed columns starting at
+// `first_column`, writing each column's output rows. Every direct recurrent route shares this
+// body, so a column's arithmetic does not depend on the call form that reached it.
+template <bool NormalizeQK>
+__device__ __forceinline__ void recurrent_bf16_columns(
+    float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, const float* g, const float* beta, __nv_bfloat16* out,
+    std::int64_t first_column, std::int32_t width, const head_map& heads, std::uint32_t h_v,
+    std::uint32_t h_qk, std::uint32_t dv_base, std::uint32_t dqk_base, int lane, float scale) {
+    RawQkLane key = load_raw_qk_lane(k + (first_column * heads.H_qk + h_qk) * kStateDim, dqk_base);
+    normalize_qk_lane<NormalizeQK>(key.value, lane);
+    for (std::int32_t token = 0; token < width; ++token) {
+        const std::int64_t column = first_column + token;
+        const RawGatePair gate    = load_source_gate(g, beta, column * heads.H_v + h_v);
+        const RawValuePack value =
+            load_value_pack(v + (column * heads.H_v + h_v) * kStateDim, dv_base);
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+
+        if (token + 1 < width) {
+            key = load_raw_qk_lane(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
+            normalize_qk_lane<NormalizeQK>(key.value, lane);
+        }
+
+        readout_and_store<NormalizeQK>(state, q + (column * heads.H_qk + h_qk) * kStateDim,
+                                       out + (column * heads.H_v + h_v) * kStateDim, dqk_base,
+                                       dv_base, lane, scale);
+    }
+}
+
 template <bool NormalizeQK>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
@@ -237,39 +278,94 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const std::uint32_t dv_base =
         static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * kQkPerLane);
-    const float* read_h = state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 
     __align__(16) float state[kDvPerWarp][kQkPerLane];
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        load_qk_lane(state[r], read_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
-                     dqk_base);
-    }
-
-    RawQkLane key = load_raw_qk_lane(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
-    normalize_qk_lane<NormalizeQK>(key.value, lane);
-    for (std::int32_t token = 0; token < width; ++token) {
-        const std::int64_t column = token;
-        const RawGatePair gate    = load_source_gate(g, beta, column * heads.H_v + h_v);
-        const RawValuePack value =
-            load_value_pack(v + (column * heads.H_v + h_v) * kStateDim, dv_base);
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
-
-        if (token + 1 < width) {
-            key = load_raw_qk_lane(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
-            normalize_qk_lane<NormalizeQK>(key.value, lane);
-        }
-
-        readout_and_store<NormalizeQK>(state, q + (column * heads.H_qk + h_qk) * kStateDim,
-                                       out + (column * heads.H_v + h_v) * kStateDim, dqk_base,
-                                       dv_base, lane, scale);
-    }
+    load_state_tile(state, state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim,
+                    dv_base, dqk_base);
+    recurrent_bf16_columns<NormalizeQK>(state, q, k, v, g, beta, out, 0, width, heads, h_v, h_qk,
+                                        dv_base, dqk_base, lane, scale);
 
     float* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
+    }
+}
+
+// Segmented staging (see segment_table): one warp per BF16 row of q (blockIdx.y=0) or k
+// (blockIdx.y=1). Rows of columns whose segment has a full chunk receive the l2norm Op's row
+// arithmetic, exactly as the single-sequence chunked route stages them; other rows are untouched.
+template <int Block>
+__launch_bounds__(Block) __global__
+    void segmented_qk_l2norm_kernel(const __nv_bfloat162* __restrict__ q,
+                                    const __nv_bfloat162* __restrict__ k,
+                                    __nv_bfloat162* __restrict__ q_normalized,
+                                    __nv_bfloat162* __restrict__ k_normalized,
+                                    const std::int32_t* __restrict__ segments,
+                                    std::int32_t segment_count, std::int32_t qk_heads,
+                                    std::int64_t rows) {
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    constexpr int kPairs         = kStateDim / 2;
+    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+
+    const auto column         = static_cast<std::int32_t>(row / qk_heads);
+    const std::int32_t owner  = segment_containing(segments, segment_count, column);
+    const std::int32_t length = __ldg(segments + 2 * owner + 1);
+    if (length < kChunkSize) { return; }
+
+    const bool key              = blockIdx.y != 0;
+    const std::int64_t row_base = row * kPairs;
+    l2norm_warp_row_bf16x2((key ? k : q) + row_base, (key ? k_normalized : q_normalized) + row_base,
+                           kPairs, kQkL2NormEps, lane);
+}
+
+// Segmented recurrent pass (see segment_table): CTA (segment, value head, dv tile) runs the
+// recurrent remainder of one segment and publishes no state. A segment with a full chunk resumes
+// from its run slot's chunk-end state over its tail columns with staged q/k consumed as supplied,
+// exactly like the single-sequence tail after its chunked stage; its CTAs exit when there is no
+// tail. A shorter segment runs every column from ssm_state with raw q/k, exactly like the
+// single-sequence recurrent route.
+template <bool NormalizeQK>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_bf16_segmented_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ q_staged, const __nv_bfloat16* __restrict__ k_staged,
+    const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, const float* __restrict__ ssm_state,
+    const float* __restrict__ chunk_states, const std::int32_t* __restrict__ segments,
+    __nv_bfloat16* __restrict__ out, head_map heads, float scale) {
+    const std::int32_t segment = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t first   = __ldg(segments + 2 * segment);
+    const std::int32_t length  = __ldg(segments + 2 * segment + 1);
+    const std::int32_t full    = length - length % kChunkSize;
+    if (full > 0 && full == length) { return; }
+
+    const int lane           = threadIdx.x;
+    const int warp_id        = threadIdx.y;
+    const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.y);
+    const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
+    const std::uint32_t dv_base =
+        static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
+    const std::uint32_t dqk_base      = static_cast<std::uint32_t>(lane * kQkPerLane);
+    constexpr std::int64_t kHeadState = static_cast<std::int64_t>(kStateDim) * kStateDim;
+
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    if (full > 0) {
+        const std::int64_t run_slot = first / kChunkSize;
+        load_state_tile(state, chunk_states + (run_slot * heads.H_v + h_v) * kHeadState, dv_base,
+                        dqk_base);
+        recurrent_bf16_columns<false>(state, q_staged, k_staged, v, g, beta, out, first + full,
+                                      length - full, heads, h_v, h_qk, dv_base, dqk_base, lane,
+                                      scale);
+    } else {
+        load_state_tile(state, ssm_state + static_cast<std::int64_t>(h_v) * kHeadState, dv_base,
+                        dqk_base);
+        recurrent_bf16_columns<NormalizeQK>(state, q, k, v, g, beta, out, first, length, heads, h_v,
+                                            h_qk, dv_base, dqk_base, lane, scale);
     }
 }
 

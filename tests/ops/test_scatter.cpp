@@ -70,6 +70,50 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     return failures;
 }
 
+int gather_case(std::int32_t rows, std::int32_t source_columns,
+                const std::vector<std::int32_t>& indices, std::size_t source_offset_bytes) {
+    const std::int32_t columns = static_cast<std::int32_t>(indices.size());
+    const auto source = bit_pattern(static_cast<std::size_t>(rows) * source_columns, 0x2468'ace0u);
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(rows) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::int32_t source_column = indices[static_cast<std::size_t>(column)];
+        for (std::int32_t row = 0; row < rows; ++row) {
+            expected[static_cast<std::size_t>(column) * rows + row] =
+                source[static_cast<std::size_t>(source_column) * rows + row];
+        }
+    }
+
+    // A byte offset into the source allocation exercises the unaligned routes.
+    GuardedDeviceBuffer device_source(source.size() * sizeof(std::uint16_t) + source_offset_bytes);
+    GuardedDeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_destination(expected.size() * sizeof(std::uint16_t));
+    auto* source_data = static_cast<unsigned char*>(device_source.data()) + source_offset_bytes;
+    device_source.copy_from_host(source.data(), source.size() * sizeof(std::uint16_t),
+                                 source_offset_bytes);
+    device_indices.copy_from_host(indices.data(), indices.size() * sizeof(std::int32_t));
+    device_destination.fill(0xcd);
+    Tensor source_tensor(source_data, DType::BF16, {rows, source_columns});
+    Tensor indices_tensor(device_indices.data(), DType::I32, {columns});
+    Tensor destination_tensor(device_destination.data(), DType::BF16, {rows, columns});
+    ops::gather_bf16_columns(source_tensor, indices_tensor, destination_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "gather_bf16_columns D=" + std::to_string(rows) +
+                              " N=" + std::to_string(source_columns) +
+                              " R=" + std::to_string(columns) +
+                              " offset=" + std::to_string(source_offset_bytes);
+    int failures = 0;
+    failures += verify_exact(label.c_str(),
+                             from_device<std::uint16_t>(device_destination.data(), expected.size()),
+                             expected);
+    failures += verify_exact((label + " preserves source").c_str(),
+                             from_device<std::uint16_t>(source_data, source.size()), source);
+    failures += device_source.verify_guards((label + " source").c_str());
+    failures += device_indices.verify_guards((label + " indices").c_str());
+    failures += device_destination.verify_guards((label + " destination").c_str());
+    return failures;
+}
+
 int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
                  std::int32_t source_offset, std::int32_t tokens) {
     const auto source = bit_pattern(static_cast<std::size_t>(source_rows) * tokens, 0x1357'9bdfu);
@@ -200,6 +244,11 @@ int main() {
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();
-    std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
+    // Decision readouts: repeated, unordered, first and last columns; the three copy routes.
+    failures += gather_case(5120, 1024, {1023, 0, 17, 17, 512, 3}, 0);
+    failures += gather_case(5120, 40, {39}, 4);
+    failures += gather_case(7, 5, {4, 0, 2}, 2);
+    std::cout << (failures ? "FAIL" : "OK")
+              << " scatter, gather_bf16_columns and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

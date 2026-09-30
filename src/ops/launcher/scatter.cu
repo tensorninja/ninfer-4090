@@ -32,6 +32,31 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gather_columns_launch(const Tensor& source, const Tensor& indices, Tensor& destination,
+                           cudaStream_t stream) {
+    constexpr int block        = 256;
+    constexpr int vector_block = 128;
+    const int d                = source.ne[0];
+    const int columns          = destination.ne[1];
+    const auto source_addr     = reinterpret_cast<std::uintptr_t>(source.data);
+    const auto destination_addr = reinterpret_cast<std::uintptr_t>(destination.data);
+    const auto* index_data      = static_cast<const std::int32_t*>(indices.data);
+    if ((d % 8) == 0 && ((source_addr | destination_addr) & 0xfu) == 0) {
+        gather_columns_kernel<uint4><<<columns, vector_block, 0, stream>>>(
+            static_cast<const uint4*>(source.data), index_data,
+            static_cast<uint4*>(destination.data), d / 8);
+    } else if ((d & 1) == 0 && ((source_addr | destination_addr) & 0x3u) == 0) {
+        gather_columns_kernel<__nv_bfloat162><<<columns, block, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(source.data), index_data,
+            static_cast<__nv_bfloat162*>(destination.data), d / 2);
+    } else {
+        gather_columns_kernel<__nv_bfloat16><<<columns, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(source.data), index_data,
+            static_cast<__nv_bfloat16*>(destination.data), d);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
                                const Tensor& valid_columns, Tensor& destination,
                                cudaStream_t stream) {

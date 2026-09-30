@@ -9,15 +9,12 @@
 #include <new>
 
 namespace ninfer::ops::detail::gated_delta_net {
-std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
-    if (tokens <= 0) { return 0; }
-    return chunked::workspace_bytes(value_heads, tokens);
-}
+namespace {
 
-void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
-                    Tensor& ssm_state_out, Tensor& out, void* workspace,
-                    std::size_t workspace_bytes, cudaStream_t stream) {
+void launch_stages(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                   const Tensor& beta, float scale, const float* state_in, float* state_out,
+                   segment_table segments, Tensor& out, void* workspace,
+                   std::size_t workspace_bytes, cudaStream_t stream) {
     const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2]);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 
@@ -32,6 +29,7 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     prepare.H_qk         = q.ne[1];
     prepare.H_v          = v.ne[1];
     prepare.L            = q.ne[2];
+    prepare.segments     = segments;
     prepare.k            = static_cast<const __nv_bfloat16*>(k.data);
     prepare.v            = static_cast<const __nv_bfloat16*>(v.data);
     prepare.g_in         = static_cast<const float*>(g.data);
@@ -46,14 +44,15 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     state.H_qk      = q.ne[1];
     state.H_v       = v.ne[1];
     state.L         = q.ne[2];
+    state.segments  = segments;
     state.W         = static_cast<const __nv_bfloat16*>(W.data);
     state.U         = static_cast<const __nv_bfloat16*>(U.data);
     state.k         = static_cast<const __nv_bfloat16*>(k.data);
     state.g_cumsum  = static_cast<const float*>(g_cumsum.data);
-    state.state_in  = static_cast<const float*>(ssm_state_in.data);
+    state.state_in  = state_in;
     state.v_new     = static_cast<__nv_bfloat16*>(v_new.data);
     state.h_chunk   = static_cast<__nv_bfloat16*>(h_chunk.data);
-    state.state_out = static_cast<float*>(ssm_state_out.data);
+    state.state_out = state_out;
     state.stream    = stream;
     CUDA_CHECK(chunked::launch_state_passing(state));
 
@@ -61,6 +60,7 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.H_qk     = q.ne[1];
     output.H_v      = v.ne[1];
     output.L        = q.ne[2];
+    output.segments = segments;
     output.q        = static_cast<const __nv_bfloat16*>(q.data);
     output.k        = static_cast<const __nv_bfloat16*>(k.data);
     output.v_new    = static_cast<const __nv_bfloat16*>(v_new.data);
@@ -70,6 +70,30 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.scale    = scale;
     output.stream   = stream;
     CUDA_CHECK(chunked::launch_output(output));
+}
+
+} // namespace
+
+std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
+    if (tokens <= 0) { return 0; }
+    return chunked::workspace_bytes(value_heads, tokens);
+}
+
+void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                    Tensor& ssm_state_out, Tensor& out, void* workspace,
+                    std::size_t workspace_bytes, cudaStream_t stream) {
+    launch_stages(q, k, v, g, beta, scale, static_cast<const float*>(ssm_state_in.data),
+                  static_cast<float*>(ssm_state_out.data), segment_table{}, out, workspace,
+                  workspace_bytes, stream);
+}
+
+void launch_chunked_segmented(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, const Tensor& ssm_state,
+                              segment_table segments, float* chunk_states, Tensor& out,
+                              void* workspace, std::size_t workspace_bytes, cudaStream_t stream) {
+    launch_stages(q, k, v, g, beta, scale, static_cast<const float*>(ssm_state.data), chunk_states,
+                  segments, out, workspace, workspace_bytes, stream);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

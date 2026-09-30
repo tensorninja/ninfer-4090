@@ -71,4 +71,31 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream);
 
+/**
+ * Op: gather_bf16_columns
+ *
+ * Math / indexing:
+ *   For source [D,N], indices [R], and destination [D,R]:
+ *   destination[d,r] = source[d,indices[r]], 0<=d<D, 0<=r<R.
+ *
+ * Logical shapes:
+ *   Contiguous BF16 source [D,N] and destination [D,R], contiguous I32 indices [R] resident on the
+ *   device. The caller guarantees 0<=indices[r]<N; indices may repeat and need not be ordered.
+ *
+ * Numeric:
+ *   Exact BF16 element copies.
+ *
+ * Effects:
+ *   Writes the full destination and nothing else; destination must not overlap source or indices.
+ *
+ * Workspace:
+ *   None. The Op has no persistent state side effect.
+ *
+ * Supported routes:
+ *   D divisible by eight with 16-byte-aligned source/destination uses BF16x8 copies; other even D
+ *   with 4-byte alignment uses BF16x2; remaining contiguous dimensions use scalar copies.
+ */
+void gather_bf16_columns(const Tensor& source, const Tensor& indices, Tensor& destination,
+                         cudaStream_t stream);
+
 } // namespace ninfer::ops

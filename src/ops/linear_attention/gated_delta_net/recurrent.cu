@@ -227,6 +227,41 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
     }
 }
 
+void launch_segmented_qk_l2norm(const Tensor& q, const Tensor& k, segment_table segments,
+                                Tensor& q_normalized, Tensor& k_normalized, cudaStream_t stream) {
+    constexpr int kBlock         = 512;
+    constexpr int kWarpsPerBlock = kBlock / kWarpSize;
+    const std::int64_t rows      = static_cast<std::int64_t>(q.ne[1]) * q.ne[2];
+    const dim3 grid(static_cast<unsigned>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock), 2, 1);
+    segmented_qk_l2norm_kernel<kBlock><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat162*>(q.data), static_cast<const __nv_bfloat162*>(k.data),
+        static_cast<__nv_bfloat162*>(q_normalized.data),
+        static_cast<__nv_bfloat162*>(k_normalized.data), segments.columns, segments.count, q.ne[1],
+        rows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_recurrent_segmented_tails(const Tensor& q, const Tensor& k, const Tensor& q_staged,
+                                      const Tensor& k_staged, const Tensor& v, const Tensor& g,
+                                      const Tensor& beta, float scale, bool normalize_qk,
+                                      const Tensor& ssm_state, const float* chunk_states,
+                                      segment_table segments, Tensor& out, cudaStream_t stream) {
+    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const dim3 grid(static_cast<unsigned>(segments.count), static_cast<unsigned>(v.ne[1]),
+                    static_cast<unsigned>(kStateDim / kBlockDv));
+    const dim3 block(kWarpSize, kNumWarps, 1);
+    const auto kernel = normalize_qk ? recurrent_bf16_segmented_kernel<true>
+                                     : recurrent_bf16_segmented_kernel<false>;
+    kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(q_staged.data),
+        static_cast<const __nv_bfloat16*>(k_staged.data), static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const float*>(g.data), static_cast<const float*>(beta.data),
+        static_cast<const float*>(ssm_state.data), chunk_states, segments.columns,
+        static_cast<__nv_bfloat16*>(out.data), heads, scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {

@@ -200,6 +200,49 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
     return out;
 }
 
+detail::gated_delta_net::segment_table require_segment_table(const Tensor& segments,
+                                                             std::int32_t columns) {
+    require_dtype(segments, DType::I32, "segments must be I32");
+    const std::int32_t count = segments.ne[1];
+    if (count < 1 || count > columns) {
+        throw std::invalid_argument("gated_delta_net: segment count must be in [1,N]");
+    }
+    require_shape(segments, 2, count, 1, 1, "segments");
+    require_contiguous_nonnull(segments, "segments");
+    return {static_cast<const std::int32_t*>(segments.data), count};
+}
+
+// A segmented call over N columns stages the chunked route whenever N admits a full chunk; which
+// segments own full chunks is known only to the device table.
+struct SegmentedWorkspace {
+    bool chunked = false;
+    Tensor staged_q;
+    Tensor staged_k;
+    Tensor chunk_states;
+    DeviceSpan stage;
+};
+
+template <class Allocator>
+SegmentedWorkspace allocate_segmented_workspace(Allocator& allocator, std::int32_t qk_heads,
+                                                std::int32_t value_heads, std::int32_t columns,
+                                                bool normalize_qk) {
+    using namespace detail::gated_delta_net;
+    SegmentedWorkspace out;
+    out.chunked = columns >= kChunkSize;
+    if (!out.chunked) { return out; }
+    if (normalize_qk) {
+        out.staged_q = allocator.alloc(DType::BF16, {kStateDim, qk_heads, columns});
+        out.staged_k = allocator.alloc(DType::BF16, {kStateDim, qk_heads, columns});
+    }
+    const std::int32_t tail_slots = segmented_tail_state_slots(columns);
+    if (tail_slots > 0) {
+        out.chunk_states =
+            allocator.alloc(DType::FP32, {kStateDim, kStateDim, value_heads, tail_slots});
+    }
+    out.stage = allocator.alloc_bytes(chunked_workspace_bytes(value_heads, columns));
+    return out;
+}
+
 } // namespace
 
 std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
@@ -228,6 +271,51 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     (void)ws;
     detail::gated_delta_net::launch_recurrent(q, k, v, g, beta, scale, normalize_qk, ssm_state, out,
                                               stream);
+}
+
+std::size_t gated_delta_net_segmented_workspace_capacity_bytes(std::int32_t qk_heads,
+                                                               std::int32_t value_heads,
+                                                               bool normalize_qk,
+                                                               std::int32_t max_columns) {
+    if (!detail::gated_delta_net::are_head_counts_valid(qk_heads, value_heads) || max_columns < 1) {
+        throw std::invalid_argument("gated_delta_net_segmented workspace: invalid profile");
+    }
+    // Every region grows monotonically with N, so the largest N bounds every call.
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_segmented_workspace(layout, qk_heads, value_heads, max_columns, normalize_qk);
+    return layout.peak_bytes(1);
+}
+
+void gated_delta_net_segmented(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               WorkspaceArena& ws, const Tensor& ssm_state, const Tensor& segments,
+                               Tensor& out, cudaStream_t stream) {
+    const Geometry geometry = validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
+    const detail::gated_delta_net::segment_table table =
+        require_segment_table(segments, geometry.tokens);
+
+    auto scratch_scope         = ws.scope();
+    SegmentedWorkspace scratch = allocate_segmented_workspace(
+        ws, geometry.qk_heads, geometry.value_heads, geometry.tokens, normalize_qk);
+    // Like the single-sequence route, segments with full chunks consume q/k normalized once into
+    // staging for both their chunks and their tail; shorter segments normalize in the recurrence.
+    Tensor q_staged = q;
+    Tensor k_staged = k;
+    if (scratch.chunked) {
+        if (normalize_qk) {
+            q_staged = scratch.staged_q;
+            k_staged = scratch.staged_k;
+            detail::gated_delta_net::launch_segmented_qk_l2norm(q, k, table, q_staged, k_staged,
+                                                                stream);
+        }
+        detail::gated_delta_net::launch_chunked_segmented(
+            q_staged, k_staged, v, g, beta, scale, ssm_state, table,
+            static_cast<float*>(scratch.chunk_states.data), out, scratch.stage.data,
+            scratch.stage.bytes, stream);
+    }
+    detail::gated_delta_net::launch_recurrent_segmented_tails(
+        q, k, q_staged, k_staged, v, g, beta, scale, normalize_qk, ssm_state,
+        static_cast<const float*>(scratch.chunk_states.data), table, out, stream);
 }
 
 void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

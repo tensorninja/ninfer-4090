@@ -221,6 +221,110 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     return failures;
 }
 
+// Every segment is its own complete sequence from the shared read-only window and is compared with
+// that sequence's oracle. `parity_exact` counts cases whose output bits also equal per-segment
+// ordinary calls; that supplementary comparison is reported, not required.
+int segmented_case(std::int32_t C, const std::vector<std::int32_t>& lengths, std::uint32_t seed,
+                   int& parity_exact) {
+    std::vector<std::int32_t> table;
+    std::int32_t N = 0;
+    for (const std::int32_t length : lengths) {
+        table.push_back(N);
+        table.push_back(length);
+        N += length;
+    }
+    const auto S                                 = static_cast<std::int32_t>(lengths.size());
+    const LogicalInput input                     = make_input(C, N, seed);
+    const std::vector<float> state               = make_state(C, seed + 2U);
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
+
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer segments(table.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    state_in.copy_from_host(state_bits.data(), state_in.bytes());
+    segments.copy_from_host(table.data(), segments.bytes());
+    output.fill(kOutputPoison);
+
+    Tensor tx(x.data(), DType::BF16, {C, N});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor ts(state_in.data(), DType::BF16, {C, 3});
+    Tensor tseg(segments.data(), DType::I32, {2, S});
+    Tensor tout(output.data(), DType::BF16, {C, N});
+    ops::causal_conv1d_silu_segmented(tx, tw, ts, tseg, tout, nullptr);
+    cuda_synchronize();
+
+    // Output columns are independent four-tap evaluations, so one comparison of the whole output
+    // against the segment-assembled oracle, at the granularity of every ordinary case, exposes any
+    // tap read from the wrong segment or window pointwise.
+    std::vector<double> reference;
+    reference.reserve(x_bits.size());
+    for (std::int32_t s = 0; s < S; ++s) {
+        const std::int32_t first  = table[2 * static_cast<std::size_t>(s)];
+        const std::int32_t length = table[2 * static_cast<std::size_t>(s) + 1];
+        const auto begin          = static_cast<std::ptrdiff_t>(offset(0, first, C));
+        const auto end            = static_cast<std::ptrdiff_t>(offset(0, first + length, C));
+        const OracleResult oracle =
+            causal_conv_oracle(std::vector<float>(input.x.begin() + begin, input.x.begin() + end),
+                               input.weight, state, C, length, false);
+        reference.insert(reference.end(), oracle.output.begin(), oracle.output.end());
+    }
+
+    const std::string tag = "causal_conv1d_silu segmented C=" + std::to_string(C) +
+                            " N=" + std::to_string(N) + " S=" + std::to_string(S);
+    int failures = 0;
+    failures +=
+        verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()), reference);
+    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    failures += verify_bits(tag + " state preserved", state_in.data(), state_bits);
+    failures += verify_exact((tag + " segments preserved").c_str(),
+                             from_device<std::int32_t>(segments.data(), table.size()), table);
+    failures += verify_buffer_guards(tag + " x", x);
+    failures += verify_buffer_guards(tag + " weight", weight);
+    failures += verify_buffer_guards(tag + " state", state_in);
+    failures += verify_buffer_guards(tag + " segments", segments);
+    failures += verify_buffer_guards(tag + " output", output);
+
+    const std::vector<std::uint16_t> bits =
+        from_device<std::uint16_t>(output.data(), x_bits.size());
+    output.fill(kOutputPoison);
+    ops::causal_conv1d_silu_segmented(tx, tw, ts, tseg, tout, nullptr);
+    cuda_synchronize();
+    failures += verify_bits(tag + " repeat bits", output.data(), bits);
+
+    DeviceBuffer single_output(x_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer single_state(state_bits.size() * sizeof(std::uint16_t));
+    Tensor single_out(single_output.p, DType::BF16, {C, N});
+    Tensor single_state_out(single_state.p, DType::BF16, {C, 3});
+    for (std::int32_t s = 0; s < S; ++s) {
+        const std::int32_t first  = table[2 * static_cast<std::size_t>(s)];
+        const std::int32_t length = table[2 * static_cast<std::size_t>(s) + 1];
+        Tensor segment_out        = single_out.slice(1, first, length);
+        ops::causal_conv1d_silu(tx.slice(1, first, length), tw, ts, single_state_out, segment_out,
+                                nullptr);
+    }
+    cuda_synchronize();
+    const std::vector<std::uint16_t> single_bits =
+        from_device<std::uint16_t>(single_output, x_bits.size());
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        if (bits[i] != single_bits[i]) { ++differing; }
+    }
+    if (differing == 0) {
+        ++parity_exact;
+    } else {
+        std::cout << tag << ": " << differing << " of " << bits.size()
+                  << " output bits differ from per-segment ordinary calls\n";
+    }
+    return failures;
+}
+
 // Continuation prefill reads a selected committed slot and publishes the new running state to slot
 // 0. The Op sees two valid disjoint [C,3] tensors; checking their common backing allocation also
 // proves that every surrounding state slot remains untouched.
@@ -510,6 +614,29 @@ int main() {
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
     failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+
+    // Segmented form: segments shorter than, equal to, and longer than the window, adjacent
+    // single-column segments, and an odd channel extent for the unpaired kernel.
+    const std::vector<std::vector<std::int32_t>> segment_mixes = {
+        {1},
+        std::vector<std::int32_t>(6, 40),
+        {1024},
+        std::vector<std::int32_t>(255, 3),
+        {3, 64, 1, 130, 40},
+        {1, 1, 2, 4, 1},
+    };
+    int parity_exact = 0;
+    int parity_cases = 0;
+    for (std::size_t i = 0; i < segment_mixes.size(); ++i) {
+        failures += segmented_case(kQwen27Channels, segment_mixes[i],
+                                   6000U + static_cast<std::uint32_t>(i), parity_exact);
+        ++parity_cases;
+    }
+    failures += segmented_case(kQwen35Channels, {3, 64, 1, 130, 40}, 6100U, parity_exact);
+    failures += segmented_case(1023, {3, 64, 1, 130, 40}, 6200U, parity_exact);
+    parity_cases += 2;
+    std::cout << "causal_conv1d_silu segmented: per-segment ordinary-call bit parity in "
+              << parity_exact << "/" << parity_cases << " cases\n";
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

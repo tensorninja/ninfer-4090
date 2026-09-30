@@ -38,7 +38,7 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const int kv_head               = tmp % Geometry::KVHeads;
     const int token                 = tmp / Geometry::KVHeads;
     const int d                     = vec * VecElems;
-    const int position              = positions[0] + token;
+    const int position              = metadata.base_position(positions) + token;
     const int lane                  = static_cast<int>(threadIdx.x) & 31;
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;

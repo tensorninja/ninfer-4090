@@ -173,6 +173,18 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
     gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
 }
 
+void gqa_kv_append_at_launch(const Tensor& k, const Tensor& v, std::int32_t first_position,
+                             const Tensor& table_rows, PagedKVBatchLayerView cache,
+                             cudaStream_t stream) {
+    const GqaPrefillHostPositionMetadata metadata{
+        .tables         = static_cast<const std::int32_t*>(cache.block_tables.data),
+        .table_rows     = static_cast<const std::int32_t*>(table_rows.data),
+        .table_stride   = cache.block_tables.ne[0],
+        .first_position = first_position,
+    };
+    gqa_kv_append_launch_for<Gqa27Geometry>(k, v, Tensor{}, cache, metadata, stream);
+}
+
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,

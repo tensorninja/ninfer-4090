@@ -49,10 +49,15 @@ inline std::size_t workspace_bytes(std::int32_t value_heads, std::int32_t tokens
     return compute_workspace_layout(value_heads, tokens).total_bytes;
 }
 
+// Every stage config accepts an optional segment table. Without one, L is a multiple of BT and
+// chunk c covers columns [c*BT,c*BT+BT). With one, L is the packed column count N, the grids
+// cover the floor(L/BT) chunk slots of segment_table, and every column-indexed input, output, and
+// private stage tensor is addressed by the chunk's own start column.
 struct prepare_wy_wu_config {
     std::int32_t H_qk = 0;
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
+    segment_table segments{};
 
     const __nv_bfloat16* k = nullptr;
     const __nv_bfloat16* v = nullptr;
@@ -66,10 +71,14 @@ struct prepare_wy_wu_config {
     cudaStream_t stream = nullptr;
 };
 
+// Segmented state passing starts every segment's chunk run from state_in. state_out is then FP32
+// [128,128,H_v,segmented_tail_state_slots(L)]; a run with a tail publishes its end state to its
+// run slot, and a run without a tail publishes nothing.
 struct state_passing_config {
     std::int32_t H_qk = 0;
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
+    segment_table segments{};
 
     const __nv_bfloat16* W = nullptr;
     const __nv_bfloat16* U = nullptr;
@@ -88,6 +97,7 @@ struct chunk_output_config {
     std::int32_t H_qk = 0;
     std::int32_t H_v  = 0;
     std::int32_t L    = 0;
+    segment_table segments{};
 
     const __nv_bfloat16* q       = nullptr;
     const __nv_bfloat16* k       = nullptr;
@@ -116,12 +126,17 @@ struct stage_validator {
         return cudaSuccess;
     }
 
-    cudaError_t check_full_chunks() const {
-        if ((T % kChunkSize) != 0) {
+    cudaError_t check_chunk_slots(segment_table segments) const {
+        if (segments.columns == nullptr && (T % kChunkSize) != 0) {
             std::fprintf(stderr,
                          "%s: Gated DeltaNet chunked path requires T to be a multiple of %d; "
                          "route tail tokens through AR instead (T=%lld)\n",
                          name, kChunkSize, static_cast<long long>(T));
+            return cudaErrorInvalidValue;
+        }
+        if (segments.columns != nullptr && (T < kChunkSize || segments.count < 1)) {
+            std::fprintf(stderr, "%s: segmented chunk slots require N>=%d and S>=1 (N=%lld S=%d)\n",
+                         name, kChunkSize, static_cast<long long>(T), segments.count);
             return cudaErrorInvalidValue;
         }
         return cudaSuccess;

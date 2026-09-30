@@ -18,7 +18,7 @@ struct GqaExecutionEnvelope {
 };
 
 /**
- * Shared numerical contract for A1/A2/A3.
+ * Shared numerical contract for A1/A2/A3/A4.
  *
  * Public q/k/v inputs and BF16 cache values are interpreted after their BF16 storage boundary.
  * INT8-G64 cache rows use one FP16 scale for each contiguous 64-element group. For BF16 source
@@ -42,8 +42,8 @@ struct GqaExecutionEnvelope {
  * named numerical criteria owned by the GQA conformance test. Those envelopes apply to the
  * registered geometries, tested token extents, conformance matrix, and target-representative
  * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
- * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
- * additional consistency check.
+ * A1, A3, and A4 are each qualified directly against the ideal oracle. A1-versus-A3 and
+ * A4-versus-per-segment-A1 parity are only additional consistency checks.
  */
 
 /**
@@ -109,5 +109,43 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/**
+ * Returns the transient arena capacity required by gqa_attention_segmented() for every N in
+ * [1, max_columns], every prefix, and every segment table. It does not depend on the prefix.
+ * Invalid intervals throw.
+ */
+[[nodiscard]] std::size_t gqa_attention_segmented_workspace_capacity_bytes(std::int32_t max_columns);
+
+/**
+ * A4: append N columns of one sequence behind a populated shared prefix and compute
+ * segment-causal grouped-query attention. The only registered geometry is group 6: q/out are
+ * contiguous BF16 `[256,24,N]` and k/v are contiguous BF16 `[256,4,N]`, N >= 1. segments is
+ * contiguous I32 [2,S] holding (c_s, T_s) pairs with c_0 = 0, T_s >= 1, and
+ * c_{s+1} = c_s + T_s, so the S segments tile [0,N) in order. kv_table_rows is contiguous I32 [1]
+ * selecting one row of the PagedKVBatchLayerView block-table matrix. prefix is a host value with
+ * 0 <= prefix and prefix + N no larger than the row capacity or kGqaAttentionMaximumVisibleKeys.
+ *
+ * The Op overwrites cache position prefix + i with column i of k/v in the A2 encoding. For column
+ * i of segment s (c_s <= i < c_s + T_s), query head h, and kvh = floor(h/6):
+ *
+ *   visible(i)   = [0, prefix) U [prefix + c_s, prefix + i]
+ *   score[x]     = scale * dot(q[:,h,i], K_cache[:,x,kvh]), x in visible(i)
+ *   probability  = softmax_x(score)
+ *   ideal[:,h,i] = sum_x probability[x] * V_cache[:,x,kvh].
+ *
+ * Every segment sees the whole shared prefix and none of another segment's columns. Cache
+ * storage, the numerical contract, and the BF16-cache/INT8-cache compute profiles are those of
+ * A1 above. The segment table and the population of [0, prefix) are caller promises that the
+ * host does not read; it checks shapes and ranges only. Cache positions outside
+ * [prefix, prefix + N) are not modified, and a repeated call on identical inputs is
+ * bit-identical. q/k/v/segments/kv_table_rows/out, every cache plane/table, and live workspace
+ * suballocations are pairwise non-overlapping. The Op owns no persistent frontier, allocation,
+ * request identity, or commit authority.
+ */
+void gqa_attention_segmented(const Tensor& q, const Tensor& k, const Tensor& v,
+                             const Tensor& segments, const Tensor& kv_table_rows,
+                             std::int32_t prefix, float scale, PagedKVBatchLayerView cache,
+                             WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

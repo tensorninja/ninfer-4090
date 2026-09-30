@@ -23,6 +23,8 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
+void causal_conv1d_segmented_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                                    const Tensor& segments, Tensor& out, cudaStream_t stream);
 void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,
                                    const Tensor& valid_columns, const Tensor& initial_state_slots,
                                    const Tensor& snapshot_base_slots, Tensor& out,

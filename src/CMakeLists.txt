@@ -96,6 +96,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
   ops/launcher/gqa_attention_prefill.cu
+  ops/launcher/gqa_attention_segmented.cu
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
@@ -103,6 +104,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
+  ops/launcher/pointer_head.cu
   ops/launcher/position.cu
   ops/launcher/prepare_ragged_prefix.cu
   ops/launcher/prepare_masked_block.cu
@@ -252,6 +254,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/mtp_pack.cpp
   ops/wrapper/mtp_round.cpp
   ops/wrapper/speculative_round.cpp
+  ops/wrapper/pointer_head.cpp
   ops/wrapper/position.cpp
   ops/wrapper/prepare_ragged_prefix.cpp
   ops/wrapper/prepare_masked_block.cpp

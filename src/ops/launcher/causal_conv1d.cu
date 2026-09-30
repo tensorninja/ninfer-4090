@@ -77,6 +77,37 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void causal_conv1d_segmented_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
+                                    const Tensor& segments, Tensor& out, cudaStream_t stream) {
+    constexpr int kBlock           = 256;
+    const std::int32_t C           = x.ne[0];
+    const std::int32_t N           = x.ne[1];
+    const std::int32_t S           = segments.ne[1];
+    const auto x_addr              = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr              = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto state_addr          = reinterpret_cast<std::uintptr_t>(conv_state.data);
+    const auto out_addr            = reinterpret_cast<std::uintptr_t>(out.data);
+    const auto* const segment_rows = static_cast<const std::int32_t*>(segments.data);
+
+    if (((x_addr | w_addr | state_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) == 0 &&
+        (C & 1) == 0) {
+        causal_conv1d_segmented_pairs_kernel<<<prefill_output_grid_for(C / 2, N, kBlock), kBlock, 0,
+                                               stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state.data), segment_rows, S,
+            static_cast<__nv_bfloat16*>(out.data), C, N);
+    } else {
+        causal_conv1d_segmented_kernel<<<prefill_output_grid_for(C, N, kBlock), kBlock, 0,
+                                         stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state.data), segment_rows, S,
+            static_cast<__nv_bfloat16*>(out.data), C, N);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
     const std::int32_t C = x.ne[0];

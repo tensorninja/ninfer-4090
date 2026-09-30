@@ -165,9 +165,29 @@ __device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsi
     high = packed & 0xffff0000U;
 }
 
+// Segmented grid rows (see segment_table). The launcher sizes grid.y to min(S, floor(N/BT)), the
+// most chunk runs a call can have: with S rows, row s is segment s; otherwise row y is run slot y.
+// Either way every run owns exactly one row, and a row without a run returns false.
+__device__ __forceinline__ bool segmented_row_run(segment_table segments,
+                                                  segmented_chunk_run& run) {
+    const auto row = static_cast<std::int32_t>(blockIdx.y);
+    if (static_cast<std::int32_t>(gridDim.y) != segments.count) {
+        return segmented_chunk_run_at(segments, row, run);
+    }
+    const std::int32_t first  = __ldg(segments.columns + 2 * row);
+    const std::int32_t length = __ldg(segments.columns + 2 * row + 1);
+    if (length < BT) { return false; }
+    run = {first, length / BT, (length % BT) != 0};
+    return true;
+}
+
 // The narrow geometry targets two 128-register CTAs per SM. The wide geometry
 // uses one 512-thread CTA; both expose 16 resident warps without local spills.
-template <int NStrip>
+//
+// SEGMENTED grids add grid.y rows (see segmented_row_run). A run starts from state_in at its first
+// column and first chunk slot; a row without a run exits before any barrier, and a run without a
+// tail publishes no end state.
+template <int NStrip, bool SEGMENTED>
 __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS) __global__
     void state_passing_kernel(const __nv_bfloat16* __restrict__ W_in,
                               const __nv_bfloat16* __restrict__ U_in,
@@ -175,7 +195,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                               const float* __restrict__ g_cumsum, const float* state_in,
                               __nv_bfloat16* __restrict__ v_new,
                               __nv_bfloat16* __restrict__ h_chunk, float* state_out,
-                              head_map qk_map, int chunks) {
+                              head_map qk_map, int chunks, segment_table segments) {
     using D                         = kernel_dims<NStrip>;
     using L                         = smem_layout<NStrip>;
     constexpr int N_STRIP_PER_BLOCK = D::N_STRIP_PER_BLOCK;
@@ -251,6 +271,20 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     const int warp_d_global = d_off + warp_d_local;
     const std::int64_t H_v  = qk_map.H_v;
 
+    // First column and first chunk slot of this CTA's chunk run, and the run slot that receives
+    // its end state (-1 when the run has no tail to read it).
+    std::int64_t run_column   = 0;
+    std::int64_t run_slot     = 0;
+    std::int32_t publish_slot = 0;
+    if constexpr (SEGMENTED) {
+        segmented_chunk_run run;
+        if (!segmented_row_run(segments, run)) { return; }
+        run_column   = run.first_column;
+        run_slot     = run.first_column / BT;
+        publish_slot = run.has_tail ? run.first_column / BT : -1;
+        chunks       = run.chunks;
+    }
+
     // === Phase 0: load state_in (AR-transposed) -> per-warp h_frag ===
     float h_frag[M_TILES_H_PW][4];
     {
@@ -285,11 +319,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     const int64_t vn_chunk_stride = (int64_t)BT * vn_stride;
     const int64_t g_chunk_step    = (int64_t)BT * H_v;
 
-    const int64_t W_block_base  = static_cast<int64_t>(h_v) * kStateDim;
-    const int64_t k_block_base  = static_cast<int64_t>(qk_map.qk_head(h_v)) * kStateDim;
-    const int64_t hc_block_base = static_cast<int64_t>(h_v) * kStateDim * kStateDim;
-    const int64_t vn_block_base = static_cast<int64_t>(h_v) * kStateDim;
-    const int64_t g_block_base  = h_v;
+    const int64_t W_block_base = run_column * W_stride + static_cast<int64_t>(h_v) * kStateDim;
+    const int64_t k_block_base =
+        run_column * k_stride + static_cast<int64_t>(qk_map.qk_head(h_v)) * kStateDim;
+    const int64_t hc_block_base =
+        run_slot * hc_chunk_stride + static_cast<int64_t>(h_v) * kStateDim * kStateDim;
+    const int64_t vn_block_base = run_column * vn_stride + static_cast<int64_t>(h_v) * kStateDim;
+    const int64_t g_block_base  = run_column * H_v + h_v;
     const int64_t g_thread_base = g_block_base + (int64_t)tid * H_v;
 
     // W/K stay native BF16 in shared memory. W is committed first for MM1;
@@ -310,7 +346,9 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     int64_t hc_base     = hc_block_base;
     int64_t vn_base     = vn_block_base;
     int64_t g_cs_offset = 0;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
+    // Counting down holds one loop register even when the chunk count is a loaded value; the
+    // segmented variants sit at the 128-register cap and spill with a separate live bound.
+    for (int remaining = chunks; remaining > 0; --remaining) {
         const int64_t W_base_next = W_base + W_chunk_stride;
         const int64_t k_base_next = k_base + k_chunk_stride;
 
@@ -502,7 +540,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
 
         // The next chunk repeats the W-then-K async group order used by the
         // prologue. Its Phase A drains W only; Phase E drains K.
-        if (chunk + 1 < chunks) {
+        if (remaining > 1) {
             issue_load_w_bf16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
             cp_commit();
             issue_load_k_bf16<THREADS_K>(k_view, k_in + k_base_next, k_stride, tid);
@@ -520,7 +558,10 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     }
 
     // === Phase Z: store h_frag -> state_out (AR-transposed) ===
-    const int64_t st_base = static_cast<int64_t>(h_v) * kStateDim * kStateDim;
+    // A segmented run publishes to its run slot, and only when its tail will read it.
+    if (publish_slot < 0) { return; }
+    const int64_t st_base =
+        (static_cast<int64_t>(publish_slot) * H_v + h_v) * kStateDim * kStateDim;
 
 #pragma unroll
     for (int m = 0; m < M_TILES_H_PW; ++m) {

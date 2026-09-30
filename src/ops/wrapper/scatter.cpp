@@ -57,6 +57,36 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
     detail::scatter_bf16_batch_launch(source, lanes, valid_columns, destination, stream);
 }
 
+void gather_bf16_columns(const Tensor& source, const Tensor& indices, Tensor& destination,
+                         cudaStream_t stream) {
+    if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 ||
+        indices.dtype != DType::I32) {
+        throw std::invalid_argument(
+            "gather_bf16_columns: source/destination must be BF16 and indices must be I32");
+    }
+    if (source.ne[0] <= 0 || source.ne[1] <= 0 || source.ne[2] != 1 || source.ne[3] != 1 ||
+        destination.ne[0] != source.ne[0] || destination.ne[1] <= 0 || destination.ne[2] != 1 ||
+        destination.ne[3] != 1 || indices.ne[0] != destination.ne[1] || indices.ne[1] != 1 ||
+        indices.ne[2] != 1 || indices.ne[3] != 1) {
+        throw std::invalid_argument(
+            "gather_bf16_columns: expected source [D,N], indices [R], destination [D,R]");
+    }
+    if (!source.is_contiguous() || !indices.is_contiguous() || !destination.is_contiguous() ||
+        source.data == nullptr || indices.data == nullptr || destination.data == nullptr) {
+        throw std::invalid_argument("gather_bf16_columns: tensors must be contiguous and non-null");
+    }
+    const auto overlaps = [](const Tensor& a, const Tensor& b) {
+        const auto* a_begin = static_cast<const unsigned char*>(a.data);
+        const auto* b_begin = static_cast<const unsigned char*>(b.data);
+        return a_begin < b_begin + b.bytes() && b_begin < a_begin + a.bytes();
+    };
+    if (overlaps(destination, source) || overlaps(destination, indices)) {
+        throw std::invalid_argument(
+            "gather_bf16_columns: destination must not overlap source or indices");
+    }
+    detail::gather_columns_launch(source, indices, destination, stream);
+}
+
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream) {
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16) {

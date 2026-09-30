@@ -131,7 +131,7 @@ __launch_bounds__(256) __global__
     const int tmp                   = unit / kGqaPrefillI8Groups;
     const int kv_head               = tmp % Geometry::KVHeads;
     const int token                 = tmp / Geometry::KVHeads;
-    const int position              = positions[0] + token;
+    const int position              = metadata.base_position(positions) + token;
     const std::int32_t* block_table = metadata.block_table();
     int page                        = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     const int page_off              = position & kPagedKVPageMask;
@@ -261,7 +261,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     const int kv_head           = static_cast<int>(blockIdx.y);
     const int group             = static_cast<int>(blockIdx.z);
     const int tile_delta        = static_cast<int>(blockIdx.x);
-    const int base_position     = positions[0];
+    const int base_position     = metadata.base_position(positions);
     const int tile_position     = (base_position / TokensPerTile + tile_delta) * TokensPerTile;
     const int logical_page      = tile_position >> kPagedKVPageShift;
     const int token_begin       = max(0, tile_position - base_position);

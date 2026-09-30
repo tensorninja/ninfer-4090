@@ -251,6 +251,7 @@ set(ninfer_op_tests
   scalar
   cast
   scatter
+  pointer_head
   position)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
@@ -262,7 +263,7 @@ endforeach()
 # is one checkpoint/device.
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops Threads::Threads)
 ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)

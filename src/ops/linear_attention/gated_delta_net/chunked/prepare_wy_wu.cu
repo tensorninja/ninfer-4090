@@ -6,21 +6,29 @@ namespace {
 
 namespace kernel = prepare_wy_wu;
 
-template <int KPanelCols, int WuPanelCols, int BlockWarps>
+template <int KPanelCols, int WuPanelCols, int BlockWarps, bool Segmented>
 cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk_map) {
     using dims               = kernel::kernel_dims<KPanelCols, WuPanelCols>;
     constexpr int smem_bytes = dims::SMEM_FLOATS * static_cast<int>(sizeof(float));
     constexpr int threads    = BlockWarps * ninfer::ops::kWarpSize;
+    const auto kernel_fn =
+        kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps, Segmented>;
 
     cudaError_t err =
-        cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
-    kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>
-        <<<grid, dim3(threads, 1, 1), smem_bytes, cfg.stream>>>(
-            cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map);
+    kernel_fn<<<grid, dim3(threads, 1, 1), smem_bytes, cfg.stream>>>(
+        cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map, cfg.segments);
     return cudaGetLastError();
+}
+
+template <int KPanelCols, int WuPanelCols, int BlockWarps>
+cudaError_t launch_route(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk_map) {
+    if (cfg.segments.columns != nullptr) {
+        return launch_fixed<KPanelCols, WuPanelCols, BlockWarps, true>(cfg, grid, qk_map);
+    }
+    return launch_fixed<KPanelCols, WuPanelCols, BlockWarps, false>(cfg, grid, qk_map);
 }
 
 } // namespace
@@ -28,7 +36,7 @@ cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk
 cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg) {
     stage_validator v{"launch_prepare_wy_wu", cfg.H_qk, cfg.H_v, cfg.L};
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
-    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
+    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_chunk_slots(cfg.segments));
     if (cfg.k == nullptr || cfg.v == nullptr || cfg.g_in == nullptr || cfg.beta == nullptr ||
         cfg.W == nullptr || cfg.U == nullptr || cfg.g_cumsum_out == nullptr) {
         return cudaErrorInvalidValue;
@@ -39,8 +47,8 @@ cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg) {
     NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(NT, cfg.H_v));
 
     const dim3 grid(static_cast<unsigned>(NT), static_cast<unsigned>(cfg.H_v), 1);
-    if (cfg.H_v == 32) { return launch_fixed<32, 16, 4>(cfg, grid, qk_map); }
-    return launch_fixed<64, 32, 8>(cfg, grid, qk_map);
+    if (cfg.H_v == 32) { return launch_route<32, 16, 4>(cfg, grid, qk_map); }
+    return launch_route<64, 32, 8>(cfg, grid, qk_map);
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

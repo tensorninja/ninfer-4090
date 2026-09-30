@@ -4,6 +4,7 @@
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
 #include "ops/common/math.cuh"
+#include "ops/common/segment_table.cuh"
 
 #include <cuda_bf16.h>
 
@@ -82,6 +83,89 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
+    out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+}
+
+// Segmented forms. Column t belongs to segment s, c_s <= t < c_s+T_s, and its local position is
+// p=t-c_s. Taps before the segment start read the shared read-only window, so no column reads
+// another segment's input. Each thread owns one output column of one channel (pair), with the
+// accumulation order of every ordinary form. The weights and x taps do not depend on the segment,
+// so they are issued before the segment lookup and overlap its latency; taps before the segment
+// start are then replaced by window columns.
+__global__ void causal_conv1d_segmented_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                               const __nv_bfloat16* conv_state,
+                                               const std::int32_t* segments,
+                                               std::int32_t segment_count, __nv_bfloat16* out,
+                                               std::int32_t C, std::int32_t N) {
+    const std::int64_t C64      = static_cast<std::int64_t>(C);
+    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t c64 =
+        (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x + threadIdx.x;
+    if (t >= N || c64 >= C64) { return; }
+
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const __nv_bfloat16 w0     = weight[c64];
+    const __nv_bfloat16 w1     = weight[C64 + c64];
+    const __nv_bfloat16 w2     = weight[2 * C64 + c64];
+    const __nv_bfloat16 w3     = weight[3 * C64 + c64];
+    __nv_bfloat16 x0           = (t >= 3) ? x[out_idx - 3 * C64] : __nv_bfloat16{};
+    __nv_bfloat16 x1           = (t >= 2) ? x[out_idx - 2 * C64] : __nv_bfloat16{};
+    __nv_bfloat16 x2           = (t >= 1) ? x[out_idx - C64] : __nv_bfloat16{};
+    const __nv_bfloat16 x3     = x[out_idx];
+    const std::int32_t p = t - __ldg(segments + 2 * segment_containing(segments, segment_count, t));
+    if (p < 3) { x0 = conv_state[static_cast<std::int64_t>(p) * C64 + c64]; }
+    if (p < 2) { x1 = conv_state[static_cast<std::int64_t>(p + 1) * C64 + c64]; }
+    if (p < 1) { x2 = conv_state[static_cast<std::int64_t>(p + 2) * C64 + c64]; }
+
+    float acc = 0.0f;
+    acc += __bfloat162float(w0) * __bfloat162float(x0);
+    acc += __bfloat162float(w1) * __bfloat162float(x1);
+    acc += __bfloat162float(w2) * __bfloat162float(x2);
+    acc += __bfloat162float(w3) * __bfloat162float(x3);
+    out[out_idx] = __float2bfloat16_rn(silu(acc));
+}
+
+__global__ void causal_conv1d_segmented_pairs_kernel(const __nv_bfloat16* x,
+                                                     const __nv_bfloat16* weight,
+                                                     const __nv_bfloat16* conv_state,
+                                                     const std::int32_t* segments,
+                                                     std::int32_t segment_count, __nv_bfloat16* out,
+                                                     std::int32_t C, std::int32_t N) {
+    const std::int64_t C2       = static_cast<std::int64_t>(C / 2);
+    const std::int64_t c_blocks = div_up(C2, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t pair =
+        (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x + threadIdx.x;
+    if (t >= N || pair >= C2) { return; }
+
+    const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* state2  = reinterpret_cast<const __nv_bfloat162*>(conv_state);
+    auto* out2          = reinterpret_cast<__nv_bfloat162*>(out);
+
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + pair;
+    const __nv_bfloat162 w0    = weight2[pair];
+    const __nv_bfloat162 w1    = weight2[C2 + pair];
+    const __nv_bfloat162 w2    = weight2[2 * C2 + pair];
+    const __nv_bfloat162 w3    = weight2[3 * C2 + pair];
+    __nv_bfloat162 x0          = (t >= 3) ? x2[out_idx - 3 * C2] : __nv_bfloat162{};
+    __nv_bfloat162 x1          = (t >= 2) ? x2[out_idx - 2 * C2] : __nv_bfloat162{};
+    __nv_bfloat162 x2v         = (t >= 1) ? x2[out_idx - C2] : __nv_bfloat162{};
+    const __nv_bfloat162 x3    = x2[out_idx];
+    const std::int32_t p = t - __ldg(segments + 2 * segment_containing(segments, segment_count, t));
+    if (p < 3) { x0 = state2[static_cast<std::int64_t>(p) * C2 + pair]; }
+    if (p < 2) { x1 = state2[static_cast<std::int64_t>(p + 1) * C2 + pair]; }
+    if (p < 1) { x2v = state2[static_cast<std::int64_t>(p + 2) * C2 + pair]; }
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    causal_conv1d_acc_pair(w0, x0, acc0, acc1);
+    causal_conv1d_acc_pair(w1, x1, acc0, acc1);
+    causal_conv1d_acc_pair(w2, x2v, acc0, acc1);
+    causal_conv1d_acc_pair(w3, x3, acc0, acc1);
     out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 

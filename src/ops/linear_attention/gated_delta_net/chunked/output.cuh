@@ -147,14 +147,15 @@ __device__ __forceinline__ void mma_av_panel(float (&D)[N_TILES][4],
     }
 }
 
+// One (chunk, value head) job. `cs` is the chunk's first column and `chunk_slot` indexes h_chunk.
 __device__ __forceinline__ void
 output_job(const __nv_bfloat16* __restrict__ q_in,
            const __nv_bfloat16* __restrict__ k_in,
            const __nv_bfloat16* __restrict__ v_new_in,
            const float* __restrict__ g_cumsum_in,
            const __nv_bfloat16* __restrict__ h_chunk_in,
-           __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale, int chunk, int h_v,
-           float* smem) {
+           __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale, std::int64_t cs,
+           std::int64_t chunk_slot, int h_v, float* smem) {
     auto* const bf16_smem = reinterpret_cast<__nv_bfloat16*>(smem);
     auto* const q_smem    = bf16_smem;
     auto* const stage0    = q_smem + kernel_dims::Q_BF16;
@@ -174,7 +175,6 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
     const int lane_g = lane >> 2;
     const int lane_t = lane & 3;
 
-    const std::int64_t cs          = static_cast<std::int64_t>(chunk) * BT;
     const std::int64_t H_v         = qk_map.H_v;
     const std::int64_t qk_stride_t = static_cast<std::int64_t>(qk_map.H_qk) * kStateDim;
     const std::int64_t qk_head_idx = static_cast<std::int64_t>(qk_map.qk_head(h_v)) * kStateDim;
@@ -182,8 +182,7 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
     const std::int64_t k_base      = cs * qk_stride_t + qk_head_idx;
     const std::int64_t vn_base =
         cs * H_v * kStateDim + static_cast<std::int64_t>(h_v) * kStateDim;
-    const std::int64_t hc_base =
-        (static_cast<std::int64_t>(chunk) * H_v + h_v) * kStateDim * kStateDim;
+    const std::int64_t hc_base = (chunk_slot * H_v + h_v) * kStateDim * kStateDim;
 
     const std::int64_t value_row_stride = H_v * kStateDim;
 
@@ -342,7 +341,9 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
     }
 }
 
-template <bool MULTI_JOB>
+// SEGMENTED grids stride over chunk slots (see segment_table) and skip empty slots; the skip is
+// uniform per CTA, and consecutive jobs remain separated by one barrier.
+template <bool MULTI_JOB, bool SEGMENTED>
 __launch_bounds__(THREADS, 4) __global__
     void output_kernel(const __nv_bfloat16* __restrict__ q_in,
                        const __nv_bfloat16* __restrict__ k_in,
@@ -350,20 +351,32 @@ __launch_bounds__(THREADS, 4) __global__
                        const float* __restrict__ g_cumsum_in,
                        const __nv_bfloat16* __restrict__ h_chunk_in,
                        __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale,
-                       int chunks) {
+                       int chunks, segment_table segments) {
     extern __shared__ float smem[];
 
     const int h_v = static_cast<int>(blockIdx.y);
-    if constexpr (MULTI_JOB) {
+    if constexpr (SEGMENTED) {
+        bool barrier_pending = false;
+        for (int slot = static_cast<int>(blockIdx.x); slot < chunks;
+             slot += static_cast<int>(gridDim.x)) {
+            const std::int32_t start = segmented_chunk_start(segments, slot);
+            if (start < 0) { continue; }
+            if (barrier_pending) { __syncthreads(); }
+            output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
+                       start, slot, h_v, smem);
+            barrier_pending = true;
+        }
+    } else if constexpr (MULTI_JOB) {
         const int chunk_stride = static_cast<int>(gridDim.x);
         for (int chunk = static_cast<int>(blockIdx.x); chunk < chunks; chunk += chunk_stride) {
             output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                       chunk, h_v, smem);
+                       static_cast<std::int64_t>(chunk) * BT, chunk, h_v, smem);
             if (chunk + chunk_stride < chunks) { __syncthreads(); }
         }
     } else {
+        const int chunk = static_cast<int>(blockIdx.x);
         output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                   static_cast<int>(blockIdx.x), h_v, smem);
+                   static_cast<std::int64_t>(chunk) * BT, chunk, h_v, smem);
     }
 }
 

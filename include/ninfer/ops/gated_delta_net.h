@@ -63,6 +63,36 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      cudaStream_t stream);
 
 /**
+ * Returns the transient arena capacity required by gated_delta_net_segmented for every packed
+ * column count N in [1,max_columns] and every segment table over it. The head-count domain is
+ * that of gated_delta_net_workspace_capacity_bytes. The query throws for an invalid profile or
+ * max_columns<1.
+ */
+[[nodiscard]] std::size_t
+gated_delta_net_segmented_workspace_capacity_bytes(std::int32_t qk_heads, std::int32_t value_heads,
+                                                   bool normalize_qk, std::int32_t max_columns);
+
+/**
+ * Segmented form for S independent recurrences that all start from one read-only state. q/k are
+ * contiguous BF16 [128,Hqk,N], v/out are BF16 [128,Hv,N], g/beta are FP32 [Hv,N], `ssm_state` is
+ * FP32 [128,128,Hv], and `segments` is a contiguous device I32 [2,S] table whose column s is
+ * (c_s,T_s), the first column and length of segment s. The caller promises that the table tiles
+ * [0,N) in order: c_0=0, c_{s+1}=c_s+T_s, T_s>=1, and c_{S-1}+T_{S-1}=N. The host checks only the
+ * shapes and 1<=S<=N.
+ *
+ * Segment s evaluates the recurrence above over columns [c_s,c_s+T_s), starting from ssm_state,
+ * and writes those output columns. The head map, normalize_qk, scale, oracle, and numerical
+ * criterion are those of the single-sequence form. No final state is published: ssm_state, the
+ * inputs, and segments are read-only, and out overlaps none of them. `ws` supplies the transient
+ * storage reported by gated_delta_net_segmented_workspace_capacity_bytes; scratch is scoped to the
+ * call.
+ */
+void gated_delta_net_segmented(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               WorkspaceArena& ws, const Tensor& ssm_state, const Tensor& segments,
+                               Tensor& out, cudaStream_t stream);
+
+/**
  * Snapshot form for B independent recurrences. q/k are contiguous BF16 [128,Hqk,W,B], v/out are
  * BF16 [128,Hv,W,B], g/beta are FP32 [Hv,W,B], and `ssm_states` is contiguous FP32
  * [128,128,Hv,Slots]. `initial_state_slots` and `snapshot_base_slots` are contiguous I32 [B].
