@@ -156,7 +156,9 @@ int run(const Options& options) {
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
+    auto program                       = target::Package::create_program(
+        *model, std::move(sequence), device, reader.identity().model_id,
+        reader.identity().weights_id, reader.content_fingerprint());
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);

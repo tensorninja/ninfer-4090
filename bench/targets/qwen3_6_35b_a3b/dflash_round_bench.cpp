@@ -239,7 +239,9 @@ int run(const Options& options) {
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto frontend                      = target::Package::make_frontend(*model);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
+    auto program                       = target::Package::create_program(
+        *model, std::move(sequence), device, reader.identity().model_id,
+        reader.identity().weights_id, reader.content_fingerprint());
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
@@ -247,7 +249,7 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request_base(prompt, execution);
-        auto request_plan = program->plan_request_for_lane(lane, prompt, request_base);
+        auto request_plan = program->plan_request_for_lane(lane, prompt, request_base, {});
         request_memory.activate(request_plan.summary().transient_bytes,
                                 request_plan.summary().transient_alignment);
         auto prefill = program->start_prefill_lane(lane, std::move(prompt), std::move(request_plan),

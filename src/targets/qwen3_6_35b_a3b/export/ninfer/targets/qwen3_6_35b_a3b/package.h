@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -111,7 +112,9 @@ struct Package {
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
-    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
+    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
+                   std::string_view model_id, std::string_view weights_id,
+                   std::span<const std::uint8_t> artifact_fingerprint);
 };
 
 } // namespace targets::qwen3_6_35b_a3b

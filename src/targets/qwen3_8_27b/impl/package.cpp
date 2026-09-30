@@ -156,14 +156,6 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 std::unique_ptr<Package::Program>
-Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
-    (void)model;
-    (void)plan;
-    (void)device;
-    throw std::invalid_argument("create_program requires artifact model_id and weights_id");
-}
-
-std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
                          std::string_view model_id, std::string_view weights_id,
                          std::span<const std::uint8_t> artifact_fingerprint) {

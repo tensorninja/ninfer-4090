@@ -63,6 +63,27 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+// `Variant` is a concrete type in this instantiation, so an `if constexpr` on one of its traits
+// would still require the discarded branch to name a member that exists. Routing the query through
+// a template parameter makes the branch dependent, so a package that registers no LoRA site table
+// never has to declare the LoRA post-mixer leaf.
+template <class V>
+std::size_t post_mixer_lora_workspace(typename V::WeightsProfile weights_profile,
+                                      qwen3_8::TextPhase phase, std::int32_t rank,
+                                      std::int32_t first, std::int32_t last) {
+    if constexpr (V::supports_lora) {
+        return V::post_mixer_lora_workspace_capacity_bytes(weights_profile, phase, rank, first,
+                                                           last);
+    } else {
+        (void)weights_profile;
+        (void)phase;
+        (void)rank;
+        (void)first;
+        (void)last;
+        throw std::logic_error("this target registers no LoRA site table");
+    }
+}
+
 template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
@@ -334,10 +355,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
         if constexpr (Variant::supports_lora) {
             if (plan.features.lora()) {
-                scratch(layout, Variant::post_mixer_lora_workspace_capacity_bytes(
+                scratch(layout, post_mixer_lora_workspace<Variant>(
                                     plan.weights_profile, phase,
-                                    static_cast<std::int32_t>(plan.features.lora_sizing_rank), first,
-                                    last));
+                                    static_cast<std::int32_t>(plan.features.lora_sizing_rank),
+                                    first, last));
                 return;
             }
         }

@@ -118,11 +118,9 @@ struct Package {
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
-    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
-    [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
-                    std::string_view model_id, std::string_view weights_id,
-                    std::span<const std::uint8_t> artifact_fingerprint);
+                   std::string_view model_id, std::string_view weights_id,
+                   std::span<const std::uint8_t> artifact_fingerprint);
 };
 
 } // namespace targets::qwen3_8_27b
