@@ -325,5 +325,20 @@ the body text), which is never sent to a server. The editors' text is kept in th
 draft, invalid or not, and restored on the next visit; a link takes precedence over `?preset=`,
 which takes precedence over the draft, and `?model=` picks the model on top of either.
 
-The presets are the examples of [laya](https://github.com/NandhaKishorM/laya)'s playground
+The original six presets come from [laya](https://github.com/NandhaKishorM/laya)'s playground
 (Apache-2.0), rewritten as System One requests, and the editor and answer views follow its design.
+Six more cover every example in TypeSafe's [Advanced: structure](https://docs.typesafe.ai/primitives/advanced):
+invoice extraction with structured instructions, sender-identity comparison, support-routing rubrics,
+product taxonomy, PR-scope score levels, and credential-request criteria. The five complete requests
+retain their state and questions; the standalone sender-identity instruction is paired with a
+`ticket.sender` state using the sender from the credential-request example. Structured questions
+open in JSON mode so nested instructions and criteria stay intact.
+
+The [Noul](https://docs.typesafe.ai/primitives/noul),
+[Choice](https://docs.typesafe.ai/primitives/choice), and
+[Score](https://docs.typesafe.ai/primitives/score) guides supply thirteen more presets: human
+escalation, resume deduplication, programming language, meeting type, product category, shoe-exchange
+routing, five-question shoe triage, return policy versus status, bug severity, three-question bug
+triage, structured severity levels, outfit formality, and candidate fit. The complete requests retain
+their state and questions; the three standalone Choice questions have sample inputs added. The Score
+explorer's severity, frustration, and report-detail questions are already covered by the bug presets.

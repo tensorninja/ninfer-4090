@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { compactJson, formatJson, parseJson, type ObjectNode } from './json'
+import { PRESETS } from './presets'
 import {
   buildBody,
   editorFromSnap,
@@ -8,6 +9,7 @@ import {
   formBlocker,
   questionFromEntry,
   questionNode,
+  snapFromValue,
   snapOf,
   withType,
   type EditorState,
@@ -29,6 +31,20 @@ const editor = (state: string, questions: string, over: Partial<Snap> = {}): Edi
   editorFromSnap(snap(state, questions, over))
 
 const problems = (e: EditorState) => analyze(e, null).problems.map((p) => [p.severity, p.msg])
+
+test.each([...PRESETS])(
+  '$name loads and restores without changing the request structure',
+  (preset) => {
+    const initial = editorFromSnap(snapFromValue(preset, { stateMode: 'fields', qMode: 'form' }))
+    for (const e of [initial, editorFromSnap(snapOf(initial))]) {
+      const analysis = analyze(e, null)
+      expect(analysis.errors).toBe(0)
+      expect(analysis.body?.text).toBe(
+        JSON.stringify({ state: preset.state, questions: preset.questions }),
+      )
+    }
+  },
+)
 
 test('the body is the text as typed, compact, with integers beyond 2^53 intact', () => {
   const body = buildBody(
