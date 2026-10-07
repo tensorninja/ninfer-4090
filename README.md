@@ -1,5 +1,8 @@
 # NInfer-4090
 
+> Apologies for the LLM text below, but this is still in heavy development, and I haven't gotten around to writing a proper README yet. In the meantime, though, here's something a LLM slapped together which is at least better than nothing.
+> Also screenshots need to be updated as they are outdated.
+
 NInfer-4090 serves **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090 as two systems in one
 process. **System One** answers TypeSafe's classification API: a decision reads a state and its
 questions by prefill alone and returns calibrated probabilities, in about 100 ms once the state is
