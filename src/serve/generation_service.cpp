@@ -70,9 +70,10 @@ constexpr std::size_t kMaximumMediaItems = 16;
 
 [[noreturn]] void throw_preparation_cancelled();
 
-[[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
+[[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception,
+                                    std::string_view param = "messages") {
     ApiError error;
-    error.param   = "messages";
+    error.param   = param;
     error.message = exception.what();
     switch (exception.kind()) {
     case ninfer::product::media_acquire::ErrorKind::BudgetExceeded:
@@ -317,6 +318,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
+    decision_images_supported_ = engine_->load_summary().decision_images_supported;
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     media_input_capacity_ = std::make_shared<MediaInputCapacity>();
@@ -538,23 +540,88 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 PreparedDecisionRequest GenerationService::prepare_decision(ninfer::DecisionInput input,
-                                                            std::string adapter,
-                                                            DecisionOverflowPolicy overflow) const {
+                                                            std::string adapter) const {
     PreparedDecisionRequest prepared;
-    prepared.lifetime                  = acquire_request_lifetime();
-    ninfer::PreparedDecision decision = engine_->prepare_decision(std::move(input));
-    prepared.summary                   = decision.summary();
-    if (overflow == DecisionOverflowPolicy::Reject && prepared.summary.state_truncated) {
-        throw ninfer::DecisionInputError(
-            "input exceeds the decision state token limit; truncation is not supported");
+    prepared.lifetime = acquire_request_lifetime();
+    return submit_decision(std::move(prepared), std::move(input), std::move(adapter), {}, {});
+}
+
+PreparedDecisionRequest
+GenerationService::prepare_decision(product::openai_decisions::Input input, std::string adapter,
+                                    std::function<bool()> is_cancelled) const {
+    if (input.images != 0 && !decision_images_supported_) {
+        throw ApiException({.status  = 400,
+                            .type    = "invalid_request_error",
+                            .message = "Vision is disabled for decisions on this server",
+                            .param   = "input",
+                            .code    = "vision_disabled"});
     }
+    PreparedDecisionRequest prepared;
+    prepared.lifetime = acquire_request_lifetime();
+    HostInputLease host_input;
+    if (input.images != 0) {
+        host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
+    }
+    std::size_t remaining_bytes = options_.max_request_bytes;
+    DecisionInput owned         = product::openai_decisions::to_decision_input(
+        std::move(input), [&](const product::openai_decisions::SourcePart& part) {
+            try {
+                if (remaining_bytes == 0) {
+                    throw product::media_acquire::Error(
+                        product::media_acquire::ErrorKind::BudgetExceeded,
+                        "request media exceeds aggregate byte limit");
+                }
+                product::media_acquire::Policy policy;
+                policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
+                policy.allow_remote = false;
+                policy.deadline     = prepared.lifetime->deadline;
+                policy.is_cancelled = is_cancelled;
+                OwnedMedia media;
+                media.kind        = MediaKind::Image;
+                media.media_type  = part.image.media_type;
+                media.source_name = "inline-data";
+                media.bytes       = product::media_acquire::acquire_bytes(part.image, policy);
+                remaining_bytes -= media.bytes.size();
+                return media;
+            } catch (const product::media_acquire::Error& error) {
+                throw_media_error(error, part.param);
+            } catch (const std::invalid_argument& error) {
+                throw ApiException({.status  = 400,
+                                            .type    = "invalid_request_error",
+                                            .message = error.what(),
+                                            .param   = part.param,
+                                            .code    = "invalid_media"});
+            }
+        });
+    return submit_decision(std::move(prepared), std::move(owned), std::move(adapter),
+                           std::move(host_input), is_cancelled);
+}
+
+PreparedDecisionRequest
+GenerationService::submit_decision(PreparedDecisionRequest prepared, ninfer::DecisionInput input,
+                                   std::string adapter, HostInputLease host_input,
+                                   const std::function<bool()>& is_cancelled) const {
+    const auto check_control = [&] {
+        if (is_cancelled && is_cancelled()) {
+            throw RequestError(RequestErrorKind::Cancelled,
+                               "client disconnected during preparation");
+        }
+        if (Clock::now() >= prepared.lifetime->deadline) {
+            throw RequestError(RequestErrorKind::QueueTimeout,
+                               "inference request expired during preparation");
+        }
+    };
+    check_control();
+    ninfer::PreparedDecision decision = engine_->prepare_decision(std::move(input));
+    check_control();
+    prepared.summary = decision.summary();
     prepared.prepare_seconds =
         std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
     prepared.decision = engine_->submit_decision(
         std::move(decision),
         ninfer::DecisionOptions{.adapter            = std::move(adapter),
                                 .allow_prefix_reuse = options_.allow_prefix_reuse},
-        prepared.lifetime->deadline);
+        prepared.lifetime->deadline, std::move(host_input));
     return prepared;
 }
 
@@ -598,7 +665,7 @@ void GenerationService::warmup() {
     try {
         for (const std::size_t words : {56U, 184U, 504U}) {
             ninfer::DecisionInput input;
-            input.state = "warmup";
+            input.state = {{.text = "warmup"}};
             ninfer::DecisionQuestion question;
             question.instructions.reserve(2 * words);
             for (std::size_t word = 0; word < words; ++word) { question.instructions += " a"; }

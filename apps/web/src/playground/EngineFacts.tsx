@@ -18,6 +18,8 @@ function Layout({ request }: { request: DecisionContext }) {
       <dd>
         {plural(request.questions, 'question')} · {plural(request.options, 'option')} ·{' '}
         {count(request.input_tokens)} input tokens
+        {' · '}
+        {plural(request.images ?? 0, 'image')} · {count(request.vision_tokens ?? 0)} vision tokens
       </dd>
     </>
   )

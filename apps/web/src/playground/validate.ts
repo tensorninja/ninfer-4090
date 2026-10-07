@@ -484,8 +484,12 @@ export function analyzeQuestions(editor: EditorState): SectionResult {
  * @param models The server's model names once its catalog has loaded, or null before; a name it
  * does not list is only a warning, since running it is how the 404 is seen.
  */
-export function analyze(editor: EditorState, models: readonly string[] | null): Analysis {
-  if (editor.protocol === 'openai') return analyzeOpenAI(editor, models)
+export function analyze(
+  editor: EditorState,
+  models: readonly string[] | null,
+  vision?: boolean,
+): Analysis {
+  if (editor.protocol === 'openai') return analyzeOpenAI(editor, models, vision)
   const state = analyzeState(editor)
   const questions = analyzeQuestions(editor)
   const problems = [...state.problems, ...questions.problems]
@@ -505,7 +509,10 @@ export function analyze(editor: EditorState, models: readonly string[] | null): 
     problems,
     errors,
     warnings: problems.length - errors,
-    body: state.node && questions.node ? buildBody(state.node, questions.node, editor.model) : null,
+    body:
+      state.node && questions.node
+        ? buildBody(state.node, questions.node, editor.model, 'typesafe', editor.requestText)
+        : null,
   }
 }
 

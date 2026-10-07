@@ -9,7 +9,7 @@ run the CLI or HTTP server.
 |---|---|
 | [RTX 3090 Linux build](rtx-3090-linux.md) | Docker and native Ubuntu builds for the `sm_86` applications |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions and text-only Decisions, TypeSafe System One, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
+| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions and text/image Decisions, TypeSafe System One, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Dashboard](dashboard.md) | optional web UI over `/telemetry` and `/events`: throughput, queueing, cache, GPU, VRAM, and JSONL replay |
 | [Tiered continuation cache](continuation-cache.md) | implemented L1/L2/L3 semantics, OpenCode session routing, stable-prefix sharing, persistence, sizing, metrics, and current limitations |
 | [Turn checkpoint ring](turn-checkpoint-ring.md) | `--turn-checkpoints` sizing, mid-history reuse, slot listing, snapshot persistence, and eviction |

@@ -82,8 +82,9 @@ void test_rendering() {
                                             {{"label", "low"}, {"description", ""}},
                                             {{"label", "high"}}};
     const api::Request strings           = api::parse_request(body.dump());
-    check(strings.model == "decision-adapter" &&
-              strings.input.state == body["input"].get<std::string>(),
+    check(strings.model == "decision-adapter" && strings.input.state.size() == 1 &&
+              strings.input.state[0].kind == ninfer::DecisionPartKind::Text &&
+              strings.input.state[0].text == body["input"].get<std::string>(),
           "model and evidence must be verbatim, without safety identifier");
     check(strings.input.questions[0].instructions == " \nIs it true?\t" &&
               strings.input.questions[0].options == std::vector<std::string>{"no", "yes"},
@@ -112,7 +113,8 @@ void test_rendering() {
 
     const std::string evidence = body["input"].get<std::string>();
     body["input"]              = {{{"role", "user"}, {"content", evidence}}};
-    check(api::parse_request(body.dump()).input.state == evidence, "single message equals string");
+    check(api::parse_request(body.dump()).input.state[0].text == evidence,
+          "single message equals string");
     body["input"] = {{{"role", "user"},
                       {"type", "message"},
                       {"content",
@@ -121,18 +123,19 @@ void test_rendering() {
                         {{"type", "input_text"}, {"text", " c\n"}}}}},
                      {{"role", "user"}, {"content", "next"}},
                      {{"role", "user"}, {"content", Json::array()}}};
-    check(api::parse_request(body.dump()).input.state == "ab  c\n\n\nnext\n\n",
+    check(api::parse_request(body.dump()).input.state[0].text == "ab  c\n\n\nnext\n\n",
           "text parts concatenate without separators; messages join with two newlines");
     for (const Json& empty :
          {Json(""), Json::array(), Json::array({{{"role", "user"}, {"content", Json::array()}}})}) {
         body["input"] = empty;
-        check(api::parse_request(body.dump()).input.state.empty(), "empty supported evidence");
+        check(api::parse_request(body.dump()).input.state[0].text.empty(),
+              "empty supported evidence");
     }
     body["input"] = std::string("a\0b", 3);
-    check(api::parse_request(body.dump()).input.state == std::string("a\0b", 3),
+    check(api::parse_request(body.dump()).input.state[0].text == std::string("a\0b", 3),
           "escaped NUL is valid text");
     body["safety_identifier"] = nullptr;
-    check(api::parse_request(body.dump()).input.state == std::string("a\0b", 3),
+    check(api::parse_request(body.dump()).input.state[0].text == std::string("a\0b", 3),
           "null safety identifier is discarded");
 }
 
@@ -261,7 +264,7 @@ void test_validation() {
                                   "file:///not-read.png"}) {
         body                           = message_body;
         body["input"][0]["content"][0] = {{"type", "input_image"}, {"image_url", url}};
-        rejected(body, "input[0].content[0].type", "unsupported_modality");
+        rejected(body, "input[0].content[0].image_url", "invalid_media");
     }
     rejected(Json::array(), "", "invalid_type");
     for (const std::string_view malformed :
@@ -334,8 +337,96 @@ void test_limits() {
                 {{"label", "repeated"}}, 2, 10);
     body["input"][0]["content"] = {{{"type", "input_text"}, {"text", std::string(10485760, 'a')}},
                                    {{"type", "input_text"}, {"text", "b"}}};
-    check(api::parse_request(body.dump()).input.state.size() == 10485761,
+    check(api::parse_request(body.dump()).input.state[0].text.size() == 10485761,
           "input text limit applies to each part, not concatenated evidence");
+}
+
+void test_images() {
+    using ninfer::DecisionPartKind;
+    using ninfer::ImageDetail;
+    const Json image    = {{"type", "input_image"}, {"image_url", "data:image/png;base64,AA=="}};
+    Json body           = request_body();
+    body["input"]       = {{{"role", "user"},
+                            {"content",
+                             {{{"type", "input_text"}, {"text", "before"}},
+                              image,
+                              {{"type", "input_text"}, {"text", "after"}}}}},
+                           {{"role", "user"}, {"content", {image}}}};
+    api::Request parsed = api::parse_request(body.dump());
+    check(parsed.input.images == 2 && parsed.input.state.size() == 4 &&
+              parsed.input.state[0].text == "before" &&
+              parsed.input.state[1].kind == DecisionPartKind::Image &&
+              parsed.input.state[2].text == "after\n\n" &&
+              parsed.input.state[3].param == "input[1].content[0].image_url",
+          "image order, adjacent text, message separators and source paths are preserved");
+    check(parsed.input.state[1].image.bytes.empty() &&
+              parsed.input.state[1].image.value == image["image_url"].get<std::string>(),
+          "pure parsing retains encoded source without acquiring image bytes");
+    int acquired = 0;
+    const auto owned =
+        api::to_decision_input(std::move(parsed.input), [&](const api::SourcePart& part) {
+            check(part.image.kind == ninfer::product::media_acquire::SourceKind::Data &&
+                      part.image.media_type == "image/png",
+                  "acquisition gets only inline image sources");
+            ++acquired;
+            return ninfer::OwnedMedia{.kind = ninfer::MediaKind::Image, .bytes = {0}};
+        });
+    check(acquired == 2 && owned.state.size() == 4 && owned.state[1].image.bytes.size() == 1 &&
+              owned.state[2].text == "after\n\n" && owned.questions[0].options.size() == 2 &&
+              owned.overflow == ninfer::DecisionStateOverflow::Reject,
+          "acquisition materializes ordered public inputs and rejects state truncation");
+    const auto text_only =
+        api::to_decision_input(api::parse_request(request_body().dump()).input, {});
+    check(text_only.state[0].text == "evidence" &&
+              text_only.overflow == ninfer::DecisionStateOverflow::Reject,
+          "OpenAI text also rejects overflow before Engine preparation");
+    body["input"] = {{{"role", "user"}, {"content", {image}}}};
+    for (const auto& [detail, expected] :
+         std::vector<std::pair<Json, ImageDetail>>{{nullptr, ImageDetail::Auto},
+                                                   {"auto", ImageDetail::Auto},
+                                                   {"low", ImageDetail::Low},
+                                                   {"high", ImageDetail::High},
+                                                   {"original", ImageDetail::Original}}) {
+        body["input"][0]["content"][0]["detail"] = detail;
+        const auto input = api::to_decision_input(api::parse_request(body.dump()).input,
+                                                  [](const auto&) { return ninfer::OwnedMedia{}; });
+        check(input.state.back().detail == expected, "detail survives source acquisition");
+    }
+    for (const Json& detail :
+         {Json("invalid"), Json(false), Json(4), Json::array(), Json::object()}) {
+        body["input"][0]["content"][0]["detail"] = detail;
+        rejected(body, "input[0].content[0].detail",
+                 detail.is_string() ? "invalid_value" : "invalid_type");
+    }
+    for (const std::string& source :
+         {"", "data:image/png,AA==", "data:video/mp4;base64,AA==", "data:image/;base64,AA==",
+          "data:image/png;base64,", "data:image/png;base64,AA", "data:image/png;base64,=AAA",
+          "data:image/png;base64,A===", "data:image/png;base64,!!!!"}) {
+        body["input"][0]["content"][0]              = image;
+        body["input"][0]["content"][0]["image_url"] = source;
+        rejected(body, "input[0].content[0].image_url", "invalid_media");
+    }
+    for (const Json& source : {Json(nullptr), Json(false), Json(3), Json::object()}) {
+        body["input"][0]["content"][0]["image_url"] = source;
+        rejected(body, "input[0].content[0].image_url", "invalid_type");
+    }
+    body["input"][0]["content"][0] = {{"type", "input_image"}};
+    rejected(body, "input[0].content[0].image_url", "missing_required_parameter");
+    body["input"][0]["content"][0]            = image;
+    body["input"][0]["content"][0]["file_id"] = "file-not-supported";
+    rejected(body, "input[0].content[0].file_id", "unknown_parameter");
+    body["input"][0]["content"][0] = {{"type", "input_video"},
+                                      {"video_url", "data:video/mp4;base64,AA=="}};
+    rejected(body, "input[0].content[0].type");
+    body["input"][0]["content"] = std::vector<Json>(128, image);
+    check(api::parse_request(body.dump()).input.images == 128, "128 image sources are accepted");
+    body["input"].push_back({{"role", "user"}, {"content", {image}}});
+    rejected(body, "input[1].content[0]");
+    body["input"] = {{{"role", "user"}, {"content", {image}}}};
+    body["input"][0]["content"][0]["image_url"] =
+        "data:image/png;base64," + std::string(1048580, 'A');
+    check(api::parse_request(body.dump()).input.images == 1,
+          "image source strings are not capped by the default text string limit");
 }
 
 struct Oracle {
@@ -493,6 +584,13 @@ void test_answers() {
     check(cold["usage"]["input_tokens_details"]["cached_tokens"] == 0 &&
               cold["usage"]["input_tokens"] == 100 && cold["usage"]["total_tokens"] == 100,
           "cold usage counts prefill only");
+    result.summary.images        = 2;
+    result.summary.vision_tokens = 512;
+    result.summary.state_tokens += 516;
+    const Json visual = Json::parse(api::response_body("served-name", result, request.questions));
+    check(visual["usage"]["input_tokens"] == 616 && visual["usage"]["total_tokens"] == 616 &&
+              visual["usage"]["output_tokens"] == 0,
+          "expanded state already includes vision tokens and delimiters without double counting");
     result.probabilities[0][1] = 0.123456789F;
     const Json precise = Json::parse(api::response_body("served-name", result, request.questions));
     check(precise["answers"][0]["probability"].get<double>() == static_cast<double>(0.123456789F),
@@ -525,6 +623,7 @@ int main() {
         test_rendering();
         test_validation();
         test_limits();
+        test_images();
         test_probability_math();
         test_answers();
     } catch (const std::exception& error) {

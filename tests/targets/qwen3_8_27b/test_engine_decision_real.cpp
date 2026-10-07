@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -122,7 +123,8 @@ ninfer::DecisionQuestion catalogue_question() {
 
 // A multi-chunk state, three packed questions and one long branch.
 ninfer::DecisionInput mixed_decision(std::uint32_t sentences = 40, std::uint32_t seed = 1) {
-    ninfer::DecisionInput input{.state = ticket_text(sentences, seed), .questions = triage_questions()};
+    ninfer::DecisionInput input{.state     = {{.text = ticket_text(sentences, seed)}},
+                                .questions = triage_questions()};
     input.questions.push_back(catalogue_question());
     return input;
 }
@@ -130,7 +132,47 @@ ninfer::DecisionInput mixed_decision(std::uint32_t sentences = 40, std::uint32_t
 // A state of about 3,000 tokens: long enough that a decision cannot finish before a cancellation
 // is observed, short enough to leave a lane room for its branch scratch.
 ninfer::DecisionInput long_decision() {
-    return {.state = ticket_text(250, 4), .questions = triage_questions()};
+    return {.state = {{.text = ticket_text(250, 4)}}, .questions = triage_questions()};
+}
+
+ninfer::OwnedMedia picture(std::uint8_t color, std::uint32_t side = 56) {
+    ninfer::OwnedMedia media;
+    media.media_type  = "image/bmp";
+    media.source_name = "decision-fixture.bmp";
+    media.bytes.resize(54 + side * side * 3);
+    auto& bytes    = media.bytes;
+    const auto u32 = [&](std::size_t at, std::uint32_t value) {
+        for (unsigned shift = 0; shift < 4; ++shift) { bytes[at + shift] = value >> (8 * shift); }
+    };
+    bytes[0] = 'B';
+    bytes[1] = 'M';
+    u32(2, static_cast<std::uint32_t>(bytes.size()));
+    u32(10, 54);
+    u32(14, 40);
+    u32(18, side);
+    u32(22, side);
+    bytes[26] = 1;
+    bytes[28] = 24;
+    u32(34, side * side * 3);
+    for (std::uint32_t y = 0; y < side; ++y) {
+        for (std::uint32_t x = 0; x < side; ++x) {
+            const std::size_t at = 54 + 3 * (y * side + x);
+            bytes[at]            = color;
+            bytes[at + 1]        = ((x / 7 + y / 7) % 2) ? 230 : 20;
+            bytes[at + 2]        = 255 - color;
+        }
+    }
+    return media;
+}
+
+ninfer::DecisionInput with_images(ninfer::DecisionInput input, std::uint8_t color = 45) {
+    input.state.insert(input.state.begin(), {{.kind   = ninfer::DecisionPartKind::Image,
+                                              .image  = picture(color),
+                                              .detail = ninfer::ImageDetail::High},
+                                             {.kind   = ninfer::DecisionPartKind::Image,
+                                              .image  = picture(255 - color, 112),
+                                              .detail = ninfer::ImageDetail::High}});
+    return input;
 }
 
 ninfer::DecisionOptions decider(bool reuse) {
@@ -208,8 +250,9 @@ int verify_registration(const ninfer::Engine& engine) {
 }
 
 // Cold decisions share nothing but the weights, so the same request is the same arithmetic.
-int verify_cold_repeat_is_bit_identical(ninfer::Engine& engine) {
-    const ninfer::DecisionInput input  = mixed_decision();
+int verify_cold_repeat_is_bit_identical(ninfer::Engine& engine, bool images = false) {
+    const ninfer::DecisionInput input   = images ? with_images(mixed_decision()) : mixed_decision();
+    const auto before                   = engine.runtime_stats().decision_prefill_tokens;
     const ninfer::DecisionResult first  = decide(engine, input, false);
     const ninfer::DecisionResult second = decide(engine, input, false);
     if (!well_formed(first, input) || !well_formed(second, input)) {
@@ -225,6 +268,15 @@ int verify_cold_repeat_is_bit_identical(ninfer::Engine& engine) {
     if (first.probabilities != second.probabilities) {
         return fail("a repeated cold decision is not bit-identical");
     }
+    if (engine.runtime_stats().decision_prefill_tokens - before !=
+        2 * first.summary.input_tokens()) {
+        return fail("decision work accounting lost shortened image chunks");
+    }
+    if (images && (first.summary.images != 2 || first.summary.vision_tokens == 0 ||
+                   first.timings.vision_seconds <= 0 ||
+                   first.timings.vision_seconds > first.timings.state_seconds)) {
+        return fail("image decision telemetry omitted Vision or counted it outside state time");
+    }
     return 0;
 }
 
@@ -232,8 +284,9 @@ int verify_cold_repeat_is_bit_identical(ninfer::Engine& engine) {
 // holds it the same decision imports it from L2. The image is a byte copy of the state the cold
 // run's branches read, so the probabilities are bit-identical rather than within the bar. Runs
 // before any other decision that publishes, so the publication it waits for is its own.
-int verify_state_restores_from_l2(ninfer::Engine& engine) {
-    const ninfer::DecisionInput input = mixed_decision(40, 9);
+int verify_state_restores_from_l2(ninfer::Engine& engine, bool images = false) {
+    const ninfer::DecisionInput input =
+        images ? with_images(mixed_decision(40, 9)) : mixed_decision(40, 9);
     const std::uint64_t published     = engine.runtime_stats().continuation_publication_successes;
     const ninfer::DecisionResult cold = decide(engine, input, true);
     if (!well_formed(cold, input) || cold.state_source != ninfer::ContinuationSource::None ||
@@ -264,16 +317,20 @@ int verify_state_restores_from_l2(ninfer::Engine& engine) {
     if (restored.probabilities != cold.probabilities) {
         return fail("a decision on a state restored from L2 is not bit-identical to its cold run");
     }
+    if (restored.timings.vision_seconds != 0 || restored.timings.state_seconds != 0) {
+        return fail("an exact decision state restore recomputed its state or images");
+    }
     return 0;
 }
 
 // A retained state continues whole (the same state) and as the prefix of a longer state. Restore
 // reproduces the input semantics of computing the state cold, not its chunking, so the bar is
 // behavioural.
-int verify_restored_state_is_equivalent(ninfer::Engine& engine) {
-    const ninfer::DecisionInput shorter = mixed_decision(40, 1);
-    ninfer::DecisionInput longer        = mixed_decision(40, 1);
-    longer.state += ' ' + ticket_text(30, 2);
+int verify_restored_state_is_equivalent(ninfer::Engine& engine, bool images = false) {
+    const ninfer::DecisionInput shorter =
+        images ? with_images(mixed_decision(40, 1)) : mixed_decision(40, 1);
+    ninfer::DecisionInput longer = shorter;
+    longer.state.back().text += ' ' + ticket_text(30, 2);
 
     const ninfer::DecisionResult cold_shorter = decide(engine, shorter, false);
     const ninfer::DecisionResult cold_longer  = decide(engine, longer, false);
@@ -296,6 +353,9 @@ int verify_restored_state_is_equivalent(ninfer::Engine& engine) {
     }
     if (!well_formed(prefix, longer) || max_difference(prefix, cold_longer) > kBehaviouralBar) {
         return fail("a decision continuing a retained prefix moved beyond the bar");
+    }
+    if (images && prefix.timings.vision_seconds != 0) {
+        return fail("text appended after cached images re-encoded an image");
     }
     return 0;
 }
@@ -356,8 +416,9 @@ int verify_lanes_report_their_work(ninfer::Engine& engine) {
 // rounds, but never join a call of another lane, so neither side's arithmetic may change. The
 // long decision is submitted first so that its later chunks run after the chat lane has started.
 int verify_chat_and_decisions_are_independent(ninfer::Engine& engine) {
-    const std::vector<ninfer::DecisionInput> inputs{long_decision(), mixed_decision(40, 3),
-                                                    mixed_decision(24, 6)};
+    const std::vector<ninfer::DecisionInput> inputs{with_images(long_decision()),
+                                                    mixed_decision(40, 3),
+                                                    with_images(mixed_decision(24, 6), 190)};
     const std::vector<ninfer::TokenId> chat_alone =
         engine.generate(engine.prepare(chat_prompt()), greedy(kChatTokens, std::nullopt))
             .generated_token_ids;
@@ -386,25 +447,31 @@ int verify_chat_and_decisions_are_independent(ninfer::Engine& engine) {
 }
 
 int verify_cancellation_releases_the_lane(ninfer::Engine& engine) {
+    auto reservation            = std::make_shared<int>(1);
+    std::weak_ptr<int> released = reservation;
+    const auto processed        = engine.runtime_stats().decision_prefill_tokens;
     ninfer::DecisionHandle cancelled =
-        engine.submit_decision(engine.prepare_decision(long_decision()), decider(false));
+        engine.submit_decision(engine.prepare_decision(with_images(long_decision())),
+                               decider(false), {}, ninfer::HostInputLease(std::move(reservation)));
     try {
-        static_cast<void>(cancelled.wait(ninfer::CancellationView([] { return true; })));
+        static_cast<void>(cancelled.wait(ninfer::CancellationView(
+            [&] { return engine.runtime_stats().decision_prefill_tokens > processed; })));
         return fail("a cancelled decision completed");
     } catch (const ninfer::RequestError& error) {
         if (error.kind() != ninfer::RequestErrorKind::Cancelled) {
             return fail(std::string("a cancelled decision failed with: ") + error.what());
         }
     }
+    if (!released.expired()) { return fail("cancelled decision kept its host input lease"); }
     {
         // Destroying an unconsumed handle cancels its decision.
-        const ninfer::DecisionHandle abandoned =
-            engine.submit_decision(engine.prepare_decision(long_decision()), decider(false));
+        const ninfer::DecisionHandle abandoned = engine.submit_decision(
+            engine.prepare_decision(with_images(long_decision())), decider(false));
     }
 
     // Every lane is free again: a full set of decisions is admitted before the deadline, and each
     // matches the same decision run alone.
-    const ninfer::DecisionInput input     = mixed_decision(40, 7);
+    const ninfer::DecisionInput input     = with_images(mixed_decision(40, 7));
     const ninfer::DecisionResult expected = decide(engine, input, false);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
     std::vector<ninfer::DecisionHandle> handles;
@@ -444,37 +511,96 @@ int verify_adapter_kinds_do_not_cross(ninfer::Engine& engine) {
 int verify_capacity_is_enforced(const ninfer::Engine& engine) {
     try {
         static_cast<void>(engine.prepare_decision(
-            {.state = ticket_text(400, 8), .questions = triage_questions()}));
+            {.state = {{.text = ticket_text(400, 8)}}, .questions = triage_questions()}));
         return fail("a state longer than a lane was prepared");
     } catch (const ninfer::DecisionInputError&) {
         return 0;
     }
 }
 
-int exercise(const char* artifact, const char* decision_path) {
-    PoolDirectory pool("exercise");
-    pool.add(kDeciderName, decision_path);
+int verify_image_identity_and_leases(ninfer::Engine& engine) {
+    const auto input            = with_images(mixed_decision(15, 22));
+    auto reservation            = std::make_shared<int>(1);
+    std::weak_ptr<int> released = reservation;
+    auto handle      = engine.submit_decision(engine.prepare_decision(input), decider(true), {},
+                                              ninfer::HostInputLease(std::move(reservation)));
+    const auto first = handle.wait();
+    if (!released.expired()) { return fail("completed decision kept its host input lease"); }
+    auto changed                = input;
+    changed.state.front().image = picture(230);
+    const auto old_prompt       = engine.prepare_decision(input);
+    const auto new_prompt       = engine.prepare_decision(changed);
+    if (!std::ranges::equal(old_prompt.state_token_ids(), new_prompt.state_token_ids())) {
+        return fail("image identity fixture did not preserve the placeholder grid");
+    }
+    const auto other = decide(engine, changed, true);
+    if (other.reused_state_tokens != 0 || other.timings.vision_seconds <= 0 ||
+        other.summary.vision_tokens != first.summary.vision_tokens) {
+        return fail("different image bytes at the same grid reused cached state");
+    }
+    changed                      = input;
+    changed.state.front().detail = ninfer::ImageDetail::Original;
+    const auto original          = decide(engine, changed, true);
+    if (original.reused_state_tokens != 0 || original.timings.vision_seconds <= 0) {
+        return fail("a changed preprocessing profile reused cached image state");
+    }
+    return 0;
+}
 
-    ninfer::EngineOptions options;
-    options.artifact_path            = artifact;
-    options.max_context              = kMaxContext;
-    options.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
-    options.kv_cache                 = ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
-    options.prefill_chunk            = kPrefillChunk;
-    options.max_concurrency          = kConcurrency;
-    options.lora.directory           = pool.path();
-    options.lora.slots               = 1;
-    options.continuation_cache.tiers = ninfer::ContinuationCacheTiers::L1L2;
+int verify_state_restores_from_l3(ninfer::EngineOptions options) {
+    PoolDirectory cache("l3");
+    options.continuation_cache.tiers                    = ninfer::ContinuationCacheTiers::L1L2L3;
+    options.continuation_cache.directory                = cache.path();
+    options.continuation_cache.persist_min_tokens       = 0;
+    options.continuation_cache.persist_interval_seconds = 0;
+    const auto input                                    = with_images(mixed_decision(20, 61));
+    ninfer::DecisionResult cold;
+    {
+        ninfer::Engine engine(options);
+        cold                = decide(engine, input, true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (engine.runtime_stats().continuation_persistence_successes == 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return fail("image decision state was not persisted to L3");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    {
+        ninfer::Engine engine(options);
+        const auto restored = decide(engine, input, true);
+        if (restored.state_source != ninfer::ContinuationSource::L3 ||
+            restored.reused_state_tokens != cold.summary.state_tokens ||
+            restored.timings.vision_seconds != 0 || restored.timings.state_seconds != 0 ||
+            restored.probabilities != cold.probabilities) {
+            return fail("image decision state did not restore exactly from L3 after reload");
+        }
+    }
+    return 0;
+}
 
-    ninfer::Engine engine(options);
+int exercise_engine(ninfer::Engine& engine) {
+    if (!engine.load_summary().decision_images_supported) {
+        return fail("Vision-enabled 27B did not report image decisions");
+    }
     if (const int result = verify_registration(engine); result != 0) { return result; }
     if (const int result = verify_cold_repeat_is_bit_identical(engine); result != 0) {
         return result;
     }
     if (const int result = verify_state_restores_from_l2(engine); result != 0) { return result; }
+    if (const int result = verify_state_restores_from_l2(engine, true); result != 0) {
+        return result;
+    }
     if (const int result = verify_restored_state_is_equivalent(engine); result != 0) {
         return result;
     }
+    if (const int result = verify_cold_repeat_is_bit_identical(engine, true); result != 0) {
+        return result;
+    }
+    if (const int result = verify_restored_state_is_equivalent(engine, true); result != 0) {
+        return result;
+    }
+    if (const int result = verify_image_identity_and_leases(engine); result != 0) { return result; }
     if (const int result = verify_lanes_report_their_work(engine); result != 0) { return result; }
     if (const int result = verify_chat_and_decisions_are_independent(engine); result != 0) {
         return result;
@@ -486,6 +612,30 @@ int exercise(const char* artifact, const char* decision_path) {
         return result;
     }
     return verify_capacity_is_enforced(engine);
+}
+
+int exercise(const char* artifact, const char* decision_path) {
+    PoolDirectory pool("exercise");
+    pool.add(kDeciderName, decision_path);
+
+    ninfer::EngineOptions options;
+    options.artifact_path            = artifact;
+    options.max_context              = kMaxContext;
+    options.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
+    options.kv_cache                 = ninfer::KvCacheStorage::BFloat16;
+    options.prefill_chunk            = kPrefillChunk;
+    options.max_concurrency          = kConcurrency;
+    options.lora.directory           = pool.path();
+    options.lora.slots               = 1;
+    options.enable_vision            = true;
+    options.vision_max_tokens        = 512;
+    options.continuation_cache.tiers = ninfer::ContinuationCacheTiers::L1L2;
+
+    {
+        ninfer::Engine engine(options);
+        if (const int result = exercise_engine(engine); result != 0) { return result; }
+    }
+    return verify_state_restores_from_l3(options);
 }
 
 const char* env_or_null(const char* name) {

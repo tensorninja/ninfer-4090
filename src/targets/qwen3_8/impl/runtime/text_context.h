@@ -202,6 +202,8 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
+
     // The phase prefill-shaped calls (prefill chunks and decision passes) run their leaves in:
     // Prefill, or Decision for every unit of a System One decision.
     void set_prefill_phase(Phase phase) {
@@ -239,7 +241,7 @@ public:
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_8::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+                  std::uint32_t nominal_length, VisionPrefillSession* vision, bool finalize_at_end);
     // One System One branch pass: `ids` holds `segments` back to back, and each segment continues
     // the resident prefix [0, prefix) on its own at RoPE positions prefix, prefix + 1, ... Its
     // attention sees the cached prefix and its own causal past, whose K/V it reads from the pass

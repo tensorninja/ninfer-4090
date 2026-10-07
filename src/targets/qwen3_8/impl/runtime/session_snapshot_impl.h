@@ -42,7 +42,7 @@ constexpr char kSessionSnapshotMagic[8] = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1
 // and index-identical across processes; with a swapped slot pool an index names whichever
 // adapter happens to occupy that position, so a v3 image would hand one adapter's KV and GDN
 // state to another. Older versions cannot be restored.
-constexpr std::uint32_t kSessionSnapshotVersion = 5;
+constexpr std::uint32_t kSessionSnapshotVersion = 6;
 // All-zero marks the base weights. A real SHA-256 of an artifact is not zero.
 using SnapshotAdapterFingerprint = std::array<std::uint8_t, 32>;
 constexpr std::uint32_t kSessionSnapshotMaxRingEntries = 64;
@@ -146,6 +146,7 @@ void write_vision_items(SnapshotWriter& writer, const std::vector<VisionItem>& i
         writer.pod<std::uint64_t>(item.patch_begin);
         writer.pod<std::uint64_t>(item.patch_count);
         writer.bytes(item.content_digest.data(), item.content_digest.size());
+        writer.bytes(item.preprocessing_digest.data(), item.preprocessing_digest.size());
         write_vector(writer, item.timestamps);
         writer.pod<std::uint32_t>(static_cast<std::uint32_t>(item.token_spans.size()));
         for (const TokenSpan& span : item.token_spans) {
@@ -169,6 +170,7 @@ std::vector<VisionItem> read_vision_items(SnapshotReader& reader, std::size_t to
         item.patch_begin   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
         item.patch_count   = static_cast<std::size_t>(reader.pod<std::uint64_t>());
         reader.bytes(item.content_digest.data(), item.content_digest.size());
+        reader.bytes(item.preprocessing_digest.data(), item.preprocessing_digest.size());
         item.timestamps = read_vector<double>(reader, tokens, "vision timestamp");
         const std::uint32_t spans = reader.pod<std::uint32_t>();
         if (spans > tokens) {

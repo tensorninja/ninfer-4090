@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from types import MethodType
 from typing import Any, Iterable
@@ -17,6 +18,35 @@ _SPECIAL_TOKEN_IDS = {
     "<|video_pad|>": 248057,
 }
 _TOKENIZER_SIZE = 248077
+
+
+def prepare_decision_image(processor, encoded: bytes, detail: str | None = None):
+    """Decode oriented RGB and apply the requested image profile with the library processor.
+
+    Low limits pixel area, not either edge. Original only replicates the right/bottom edges to
+    the patch/merge multiple; neither the native minimum area nor resize applies to that mode.
+    """
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    detail = "high" if detail is None or detail == "auto" else detail
+    if detail not in {"low", "high", "original"}:
+        raise ValueError(f"unsupported decision image detail {detail!r}")
+    with Image.open(BytesIO(encoded)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    options = {}
+    if detail == "original":
+        factor = processor.patch_size * processor.merge_size
+        pixels = np.asarray(image)
+        height, width = pixels.shape[:2]
+        image = Image.fromarray(np.pad(
+            pixels, ((0, -height % factor), (0, -width % factor), (0, 0)), mode="edge"
+        ))
+        options["do_resize"] = False
+    elif detail == "low":
+        options["size"] = {"shortest_edge": processor.size["shortest_edge"],
+                           "longest_edge": min(processor.size["longest_edge"], 512 * 512)}
+    return processor(images=[image], return_tensors="pt", **options)
 
 
 def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):

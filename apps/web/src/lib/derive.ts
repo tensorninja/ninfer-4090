@@ -326,12 +326,14 @@ export function adapterPool(inventory: AdapterInventory | undefined): PoolEntry[
  * record's `queue` includes the restore, so the wait is the difference.
  */
 export interface DecisionSummary {
+  images: number
+  visionTokens: number
   count: number
   questions: number
   options: number
   latency: Spread
   total: Spread
-  phaseShare: { wait: number; restore: number; state: number; branch: number }
+  phaseShare: { wait: number; restore: number; state: number; vision: number; branch: number }
   stateTokens: number
   reusedStateTokens: number
   /** Share of state tokens resident in a lane or restored from a tier instead of prefilled. */
@@ -357,13 +359,16 @@ export function decisionPhases(record: DecisionDoneRecord): {
   wait: number
   restore: number
   state: number
+  vision: number
   branch: number
 } {
   const timings = record.timings_seconds
+  const vision = timings.vision ?? 0
   return {
     wait: Math.max(0, timings.queue - timings.restore),
     restore: timings.restore,
-    state: timings.state,
+    state: Math.max(0, timings.state - vision),
+    vision,
     branch: timings.branch,
   }
 }
@@ -374,6 +379,9 @@ export function decisionLatency(record: DecisionDoneRecord): number {
 }
 
 export function summarizeDecisions(records: readonly DecisionDoneRecord[]): DecisionSummary {
+  let images = 0
+  let visionTokens = 0
+  let vision = 0
   let questions = 0
   let options = 0
   let wait = 0
@@ -389,6 +397,9 @@ export function summarizeDecisions(records: readonly DecisionDoneRecord[]): Deci
   let truncatedStates = 0
   for (const record of records) {
     const phases = decisionPhases(record)
+    images += record.request.images ?? 0
+    visionTokens += record.request.vision_tokens ?? 0
+    vision += phases.vision
     questions += record.request.questions
     options += record.request.options
     wait += phases.wait
@@ -404,6 +415,8 @@ export function summarizeDecisions(records: readonly DecisionDoneRecord[]): Deci
     if (record.request.state_truncated) truncatedStates += 1
   }
   return {
+    images,
+    visionTokens,
     count: records.length,
     questions,
     options,
@@ -413,6 +426,7 @@ export function summarizeDecisions(records: readonly DecisionDoneRecord[]): Deci
       wait: engine === 0 ? 0 : wait / engine,
       restore: engine === 0 ? 0 : restore / engine,
       state: engine === 0 ? 0 : state / engine,
+      vision: engine === 0 ? 0 : vision / engine,
       branch: engine === 0 ? 0 : branch / engine,
     },
     stateTokens,
@@ -421,7 +435,7 @@ export function summarizeDecisions(records: readonly DecisionDoneRecord[]): Deci
     bySource: tally(records.map((record) => record.result.state_source)),
     branchTokens,
     branchPasses,
-    stateTokensPerSecond: pooledRate(computedStateTokens, state),
+    stateTokensPerSecond: pooledRate(computedStateTokens, state + vision),
     branchTokensPerSecond: pooledRate(branchTokens, branch),
     truncatedStates,
   }

@@ -719,10 +719,22 @@ struct DecisionQuestion {
     std::vector<std::string> options;
 };
 
+enum class ImageDetail : std::uint8_t { Auto, Low, High, Original };
+enum class DecisionPartKind : std::uint8_t { Text, Image };
+enum class DecisionStateOverflow : std::uint8_t { TruncateText, Reject };
+
+struct DecisionPart {
+    DecisionPartKind kind = DecisionPartKind::Text;
+    std::string text;
+    OwnedMedia image;
+    ImageDetail detail = ImageDetail::Auto;
+};
+
 // The rendered state and at least one question, in request order.
 struct DecisionInput {
-    std::string state;
+    std::vector<DecisionPart> state;
     std::vector<DecisionQuestion> questions;
+    DecisionStateOverflow overflow = DecisionStateOverflow::TruncateText;
 };
 
 // Token accounting of one prepared decision.
@@ -734,6 +746,8 @@ struct DecisionSummary {
     std::uint32_t longest_branch = 0;
     std::uint32_t questions      = 0;
     std::uint32_t options        = 0;
+    std::uint32_t images         = 0;
+    std::uint32_t vision_tokens  = 0;
     // The state text encoded to more tokens than a state holds and was cut to its head.
     bool state_truncated = false;
 
@@ -746,7 +760,7 @@ struct DecisionSummary {
 // [<|fim_prefix|>, state...] is followed, per question in request order, by the branch
 // [<|fim_middle|>, instructions..., (<|box_start|>, option..., <|box_end|>)..., <|fim_suffix|>].
 struct DecisionBranch {
-    // Offset of the branch's first token in the layout, and its length.
+    // Offset of the branch's first token in the branch tape, and its length.
     std::uint32_t begin  = 0;
     std::uint32_t length = 0;
     // Branch-relative offsets of each option's closing delimiter, in option order. The decide
@@ -758,6 +772,22 @@ struct DecisionBranch {
 class DecisionInputError final : public std::invalid_argument {
 public:
     using std::invalid_argument::invalid_argument;
+};
+
+enum class DecisionMediaErrorKind : std::uint8_t { InvalidMedia, BudgetExceeded };
+
+class DecisionMediaError final : public std::invalid_argument {
+public:
+    DecisionMediaError(std::size_t image_index, DecisionMediaErrorKind kind, std::string message)
+        : std::invalid_argument(std::move(message)), image_index_(image_index), kind_(kind) {}
+
+    [[nodiscard]] std::size_t image_index() const noexcept { return image_index_; }
+
+    [[nodiscard]] DecisionMediaErrorKind kind() const noexcept { return kind_; }
+
+private:
+    std::size_t image_index_;
+    DecisionMediaErrorKind kind_;
 };
 
 struct DecisionOptions {
@@ -774,6 +804,7 @@ struct DecisionTimings {
     double queue_seconds   = 0.0;
     double restore_seconds = 0.0; // Import of an L2/L3 state image; zero for L1 or a cold state.
     double state_seconds   = 0.0; // State prefill.
+    double vision_seconds    = 0.0;
     double branch_seconds  = 0.0; // Branch passes, long-branch chunks, readout and head.
     double execution_seconds = 0.0; // Admission to result.
     double total_seconds     = 0.0; // Submission to result.
@@ -1106,6 +1137,7 @@ struct LoadSummary {
     std::vector<LoraAdapterInfo> lora_adapters;
     // The loaded target serves System One decisions (a compile-time trait of its package).
     bool decisions_supported = false;
+    bool decision_images_supported = false;
     DecisionLimits decision_limits;
     // Bank rank, resident slot count, the device bytes the bank cost, and the disk bytes the
     // whole pool occupies. A lower-rank pool adapter is zero-padded into the bank rank.

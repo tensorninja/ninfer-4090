@@ -327,11 +327,34 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     result.patch_begin    = item.patch_begin;
     result.patch_count    = item.patch_count;
     result.content_digest = item.content_digest;
+    result.preprocessing_digest = item.preprocessing_digest;
     result.timestamps     = std::move(item.timestamps);
     result.token_spans.reserve(item.token_spans.size());
     for (const fi::TokenSpan span : item.token_spans) {
         result.token_spans.push_back(TokenSpan{.begin = span.begin, .count = span.count});
     }
+    return result;
+}
+
+PreparedPromptData convert_processed(fi::ProcessedInput processed) {
+    PreparedPromptData result;
+    result.token_ids   = std::move(processed.input_ids);
+    result.token_types = std::move(processed.token_types);
+    result.positions   = std::move(processed.positions);
+    result.rope_delta  = processed.rope_delta;
+    result.patches     = std::move(processed.patches);
+    result.vision_items.reserve(processed.vision_items.size());
+    for (fi::VisionItem& item : processed.vision_items) {
+        result.vision_items.push_back(convert_vision_item(std::move(item)));
+    }
+    result.prepare.media_items            = processed.stats.media_items;
+    result.prepare.raw_patches            = processed.stats.raw_patches;
+    result.prepare.vision_tokens          = processed.stats.vision_tokens;
+    result.prepare.attention_pairs        = processed.stats.attention_pairs;
+    result.prepare.patch_bytes            = processed.stats.patch_bytes;
+    result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
+    result.identity.user_turn_boundary    = processed.user_turn_boundary;
+    result.identity.boundaries            = std::move(processed.boundaries);
     return result;
 }
 
@@ -942,23 +965,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
             processed = processor.process(messages,
                                           render_options(options, impl_->prefix_checkpoint_policy));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
-        result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
-        result.token_types = std::move(processed.token_types);
-        result.positions   = std::move(processed.positions);
-        result.rope_delta  = processed.rope_delta;
-        result.patches     = std::move(processed.patches);
-        result.vision_items.reserve(processed.vision_items.size());
-        for (fi::VisionItem& item : processed.vision_items) {
-            result.vision_items.push_back(convert_vision_item(std::move(item)));
-        }
-        result.prepare.media_items            = processed.stats.media_items;
-        result.prepare.raw_patches            = processed.stats.raw_patches;
-        result.prepare.vision_tokens          = processed.stats.vision_tokens;
-        result.prepare.attention_pairs        = processed.stats.attention_pairs;
-        result.prepare.patch_bytes            = processed.stats.patch_bytes;
-        result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
-        result.identity.user_turn_boundary    = processed.user_turn_boundary;
-        result.identity.boundaries            = std::move(processed.boundaries);
+        result = convert_processed(std::move(processed));
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, impl_->prefix_checkpoint_policy));
@@ -1029,8 +1036,31 @@ DecisionPrompt Frontend::prepare_decision(const DecisionInput& input) const {
     if (!impl_->decision_delimiters.has_value()) {
         throw std::logic_error("this tokenizer has no System One decision delimiters");
     }
-    DecisionPrompt prompt = fi::layout_decision(*impl_->tokenizer, *impl_->decision_delimiters, input);
+    if (input.questions.empty()) {
+        throw std::invalid_argument("a decision needs at least one question");
+    }
+    const bool has_images =
+        std::any_of(input.state.begin(), input.state.end(),
+                    [](const DecisionPart& part) { return part.kind == DecisionPartKind::Image; });
+    if (has_images && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    fi::ProcessorOptions options = impl_->processor;
+    options.max_media_items      = 128;
+    options.max_prompt_tokens    = kDecisionMaxStateTokens;
+    fi::ProcessedDecisionState processed;
+    try {
+        processed = fi::process_decision_state(*impl_->tokenizer, impl_->decision_delimiters->state,
+                                               input, options);
+    } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+    DecisionPrompt prompt;
+    prompt.summary.state_truncated = processed.truncated;
+    prompt.summary.images          = static_cast<std::uint32_t>(processed.input.stats.media_items);
+    prompt.summary.vision_tokens = static_cast<std::uint32_t>(processed.input.stats.vision_tokens);
+    prompt.state                 = convert_processed(std::move(processed.input));
+    fi::layout_decision_branches(*impl_->tokenizer, *impl_->decision_delimiters, input, prompt);
     prompt.prepare_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    prompt.state.prepare.seconds = prompt.prepare_seconds;
     return prompt;
 }
 

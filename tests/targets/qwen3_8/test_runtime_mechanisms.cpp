@@ -235,6 +235,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
                          .timestamps  = {0.25, 0.5},
                          .token_spans = {{.begin = 1, .count = 2}}};
     item.content_digest.fill(digest_byte);
+    item.preprocessing_digest.fill(17);
     prompt.vision_items.push_back(std::move(item));
     return prompt;
 }
@@ -371,6 +372,8 @@ void test_prefix_identity_snapshot() {
                           "snapshot retains media patch count");
     media_change_rejected([](q36::VisionItem& item) { ++item.content_digest[0]; },
                           "snapshot retains media digest");
+    media_change_rejected([](q36::VisionItem& item) { ++item.preprocessing_digest[0]; },
+                          "snapshot retains preprocessing digest at the same grid");
     media_change_rejected([](q36::VisionItem& item) { item.timestamps[0] += 0.25; },
                           "snapshot retains media timestamps");
     media_change_rejected([](q36::VisionItem& item) { ++item.token_spans[0].count; },
@@ -405,6 +408,14 @@ void test_continuation_image_codec() {
                q36::detail::prefix_matches(prompt, decoded.ledger, restored,
                                             prompt.token_ids.size()),
            "continuation prefix codec preserves exact authorization identity");
+    auto old_prefix                                        = encoded;
+    old_prefix[8 + std::string_view("qwen-prefix").size()] = image::kTargetImageVersion - 1;
+    bool old_rejected                                      = false;
+    try {
+        (void)image::decode_prefix(old_prefix);
+    } catch (const std::invalid_argument&) { old_rejected = true; }
+    expect(old_rejected,
+           "continuation prefixes from before preprocessing identity are invalidated");
 
     const image::FrontierMetadata metadata{.execution_frontier = 3,
                                             .ledger_frontier = 4,
@@ -486,6 +497,50 @@ void test_continuation_image_codec() {
 
     expect(rejects([&] { (void)image::decode_prefix(encoded, prompt.token_ids.size() - 1); }),
            "continuation codec rejects prefixes above runtime capacity before allocation");
+}
+
+void test_decision_state_identity() {
+    namespace image  = q36::detail::continuation;
+    auto state       = identity_prompt();
+    state.rope_delta = -2;
+    const ninfer::cache::Bytes key{1, 2, 3};
+    const auto prefix  = image::decision_state_prefix(state);
+    const auto alias   = image::decision_state_alias(key, state);
+    const auto digest  = image::decision_state_digest(prefix, state.rope_delta);
+    const auto decoded = image::decode_prefix(prefix);
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.restore(decoded.identity);
+    expect(q36::detail::prefix_matches(state, decoded.ledger, resident, state.token_ids.size()),
+           "decision state roundtrip retains image geometry and content identity");
+    const auto rejects_change = [&](auto change) {
+        auto changed = state;
+        change(changed);
+        expect(image::decision_state_alias(key, changed) != alias,
+               "decision state alias rejects changed state semantics");
+        expect(image::decision_state_digest(image::decision_state_prefix(changed),
+                                            changed.rope_delta) != digest,
+               "decision descriptor digest rejects changed state semantics");
+    };
+    rejects_change([](auto& value) { ++value.vision_items[0].content_digest[0]; });
+    rejects_change([](auto& value) { ++value.vision_items[0].preprocessing_digest[0]; });
+    rejects_change([](auto& value) { ++value.vision_items[0].grid.height; });
+    rejects_change([](auto& value) { --value.vision_items[0].token_spans[0].count; });
+    rejects_change([](auto& value) { value.token_types[1] = 0; });
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        rejects_change([&](auto& value) { ++value.positions[axis * value.token_ids.size() + 1]; });
+    }
+    rejects_change([](auto& value) { ++value.rope_delta; });
+    rejects_change([](auto& value) { append_text_token(value, 99, 4); });
+    auto payload_changed    = state;
+    payload_changed.patches = {1.0F, 2.0F};
+    expect(image::decision_state_prefix(payload_changed) == prefix,
+           "decision state persistence contains no pixel or embedding payload");
+    const image::DecisionStateMetadata metadata{
+        .state_tokens = 4, .rope_delta = -2, .adapter = {7}};
+    const auto restored = image::decode_decision_state(image::encode_decision_state(metadata));
+    expect(restored.state_tokens == metadata.state_tokens &&
+               restored.rope_delta == metadata.rope_delta && restored.adapter == metadata.adapter,
+           "decision state metadata preserves its RoPE continuation and adapter");
 }
 
 void test_continuation_prefix_filter_digest() {
@@ -689,6 +744,7 @@ int main() {
     test_continuation_reuse_depth();
     test_prefix_identity_snapshot();
     test_continuation_image_codec();
+    test_decision_state_identity();
     test_continuation_prefix_filter_digest();
     test_stable_alias_identity();
     test_multiple_checkpoint_planning();

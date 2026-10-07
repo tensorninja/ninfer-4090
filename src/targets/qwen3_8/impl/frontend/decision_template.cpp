@@ -65,24 +65,16 @@ DecisionDelimiters resolve_decision_delimiters(const Tokenizer& tokenizer) {
                               .decide       = tokenizer.token_id(kDecisionDelimiterNames[4])};
 }
 
-DecisionPrompt layout_decision(const Tokenizer& tokenizer, const DecisionDelimiters& delimiters,
-                               const DecisionInput& input) {
+void layout_decision_branches(const Tokenizer& tokenizer, const DecisionDelimiters& delimiters,
+                              const DecisionInput& input, DecisionPrompt& prompt) {
     if (input.questions.empty()) {
         throw std::invalid_argument("a decision needs at least one question");
     }
-    DecisionPrompt prompt;
-    std::vector<TokenId>& tokens = prompt.tokens;
-
-    const std::vector<int> state = tokenizer.encode(escape_decision_text(input.state));
-    const std::size_t kept       = std::min<std::size_t>(state.size(), kDecisionMaxStateTokens - 1);
-    tokens.reserve(1 + kept);
-    tokens.push_back(delimiters.state);
-    tokens.insert(tokens.end(), state.begin(), state.begin() + static_cast<std::ptrdiff_t>(kept));
-    const auto state_tokens = static_cast<std::uint32_t>(tokens.size());
+    std::vector<TokenId>& tokens = prompt.branch_tokens;
+    const auto state_tokens      = checked_u32(prompt.state.token_ids.size());
 
     DecisionSummary& summary = prompt.summary;
     summary.state_tokens     = state_tokens;
-    summary.state_truncated  = state.size() + 1 > kDecisionMaxStateTokens;
     summary.questions        = checked_u32(input.questions.size());
     prompt.branches.reserve(input.questions.size());
 
@@ -116,8 +108,7 @@ DecisionPrompt layout_decision(const Tokenizer& tokenizer, const DecisionDelimit
         summary.longest_branch = std::max(summary.longest_branch, branch.length);
         prompt.branches.push_back(std::move(branch));
     }
-    summary.branch_tokens = checked_u32(tokens.size() - state_tokens);
-    return prompt;
+    summary.branch_tokens = checked_u32(tokens.size());
 }
 
 } // namespace ninfer::targets::qwen3_8::frontend_internal

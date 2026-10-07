@@ -275,7 +275,9 @@ pointer head. Its layout is kev's row form. The state row is `[<|fim_prefix|>, s
 
 Every branch continues the state alone:
 
-- branch token `j` has position `Ls + j`, so positions restart at `Ls` for every branch;
+- branch token `j` has logical KV position `Ls + j` and RoPE position `Ls + delta + j`, where
+  `delta` is the state's MRoPE continuation offset (zero for text-only states); every branch
+  restarts from that same state frontier;
 - attention sees the state `[0, Ls)` and the branch's own tokens `[0, j]`, never another branch;
 - the GDN causal convolution and recurrence start from the state's final window and state, and no
   branch's final state is kept.
@@ -292,6 +294,21 @@ p   = softmax_k(z)            over the question's K options
 ```
 
 No `lm_head` runs, nothing is sampled, and no MTP state exists for a decision lane.
+
+With startup Vision enabled, OpenAI decision states can interleave text and images. Preparation
+uses the same image decoder, normalization, patch packing, Vision encoder and MRoPE geometry as
+generation, but no chat-template wrappers. User text is escaped before trusted image delimiters are
+inserted. Image-detail transforms are specified in [serving](../serving.md#decisions-image-input):
+`low`/`high`/`auto` resize, while `original` preserves decoded pixels and pads trailing edges by
+replication. The state owns its prepared tokens, positions and image items; branch tokens occupy
+a separate tape with branch-relative origins. Each uncached image is encoded once during state
+prefill, not per question. Reusing the exact state needs no Vision encode. A reused image prefix
+followed by new text retains its MRoPE geometry even when no new image needs encoding.
+
+All decoder state chunks remain in `TextPhase::Decision`, including chunks containing visual
+embeddings. Image boundaries can shorten a nominal prefill chunk. Questions use the existing
+segmented attention/GDN branches and unchanged pointer-head mathematics. This execution contract
+does not establish image-task accuracy or calibration for text-trained adapters.
 
 Execution follows these semantics without materializing a row per question. The state is prefilled
 like a prompt, continued from a retained decision state of the same adapter, or imported from that

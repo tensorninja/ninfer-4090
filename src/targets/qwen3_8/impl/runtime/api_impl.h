@@ -225,10 +225,11 @@ RequestPlan<Variant> Program<Variant>::plan_decision_for_lane(std::uint32_t lane
 }
 
 template <>
-runtime::PrefillStepResult Program<Variant>::start_decision_lane(std::uint32_t lane,
-                                                                 DecisionPrompt&& prompt,
-                                                                 RequestPlan<Variant>&& plan) {
-    return impl_->start_decision_lane(lane, std::move(prompt), std::move(plan));
+runtime::PrefillStepResult
+Program<Variant>::start_decision_lane(std::uint32_t lane, DecisionPrompt&& prompt,
+                                      RequestPlan<Variant>&& plan,
+                                      runtime::TransientRegion transient) {
+    return impl_->start_decision_lane(lane, std::move(prompt), std::move(plan), transient);
 }
 
 template <>

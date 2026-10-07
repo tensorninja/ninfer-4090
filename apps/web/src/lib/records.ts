@@ -1,4 +1,4 @@
-// Record shapes, as emitted by src/serve/request_log.cpp (schema 23).
+// Record shapes, as emitted by src/serve/request_log.cpp (schema 24).
 //
 // GET /events streams these live and `--request-log-jsonl` appends the identical lines, so one
 // set of types serves both the live dashboard and file replay. Only the fields the dashboard
@@ -262,6 +262,8 @@ export interface RequestErrorRecord extends RecordEnvelope {
 
 /** A decision as submitted: its layout, before anything ran. */
 export interface DecisionContext {
+  images?: number
+  vision_tokens?: number
   request_id: number
   /** The request id the response carries. */
   x_request_id: string
@@ -292,6 +294,7 @@ export interface DecisionContext {
  * is receipt to response, including `prepare` on the HTTP side.
  */
 export interface DecisionTimings {
+  vision?: number
   prepare: number
   queue: number
   restore: number
@@ -478,7 +481,40 @@ export const RECORD_EVENTS: readonly RecordEvent[] = [
 
 export function isEngineRecord(value: unknown): value is EngineRecord {
   if (typeof value !== 'object' || value === null) return false
-  const event = (value as { event?: unknown }).event
+  const record = value as Record<string, unknown>
+  const event = record.event
+  if (
+    typeof record.schema_version === 'number' &&
+    record.schema_version >= 24 &&
+    (event === 'decision_start' || event === 'decision_done' || event === 'decision_error')
+  ) {
+    const request = record.request as Partial<DecisionContext> | undefined
+    if (
+      !request ||
+      !Number.isInteger(request.images) ||
+      request.images! < 0 ||
+      request.images! > 128 ||
+      !Number.isInteger(request.vision_tokens) ||
+      request.vision_tokens! < 0
+    )
+      return false
+    if ((request.protocol === 'systemone' || request.images === 0) && request.vision_tokens !== 0)
+      return false
+    if (request.protocol === 'systemone' && request.images !== 0) return false
+    if (event === 'decision_done') {
+      const timings = record.timings_seconds as Partial<DecisionTimings> | undefined
+      if (
+        !timings ||
+        typeof timings.vision !== 'number' ||
+        !Number.isFinite(timings.vision) ||
+        timings.vision < 0 ||
+        typeof timings.state !== 'number' ||
+        timings.vision > timings.state
+      )
+        return false
+      if (request.images === 0 && timings.vision !== 0) return false
+    }
+  }
   return RECORD_EVENTS.includes(event as RecordEvent)
 }
 

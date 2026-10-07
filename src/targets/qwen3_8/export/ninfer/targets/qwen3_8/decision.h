@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include <ninfer/targets/qwen3_8/prepared_prompt.h>
 
 #include <algorithm>
 #include <array>
@@ -13,12 +14,12 @@ namespace ninfer::targets::qwen3_8 {
 // System One decision layout (kev model.encode with its serving limits). A decision is the state
 // row [<|fim_prefix|>, state...] followed, per question in request order, by the branch
 // [<|fim_middle|>, instructions..., (<|box_start|>, option..., <|box_end|>)..., <|fim_suffix|>].
-// Every branch sees the state and itself only; its positions restart at the state length.
+// Every branch sees the state and itself only; its RoPE positions continue the state's MRoPE.
 // Readouts are the final-norm hidden states at each <|box_end|> (options) and at <|fim_suffix|>
 // (decide).
 
-// The state row holds at most this many tokens including its delimiter; a longer state text is
-// cut to its head silently. A state plus one branch holds at most kDecisionMaxRowTokens.
+// The state row holds at most this many tokens including its delimiter. A state plus one branch
+// holds at most kDecisionMaxRowTokens.
 inline constexpr std::uint32_t kDecisionMaxStateTokens = 65536;
 inline constexpr std::uint32_t kDecisionMaxRowTokens   = kDecisionMaxStateTokens + 8192;
 
@@ -36,10 +37,9 @@ struct DecisionDelimiters {
 
 using ::ninfer::DecisionBranch;
 
-// A laid-out decision: the state row followed by every branch in request order (kev's packed
-// token sequence).
 struct DecisionPrompt {
-    std::vector<TokenId> tokens;
+    PreparedPromptData state;
+    std::vector<TokenId> branch_tokens;
     std::vector<DecisionBranch> branches;
     DecisionSummary summary;
     double prepare_seconds = 0.0;
@@ -56,6 +56,7 @@ struct DecisionOutcome {
     std::uint32_t branch_passes       = 0;
     std::uint32_t long_branch_chunks  = 0;
     double state_seconds              = 0.0;
+    double vision_seconds             = 0.0;
     double branch_seconds             = 0.0;
 };
 

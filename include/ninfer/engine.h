@@ -73,9 +73,8 @@ public:
     [[nodiscard]] const DecisionSummary& summary() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
-    // The laid-out tokens (the state row, then every branch in request order) and each
-    // question's branch, retained for parity tools. Empty when the decision is empty.
-    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
+    [[nodiscard]] std::span<const TokenId> state_token_ids() const noexcept;
+    [[nodiscard]] std::span<const TokenId> branch_token_ids() const noexcept;
     [[nodiscard]] std::span<const DecisionBranch> branches() const noexcept;
 
 private:
@@ -149,7 +148,8 @@ public:
     [[nodiscard]] PreparedDecision prepare_decision(DecisionInput input) const;
     [[nodiscard]] DecisionHandle
     submit_decision(PreparedDecision decision, DecisionOptions options,
-                    std::chrono::steady_clock::time_point pending_deadline = {});
+                    std::chrono::steady_clock::time_point pending_deadline = {},
+                    HostInputLease host_input                              = {});
     DecisionResult decide(PreparedDecision decision, DecisionOptions options,
                           const CancellationView& cancellation = {});
 

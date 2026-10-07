@@ -454,19 +454,24 @@ int main() {
     openai_decision.x_request_id       = "req_openai_decision";
     openai_decision.protocol           = "openai_decisions";
     openai_decision.model              = "decider";
+    openai_decision.summary.images        = 2;
+    openai_decision.summary.vision_tokens = 512;
     for (const DecisionLogContext& logged : {decision, openai_decision}) {
+        decided.summary                   = logged.summary;
+        decided.timings.vision_seconds    = logged.summary.images ? 0.008 : 0.0;
+        const std::uint32_t output_tokens = logged.protocol == "openai_decisions" ? 0 : 25;
         const Json decision_start =
             Json::parse(format_decision_start_json("serve-test", 4000, logged));
-        const Json decision_done =
-            Json::parse(format_decision_done_json("serve-test", 4100, logged, decided, 25));
+        const Json decision_done = Json::parse(
+            format_decision_done_json("serve-test", 4100, logged, decided, output_tokens));
         const Json decision_error = Json::parse(
             format_decision_error_json("serve-test", 4200, logged, 499, "client disconnected"));
         const Json& decision_request = decision_done.at("request");
         failures +=
             check(decision_start.at("event") == "decision_start" &&
-                      decision_start.at("schema_version") == 23 &&
-                      decision_done.at("schema_version") == 23 &&
-                      decision_error.at("schema_version") == 23 &&
+                      decision_start.at("schema_version") == 24 &&
+                      decision_done.at("schema_version") == 24 &&
+                      decision_error.at("schema_version") == 24 &&
                       decision_start.at("request") == decision_request &&
                       decision_error.at("request") == decision_request &&
                       decision_request.at("request_id") == logged.id &&
@@ -474,19 +479,28 @@ int main() {
                       decision_request.at("model") == logged.model &&
                       decision_request.at("adapter") == "decider" &&
                       decision_request.at("x_request_id") == logged.x_request_id &&
-                      decision_request.at("input_tokens") == 1290,
+                      decision_request.at("input_tokens") == 1290 &&
+                      decision_request.at("images") == logged.summary.images &&
+                      decision_request.at("vision_tokens") == logged.summary.vision_tokens,
                   "decision records must preserve each protocol's request and token layout");
         failures += check(
             decision_done.at("event") == "decision_done" &&
-                decision_done.at("result").at("output_tokens") == 25 &&
+                decision_done.at("result").at("output_tokens") == output_tokens &&
                 decision_done.at("result").at("computed_state_tokens") == 200 &&
                 decision_done.at("result").at("state_source") == "l1" &&
                 decision_done.at("result").at("slot") == 2 &&
+                decision_done.at("timings_seconds").at("vision") ==
+                    decided.timings.vision_seconds &&
+                decision_done.at("timings_seconds").at("state") == 0.020 &&
                 std::abs(decision_done.at("timings_seconds").at("total").get<double>() - 0.069) <
                     1e-12 &&
                 std::abs(decision_done.at("rates").at("state_tok_s").get<double>() - 10000.0) <
                     1e-6,
             "decision_done must decompose the decision's work and time");
+        failures += check(
+            !decision_request.contains("input") && !decision_request.contains("state") &&
+                !decision_request.contains("image_url") && !decision_request.contains("parts"),
+            "decision records contain image counts, not payloads");
         failures += check(decision_error.at("event") == "decision_error" &&
                               decision_error.at("error").at("status") == 499 &&
                               decision_error.at("error").at("message") == "client disconnected",

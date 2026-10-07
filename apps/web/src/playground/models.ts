@@ -19,6 +19,7 @@ export interface ModelCard {
   max_context: number
   prefix_reuse?: boolean
   max_state_tokens?: number
+  vision?: boolean
 }
 
 export type Catalog =
@@ -42,7 +43,7 @@ export function parseCatalog(data: unknown, protocol: Protocol = 'typesafe'): Mo
         ? [
             {
               name: m.id,
-              description: 'Text-only OpenAI Decisions. Uses a local decision adapter, not Luna.',
+              description: 'OpenAI Decisions. Uses a local decision adapter, not Luna.',
               release_date: '',
               adapter: m.id,
               base: '',
@@ -52,6 +53,7 @@ export function parseCatalog(data: unknown, protocol: Protocol = 'typesafe'): Mo
               max_context: typeof m.context_window === 'number' ? m.context_window : 0,
               max_state_tokens:
                 typeof m.max_state_tokens === 'number' ? m.max_state_tokens : undefined,
+              vision: isRecord(m.modalities) ? m.modalities.vision === true : false,
             },
           ]
         : [],

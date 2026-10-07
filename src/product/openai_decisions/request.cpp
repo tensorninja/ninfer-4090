@@ -66,9 +66,61 @@ void array(const Json& value, std::string_view param, std::size_t minimum, std::
     }
 }
 
-void append_content(std::string& state, const Json& content, std::string_view param) {
+void append_text(Input& input, std::string_view text) {
+    if (input.state.empty() || input.state.back().kind != DecisionPartKind::Text) {
+        input.state.emplace_back();
+    }
+    input.state.back().text += text;
+}
+
+SourcePart image_part(const Json& part, std::string_view path) {
+    fields(part, path, {"type", "image_url", "detail"});
+    SourcePart result;
+    result.kind     = DecisionPartKind::Image;
+    result.param    = field(path, "image_url");
+    const Json& url = required(part, "image_url", path);
+    if (!url.is_string()) { invalid(result.param, "Expected a string.", "invalid_type"); }
+    const auto& source          = url.get_ref<const std::string&>();
+    const std::size_t separator = source.find(";base64,");
+    if (!source.starts_with("data:image/") || separator == std::string::npos || separator <= 11 ||
+        source.find_first_of(";, \t\r\n", 5) != separator) {
+        invalid(result.param, "Expected an inline base64 image data URI.", "invalid_media");
+    }
+    const std::string_view encoded = std::string_view(source).substr(separator + 8);
+    const std::size_t padding      = encoded.ends_with("==") ? 2 : encoded.ends_with('=') ? 1 : 0;
+    if (encoded.empty() || encoded.size() % 4 != 0) {
+        invalid(result.param, "Invalid base64 image data.", "invalid_media");
+    }
+    for (std::size_t i = 0; i < encoded.size() - padding; ++i) {
+        const char c = encoded[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '+' || c == '/')) {
+            invalid(result.param, "Invalid base64 image data.", "invalid_media");
+        }
+    }
+    result.image.kind       = media_acquire::SourceKind::Data;
+    result.image.value      = source;
+    result.image.media_type = source.substr(5, separator - 5);
+    if (part.contains("detail") && !part["detail"].is_null()) {
+        const std::string& detail = text(part["detail"], field(path, "detail"));
+        if (detail == "auto") {
+            result.detail = ImageDetail::Auto;
+        } else if (detail == "low") {
+            result.detail = ImageDetail::Low;
+        } else if (detail == "high") {
+            result.detail = ImageDetail::High;
+        } else if (detail == "original") {
+            result.detail = ImageDetail::Original;
+        } else {
+            invalid(field(path, "detail"), "Expected auto, low, high, or original.");
+        }
+    }
+    return result;
+}
+
+void append_content(Input& input, const Json& content, std::string_view param) {
     if (content.is_string()) {
-        state += text(content, param, kInputLimit);
+        append_text(input, text(content, param, kInputLimit));
         return;
     }
     array(content, param, 0, 16384);
@@ -78,19 +130,28 @@ void append_content(std::string& state, const Json& content, std::string_view pa
         if (!part.is_object()) { invalid(path, "Expected an object.", "invalid_type"); }
         const std::string& type = text(required(part, "type", path), field(path, "type"));
         if (type == "input_image") {
-            invalid(field(path, "type"), "Decisions supports text input only.",
-                    "unsupported_modality");
+            if (++input.images > 128) {
+                invalid(path, "Decisions supports at most 128 images per request.");
+            }
+            input.state.push_back(image_part(part, path));
+            continue;
+        }
+        if (type != "input_text") {
+            invalid(field(path, "type"), "Expected input_text or input_image.");
         }
         fields(part, path, {"type", "text"});
-        if (type != "input_text") { invalid(field(path, "type"), "Expected input_text."); }
-        state += text(required(part, "text", path), field(path, "text"), kInputLimit);
+        append_text(input, text(required(part, "text", path), field(path, "text"), kInputLimit));
     }
 }
 
-std::string input_text(const Json& input) {
-    if (input.is_string()) { return text(input, "input", kInputLimit); }
+Input parse_input(const Json& input) {
+    Input result;
+    if (input.is_string()) {
+        append_text(result, text(input, "input", kInputLimit));
+        return result;
+    }
     array(input, "input", 0, 131072);
-    std::string state;
+    append_text(result, "");
     for (std::size_t i = 0; i < input.size(); ++i) {
         const Json& message    = input[i];
         const std::string path = index("input", i);
@@ -101,10 +162,10 @@ std::string input_text(const Json& input) {
         if (message.contains("type") && text(message["type"], field(path, "type")) != "message") {
             invalid(field(path, "type"), "Expected message.");
         }
-        if (i != 0) { state += "\n\n"; }
-        append_content(state, required(message, "content", path), field(path, "content"));
+        if (i != 0) { append_text(result, "\n\n"); }
+        append_content(result, required(message, "content", path), field(path, "content"));
     }
-    return state;
+    return result;
 }
 
 std::string option_text(std::string label, const Json& option, std::string_view path) {
@@ -195,7 +256,7 @@ Request parse_request(std::string_view body) {
     if (root.contains("safety_identifier") && !root["safety_identifier"].is_null()) {
         static_cast<void>(text(root["safety_identifier"], "safety_identifier", 128));
     }
-    request.input.state   = input_text(required(root, "input", ""));
+    request.input         = parse_input(required(root, "input", ""));
     const Json& questions = required(root, "questions", "");
     array(questions, "questions", 1, 200);
     request.input.questions.reserve(questions.size());
@@ -206,4 +267,20 @@ Request parse_request(std::string_view body) {
     return request;
 }
 
+DecisionInput to_decision_input(Input input,
+                                const std::function<OwnedMedia(const SourcePart&)>& acquire) {
+    DecisionInput result;
+    result.overflow  = DecisionStateOverflow::Reject;
+    result.questions = std::move(input.questions);
+    result.state.reserve(input.state.size());
+    for (SourcePart& source : input.state) {
+        DecisionPart part;
+        part.kind   = source.kind;
+        part.text   = std::move(source.text);
+        part.detail = source.detail;
+        if (source.kind == DecisionPartKind::Image) { part.image = acquire(source); }
+        result.state.push_back(std::move(part));
+    }
+    return result;
+}
 }

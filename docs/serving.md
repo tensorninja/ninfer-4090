@@ -48,7 +48,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/models` | base model, generative adapters, and decision-only adapter model objects |
 | `GET /v1/models/{id}` | lookup of a listed OpenAI model object |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
-| `POST /v1/decisions` | [OpenAI Decisions](#openai-decisions): text-only typed questions answered by a decision adapter |
+| `POST /v1/decisions` | [OpenAI Decisions](#openai-decisions): typed questions over text and, with `--vision`, inline images, answered by a decision adapter |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
 | `GET /v1/responses/{id}` | retrieve a locally stored terminal Response |
@@ -62,7 +62,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 | `GET /metrics` | Prometheus text exposition; see [Metrics](#metrics) |
 | `GET /telemetry` | one live JSON snapshot: board sensors, scheduler occupancy, lane work, VRAM, cache fill, adapter pool and bank residency, System One surface |
-| `GET /events` | SSE stream of the schema-23 records `--request-log-jsonl` writes |
+| `GET /events` | SSE stream of the schema-24 records `--request-log-jsonl` writes |
 
 `/metrics`, `/telemetry`, and `/events` are always registered and cannot be disabled. Like every
 path except `/health`, they require the API key when `--api-key` is set.
@@ -118,7 +118,7 @@ reported apart from `restore_failures` because a deferral leaves the candidate l
 and a failure does not. The same counters appear on the throughput record as cumulative totals
 paired with interval deltas, so churn is readable from a replayed log as well as live.
 
-`GET /events` streams the same schema-23 records `--request-log-jsonl` appends, as named SSE
+`GET /events` streams the same schema-24 records `--request-log-jsonl` appends, as named SSE
 frames whose event name is the record's own `event` field. The records are formatted once and
 fanned out to both sinks, so a live reader and a post-hoc reader of the file see identical lines.
 A connecting reader is replayed the retained `server_start` record followed by a bounded ring of
@@ -157,8 +157,8 @@ session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. Th
 backend is not supported.
 
 When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry. The snapshot format is version 5, which always records both the
-adapter fingerprint and the ring section and stores packed 4-bit KV pages in the midrise codec;
+about 147 MiB per entry. The snapshot format is version 6, which records the media preprocessing
+identity, adapter fingerprint and ring section and stores packed 4-bit KV pages in the midrise codec;
 earlier versions are rejected. The restored
 ring lets a later mid-history edit reuse the session; see
 [turn-checkpoint-ring.md](turn-checkpoint-ring.md).
@@ -662,14 +662,14 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 
 ## OpenAI Decisions
 
-`POST /v1/decisions` implements the text-only request and response wire contract of the
+`POST /v1/decisions` implements the text and inline-image request and response wire contract of the
 [OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions), inspected
 2026-10-07. The [OpenAI Python SDK](https://github.com/openai/openai-python) requires version
 **3.26.0 or newer** for `client.decisions.create`; its generated
 [request types](https://github.com/openai/openai-python/blob/main/src/openai/types/decision_create_params.py)
 and [response types](https://github.com/openai/openai-python/blob/main/src/openai/types/decision.py)
 describe the SDK wire shape. NInfer runs the local Qwen3.8-27B decision adapter, not Luna. This
-compatibility does not promise Luna outputs, images, confidence calibration or refusal policy.
+compatibility does not promise Luna outputs, image preprocessing, confidence calibration or refusal policy.
 There is no trained refusal detector, and NInfer does not fabricate `refusal` answers.
 
 Both decision surfaces use the same Engine, weights, `--lora-slots`, bounded FIFO, KV pool and
@@ -677,7 +677,8 @@ continuation cache as chat. They are prefill-only: one state, then one independe
 question. Use an actual decision adapter pool name such as `systemone-decision-v7`; there is no
 `gpt-6-luna` alias, and `jev-latest` exists only on TypeSafe. Root `/v1/models` and
 `/v1/models/{id}` advertise decision adapters as OpenAI model objects with
-`supported_endpoints: ["/v1/decisions"]`, `modalities.vision: false`, and `context_window` capped
+`supported_endpoints: ["/v1/decisions"]`, `modalities.vision` reflecting startup Vision capability,
+and `context_window` capped
 by the decision row budget and configured lane context. `max_state_tokens` is the smaller of
 65,536 and the configured lane context. Generative endpoints still reject these
 models, and Decisions rejects base and generative models. Anthropic Messages and its token-count
@@ -719,11 +720,11 @@ was absent. Explicit null names or descriptions, numeric choice values and unkno
 invalid. Optional `safety_identifier` is a string of at most 128 characters or null. It is
 accepted caller metadata, never authentication or prompt text.
 
-`input` is a string or an array of text-only user messages. Message `content` is a string or an
-array of `{"type": "input_text", "text": "..."}` parts. Text parts concatenate verbatim within
-each message; messages join with exactly `\n\n`, without trimming. Non-user roles and non-text
-inputs are not supported. Image parts fail explicitly with HTTP 400 `unsupported_modality`,
-even in a mixed text/image message or on a server started with `--vision`; no image is stripped.
+`input` is a string or an array of user messages. Message `content` is a string or an ordered array
+of `{"type": "input_text", "text": "..."}` and `input_image` parts. Adjacent text parts concatenate
+verbatim within each message; messages join with exactly `\n\n`, without trimming. Images retain
+their position among the text parts. Non-user roles, video, audio and files are not supported.
+Images require `--vision`; no image is stripped when the server cannot process it.
 
 String-only choices render as `value` or `value: description`, matching TypeSafe's choice
 rendering. If any choice is boolean, **every** value renders as a JSON scalar label, so boolean
@@ -731,9 +732,102 @@ rendering. If any choice is boolean, **every** value renders as a JSON scalar la
 `label: description`; descriptions do not change the echoed labels or zero-based indices.
 
 The state budget is **65,536 tokens including its delimiter**; each state-plus-branch row must
-fit **73,728 tokens** and the configured lane's `--max-context`. OpenAI rejects overflow rather
-than silently truncating: the exact prepared state's `state_truncated` flag is checked before
-submission. TypeSafe retains its original state truncation behavior below.
+fit **73,728 tokens** and the configured lane's `--max-context`. Expanded visual tokens and image
+delimiters count toward these limits. OpenAI rejects overflow during preparation rather than
+silently truncating; an image span is never clipped. TypeSafe retains its original state truncation
+behavior below.
+
+### Decisions image input
+
+Start the server with `--vision` to load the Vision weights and startup-fixed workspace. The flag
+cannot be enabled by a request. Without it, a valid image request returns HTTP 400 `vision_disabled`
+and the decision model cards report `modalities.vision: false`. TypeSafe's state format is unchanged;
+this image contract belongs only to OpenAI Decisions.
+
+An image part has `type: "input_image"`, a string `image_url` containing an **inline base64 data URL**,
+and optional `detail`. HTTP(S) URLs, local paths and `file_id` are rejected, even though some
+generation endpoints accept remote image URLs. At most **128 image parts** may appear across the
+request. Image count is only one limit: the whole request must also fit its byte, Vision and context
+budgets. Image acquisition/preparation uses the same bounded media permit and request lifetime as
+chat, with cancellation and deadline handling.
+
+```python
+import base64
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
+image = base64.b64encode(Path("product.png").read_bytes()).decode("ascii")
+result = client.decisions.create(
+    model="systemone-decision-v7",
+    input=[{"role": "user", "content": [
+        {"type": "input_text", "text": "Inspect this product."},
+        {"type": "input_image", "image_url": f"data:image/png;base64,{image}",
+         "detail": "original"},
+    ]}],
+    questions=[{"type": "predicate", "name": "damage",
+                "instructions": "Is there visible damage to the product?"}],
+)
+print(result.answers[0].probability)
+```
+
+The image profiles are **Qwen-specific**, not a promise of Luna's image preprocessing:
+
+| `detail` | Transformation |
+|---|---|
+| `low` | native aspect-preserving, 32-aligned smart resize, with the embedded minimum pixel area and a maximum capped at **262,144 pixels / 256 merged image tokens**; this is an area ceiling, not a limit of 512 on each edge |
+| `high` | native smart resize using the checkpoint's embedded minimum/maximum pixel-area settings; one image grid, without hidden tiling |
+| `auto`, omitted or null | deterministically resolves to `high` |
+| `original` | preserve the decoded, orientation-corrected RGB pixels; replicate the trailing row/column to pad dimensions up to multiples of 32, without resize, crop or minimum-area enlargement |
+
+Padding is real image content, not masked tokens. Detail does not change based on question count,
+queue state or cache reuse. Every transformed image must fit the resource bounds; `high`/`auto`
+can therefore fail even after native resizing. The server never silently lowers detail or retries
+an oversized `original` image at a reduced resolution. The existing generation preprocessing and
+generation endpoints' accepted `detail` values are unchanged.
+
+For an aligned still image, raw patches are `P = (H/16) * (W/16)`, merged image tokens are
+`V = P/4 = H*W/1024`, and the attention-work charge is **`P*P`**, not `V*V`. Request-wide charges
+sum each image's contribution. The limits are:
+
+| Resource | Limit |
+|---|---|
+| HTTP request body, including base64 expansion | `--max-request-mib` |
+| One image's bytes after base64 decoding | 256 MiB, also bounded by the remaining request media-byte budget |
+| One decoded raster, before transformation | 64 Mi pixels |
+| Aggregate merged Vision tokens | `--vision-max-tokens`, default 8,192 |
+| Aggregate raw patches | 131,072 |
+| Aggregate attention pairs | 134,217,728 |
+| State / state-plus-branch | 65,536 / 73,728 tokens and the configured lane context |
+
+The startup execution envelope also limits each whole image to the smaller of context capacity and
+`--vision-max-tokens`. That flag is a capacity limit, not a resize target, and raising it does not
+raise the attention-pair limit. Attention alone permits at most 2,896 merged tokens in one still
+image, with aligned geometry potentially reducing that ceiling. For example, a 1920×1080 original
+image pads to 1920×1088 (2,040 tokens and 66,585,600 pairs), whereas 2048×1536 already requires
+150,994,944 pairs and is rejected even at the default 8,192-token setting.
+
+Vision runs once per image needed to compute the shared state, never once per question. An exact
+cached state reuses its KV/GDN state without rerunning Vision. Identity includes image content and
+effective preprocessing: resizing and edge-padding the same image to the same grid cannot alias.
+
+**Image execution support is not image-task qualification.** The existing decision adapters were
+trained on text. Their image-task accuracy and confidence calibration need separate evaluation;
+the text-only fidelity and mixed-load measurements do not establish either. The same pointer head
+and six LoRA modules are used, and no image-trained adapter or refusal detector is fabricated.
+
+Numerical integration checked on 2026-10-07 with RTX 4090 (`sm_89`, CUDA 13.2), the groupwise-int
+27B artifact, `systemone-decision-v7` and BF16 KV: 10 cold synthetic image requests / 30 questions
+had max |Δp| **0.001869**, mean per-question max |Δp| **0.000397**, **zero changed argmax answers**,
+and exact input-token accounting against the independent PyTorch reference. Cases covered all
+effective detail profiles, same-grid resize versus padding, changed pixels, multiple images and a
+1,185-token branch. Engine/reference pass widths were 128/1,024; prefix and continuation reuse were
+off. The reference independently decodes and transforms the original inputs with embedded frontend
+resources, evaluates Vision and the shared state, restores that state for each branch, and evaluates
+the BF16 pointer-head parameters in FP64. This checks implementation fidelity, not image-task
+accuracy. To compare another native requests JSONL, use `image-capture` and then `image-gates` in
+[`tools/parity/qwen3_8_27b/decision.py`](../tools/parity/qwen3_8_27b/decision.py); capture from a cold
+BF16 server and stop it before running the reference on the same GPU.
 
 ### Decisions answers, usage and errors
 
@@ -752,7 +846,7 @@ probabilities. A predicate has no separate confidence.
 
 | Usage field | Meaning |
 |---|---|
-| `input_tokens` | state tokens plus **all** question-branch tokens |
+| `input_tokens` | expanded state tokens, including visual tokens counted once, plus **all** question-branch tokens |
 | `input_tokens_details.cached_tokens` | state tokens actually reused, including retained or restored state; zero on a cold request |
 | `input_tokens_details.cache_write_tokens` | always zero: no separate cache-write accounting, not a claim that the continuation cache is disabled |
 | `output_tokens` | zero: decisions do not generate tokens |
@@ -760,14 +854,15 @@ probabilities. A predicate has no separate confidence.
 | `total_tokens` | equals `input_tokens` |
 
 Errors use the standard OpenAI `{"error": {"message": ..., "type": ..., "param": ..., "code": ...}}`
-shape: **400** for validation, unsupported modality and token overflow; **404** for unknown or
+shape: **400** for validation, disabled Vision, invalid media, unsupported modality and token overflow;
+**413** for request/media resource budgets; **404** for unknown or
 non-decision models; **401** for authentication failure. Queue saturation and timeout retain the
 existing **429**/`server_overloaded` and **503**/`request_queue_timeout` codes and retry headers.
 HTTP request-size limits still apply. Responses carry `x-request-id`, not TypeSafe's request-ID header.
 
 Decision events and metrics are shared with TypeSafe, not a second accounting path:
 `decision_start`, `decision_done` and `decision_error` identify the protocol as
-`openai_decisions` or `systemone` in schema 23. The `ninfer:decision_*` metrics aggregate both
+`openai_decisions` or `systemone` in schema 24. The `ninfer:decision_*` metrics aggregate both
 surfaces, and both use the same retained-state and continuation-cache reuse rules described below.
 
 ## System One decisions
@@ -877,7 +972,9 @@ process; raw HTTP checks cover both surfaces regardless. No SDK is installed by 
 
 The smoke checks discovery, errors, ordered typed answers, equivalent text rendering, usage,
 cross-surface probabilities with TypeSafe's four-decimal rounding allowance, and both decision
-surfaces beside greedy chat. The script disables prefix reuse to compare cold requests.
+surfaces beside greedy chat. By default `--vision-mode both` runs with Vision disabled and enabled;
+image checks cover detail profiles, budgets, accounting, overload-before-decode and queued
+cancellation/recovery. The script disables prefix reuse to compare cold requests.
 
 ### System One fidelity
 
@@ -1041,6 +1138,7 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--lora-slots N` | device-resident adapter slabs; the rest swap in on admission | `2` |
 | `--systemone-default NAME` | decision adapter the System One default model `jev-latest` answers with | the only decision adapter |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-max-tokens N` | aggregate prepared Vision-token limit and startup Vision capacity; does not change the image profile or attention-pair budget | `8192` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--prefix-checkpoint-policy stable-turn\|rolling-tool` | choose a stable first-assistant rewrite checkpoint or advance it after completed tool history | `rolling-tool` |
@@ -1141,7 +1239,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-23 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-24 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Generation request records retain that numeric `request_id` for metrics and
 also carry `x_request_id`, matching the client-visible HTTP response header for log correlation.
@@ -1152,10 +1250,15 @@ also carry `x_request_id`, matching the client-visible HTTP response header for 
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call counts, unrounded phase seconds, complete speculative-decoding counters, and a structured `continuation_cache` diagnostic |
 | `request_error` | the resolved request configuration and generation error message |
-| `decision_start` | a submitted decision: `protocol` (`systemone` or `openai_decisions`), `model`, the answering `adapter`, reuse flag, question/option counts, state/branch/longest-branch tokens, and state truncation |
-| `decision_done` | output tokens, reused and computed state tokens with their `state_source`, branch passes, long-branch chunks, slot, unrounded `prepare`/`queue`/`restore`/`state`/`branch`/`execution`/`total` seconds, and state/branch prefill rates |
+| `decision_start` | a submitted decision: `protocol` (`systemone` or `openai_decisions`), `model`, the answering `adapter`, reuse flag, question/option/image counts, visual/state/branch/longest-branch tokens, and state truncation |
+| `decision_done` | output tokens, reused and computed state tokens with their `state_source`, branch passes, long-branch chunks, slot, unrounded `prepare`/`queue`/`restore`/`state`/`vision`/`branch`/`execution`/`total` seconds, and state/branch prefill rates |
 | `decision_error` | the submitted decision and the client-visible status and message |
 | `throughput` | interval token deltas and rates with the System One share of computed prefill (`tokens.decision_prefill`), board energy, scheduler occupancy, decode-round batch statistics, cumulative/delta LoRA bank `stages` and `slot_waits` (`adapters`), and cumulative/delta continuation tier and latency summaries |
+
+Decision `timings_seconds.vision` is a subset of `state`, not an additional phase to add to total
+execution time. It is zero for text-only requests and exact-state reuse; state throughput includes
+Vision time when an image is encoded. Image counts and visual tokens describe the prepared input,
+not necessarily newly computed work. The log never stores image bytes or base64 data URLs.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `queue`, `restore`, `publish`,
 `prefill`, `decode`, and `total` as full-precision JSON numbers. `publish` is only the completion

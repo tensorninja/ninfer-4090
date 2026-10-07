@@ -1,14 +1,17 @@
 #include "targets/qwen3_8/impl/frontend/processor.h"
 
 #include "media/decode/decode.h"
+#include "targets/qwen3_8/impl/frontend/decision_template.h"
 #include "targets/qwen3_8/impl/frontend/digest.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <sstream>
@@ -240,19 +243,61 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 void add_budget(PreprocessStats& stats, const VisionItem& item);
 void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options);
 
-Prepared prepare_image(const ChatPart& part, const ProcessorOptions& options,
-                       const media::decode::Policy& policy, PreprocessStats& stats) {
-    media::decode::Image image = media::decode::decode_image(part.media.bytes, policy);
-    const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
-                                         options.image_max_pixels);
+Sha256Digest preprocessing_digest(std::string_view transform,
+                                  std::initializer_list<std::uint64_t> parameters) {
+    std::string identity = "qwen3_8.rgb8.patch16.temporal2.merge2.normalize127_5.v1:";
+    identity += transform;
+    for (const std::uint64_t value : parameters) {
+        identity.push_back(':');
+        identity += std::to_string(value);
+    }
+    return sha256(identity);
+}
+
+media::decode::Image pad_image(const media::decode::Image& input, Size size) {
+    media::decode::Image out;
+    out.width  = size.w;
+    out.height = size.h;
+    out.rgb.resize(static_cast<std::size_t>(size.h) * size.w * 3);
+    for (int y = 0; y < size.h; ++y) {
+        for (int x = 0; x < size.w; ++x) {
+            const std::size_t source =
+                (static_cast<std::size_t>(std::min(y, input.height - 1)) * input.width +
+                 std::min(x, input.width - 1)) *
+                3;
+            const std::size_t target = (static_cast<std::size_t>(y) * size.w + x) * 3;
+            std::copy_n(input.rgb.begin() + source, 3, out.rgb.begin() + target);
+        }
+    }
+    return out;
+}
+
+Prepared prepare_image(media::decode::Image image, ImageDetail detail,
+                       const ProcessorOptions& options, PreprocessStats& stats) {
+    const bool original            = detail == ImageDetail::Original;
+    const std::uint64_t min_pixels = original ? 0 : options.image_min_pixels;
+    const std::uint64_t max_pixels =
+        original ? 0
+        : detail == ImageDetail::Low
+            ? std::min<std::uint64_t>(options.image_max_pixels, 512ULL * 512ULL)
+            : options.image_max_pixels;
+    const Size size = original
+                          ? Size{((image.height + kFactor - 1) / kFactor) * kFactor,
+                                 ((image.width + kFactor - 1) / kFactor) * kFactor}
+                          : smart_resize_image(image.height, image.width, min_pixels, max_pixels);
     const int gh    = size.h / kPatch;
     const int gw    = size.w / kPatch;
     Prepared out;
     out.item.modality = Modality::Image;
     out.item.grid     = {1, gh, gw};
+    out.item.preprocessing_digest = preprocessing_digest(
+        original ? "replicate_right_bottom" : "smartresize_bicubic_antialias",
+        {min_pixels, max_pixels, static_cast<std::uint64_t>(image.height),
+         static_cast<std::uint64_t>(image.width), static_cast<std::uint64_t>(size.h),
+         static_cast<std::uint64_t>(size.w)});
     add_budget(stats, out.item);
     enforce_budget(stats, options);
-    image = resize_bicubic(image, size);
+    image = original ? pad_image(image, size) : resize_bicubic(image, size);
     out.patches.reserve(static_cast<std::size_t>(gh) * gw * kPatchFeatures);
     const std::vector<const media::decode::Image*> frames{&image, &image};
     for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
@@ -283,6 +328,15 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
     Prepared out;
     out.item.modality = Modality::Video;
     out.item.grid     = {gt, gh, gw};
+    out.item.preprocessing_digest = preprocessing_digest(
+        "video_smartresize_bicubic_antialias_uniform",
+        {options.video_min_pixels, options.video_max_pixels,
+         std::bit_cast<std::uint64_t>(options.video_fps),
+         static_cast<std::uint64_t>(options.video_min_frames),
+         static_cast<std::uint64_t>(options.video_max_frames),
+         static_cast<std::uint64_t>(video.height), static_cast<std::uint64_t>(video.width),
+         static_cast<std::uint64_t>(size.h), static_cast<std::uint64_t>(size.w),
+         static_cast<std::uint64_t>(video.frames.size())});
     add_budget(stats, out.item);
     enforce_budget(stats, options);
     for (media::decode::Image& frame : video.frames) { frame = resize_bicubic(frame, size); }
@@ -513,6 +567,46 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     }
 }
 
+media::decode::Policy decode_policy(const ProcessorOptions& options) {
+    return {.max_bytes                  = options.max_media_bytes,
+            .max_decoded_pixels         = options.max_decoded_pixels,
+            .max_decoded_video_pixels   = options.max_decoded_video_pixels,
+            .max_video_source_frames    = options.max_video_source_frames,
+            .max_video_duration_seconds = options.max_video_duration_seconds};
+}
+
+void append_media(ProcessedInput& output, Prepared media, std::span<const std::uint8_t> bytes) {
+    media.item.content_digest = sha256(bytes);
+    if (media.patches.size() % kPatchFeatures != 0) {
+        throw std::logic_error("preprocessed patch buffer is not row aligned");
+    }
+    media.item.patch_begin = output.patches.size() / kPatchFeatures;
+    media.item.patch_count = media.patches.size() / kPatchFeatures;
+    output.patches.insert(output.patches.end(), std::make_move_iterator(media.patches.begin()),
+                          std::make_move_iterator(media.patches.end()));
+    output.vision_items.push_back(std::move(media.item));
+}
+
+void finish_processed(ProcessedInput& output, PreprocessStats stats,
+                      const ProcessorOptions& options) {
+    if (output.patches.size() / kPatchFeatures != stats.raw_patches) {
+        throw std::logic_error("preprocessed patch count does not match processor budget");
+    }
+    output.token_types.resize(output.input_ids.size(), 0);
+    for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
+        if (output.input_ids[i] == kImageToken) {
+            output.token_types[i] = static_cast<std::uint8_t>(Modality::Image);
+        } else if (output.input_ids[i] == kVideoToken) {
+            output.token_types[i] = static_cast<std::uint8_t>(Modality::Video);
+        }
+    }
+    stats.prompt_tokens = output.input_ids.size();
+    enforce_budget(stats, options);
+    stats.patch_bytes = output.patches.size() * sizeof(float);
+    output.stats      = stats;
+    assign_positions(output);
+}
+
 } // namespace
 
 std::string PreprocessStats::summary() const {
@@ -635,23 +729,17 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
                              "media item count exceeds processor budget");
     }
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
-    const media::decode::Policy policy{
-        .max_bytes                  = options_.max_media_bytes,
-        .max_decoded_pixels         = options_.max_decoded_pixels,
-        .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
-        .max_video_source_frames    = options_.max_video_source_frames,
-        .max_video_duration_seconds = options_.max_video_duration_seconds,
-    };
+    const media::decode::Policy policy = decode_policy(options_);
     ProcessedInput output;
-    std::vector<VisionItem> items;
-    items.reserve(parts.size());
+    output.vision_items.reserve(parts.size());
     PreprocessStats stats;
     stats.media_items = parts.size();
     for (const ChatPart* part : parts) {
         Prepared media;
         try {
             media = part->kind == ChatPartKind::Image
-                        ? prepare_image(*part, options_, policy, stats)
+                        ? prepare_image(media::decode::decode_image(part->media.bytes, policy),
+                                        ImageDetail::High, options_, stats)
                         : prepare_video(*part, options_, policy, stats);
         } catch (const media::decode::Error& error) {
             if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
@@ -659,42 +747,109 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
             }
             throw;
         }
-        media.item.content_digest = sha256(part->media.bytes);
-        if (media.patches.size() % kPatchFeatures != 0) {
-            throw std::logic_error("preprocessed patch buffer is not row aligned");
-        }
-        media.item.patch_begin = output.patches.size() / kPatchFeatures;
-        media.item.patch_count = media.patches.size() / kPatchFeatures;
-        output.patches.insert(output.patches.end(), std::make_move_iterator(media.patches.begin()),
-                              std::make_move_iterator(media.patches.end()));
-        items.push_back(std::move(media.item));
-    }
-    if (output.patches.size() / kPatchFeatures != stats.raw_patches) {
-        throw std::logic_error("preprocessed patch count does not match processor budget");
+        append_media(output, std::move(media), part->media.bytes);
     }
 
-    rendered                     = expand_placeholders(std::move(rendered), items);
+    rendered                     = expand_placeholders(std::move(rendered), output.vision_items);
     EncodedChat encoded          = encode_rendered_chat(tokenizer_, rendered);
     output.input_ids             = std::move(encoded.input_ids);
     output.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
     output.user_turn_boundary    = encoded.user_turn_boundary;
     output.boundaries            = std::move(encoded.boundaries);
-    output.token_types.resize(output.input_ids.size(), 0);
-    for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
-        if (output.input_ids[i] == kImageToken) {
-            output.token_types[i] = static_cast<std::uint8_t>(Modality::Image);
-        } else if (output.input_ids[i] == kVideoToken) {
-            output.token_types[i] = static_cast<std::uint8_t>(Modality::Video);
-        }
-    }
-    stats.prompt_tokens = output.input_ids.size();
-    enforce_budget(stats, options_);
-
-    output.vision_items = std::move(items);
-    stats.patch_bytes   = output.patches.size() * sizeof(float);
-    output.stats        = stats;
-    assign_positions(output);
+    finish_processed(output, stats, options_);
     return output;
+}
+
+ProcessedDecisionState process_decision_state(const Tokenizer& tokenizer, TokenId state_token,
+                                              const DecisionInput& input,
+                                              const ProcessorOptions& options) {
+    ProcessedDecisionState result;
+    ProcessedInput& output = result.input;
+    PreprocessStats stats;
+    for (const DecisionPart& part : input.state) {
+        if (part.kind == DecisionPartKind::Image) { ++stats.media_items; }
+    }
+    enforce_budget(stats, options);
+    if (stats.media_items != 0) { validate_special_token(tokenizer, kImagePad, kImageToken); }
+    output.input_ids.push_back(state_token);
+    output.vision_items.reserve(stats.media_items);
+    const auto flush_text = [&](std::string& text) {
+        const std::vector<int> ids = tokenizer.encode(escape_decision_text(text));
+        output.input_ids.insert(output.input_ids.end(), ids.begin(), ids.end());
+        text.clear();
+    };
+    const media::decode::Policy policy = decode_policy(options);
+    std::string text;
+    for (const DecisionPart& part : input.state) {
+        if (part.kind == DecisionPartKind::Text) {
+            text += part.text;
+            continue;
+        }
+        flush_text(text);
+        const std::size_t image_index = output.vision_items.size();
+        if (part.image.kind != MediaKind::Image || part.image.media_type.starts_with("video/")) {
+            throw DecisionMediaError(image_index, DecisionMediaErrorKind::InvalidMedia,
+                                     "decision state supports images, not video");
+        }
+        switch (part.detail) {
+        case ImageDetail::Auto:
+        case ImageDetail::Low:
+        case ImageDetail::High:
+        case ImageDetail::Original:
+            break;
+        default:
+            throw DecisionMediaError(image_index, DecisionMediaErrorKind::InvalidMedia,
+                                     "unsupported decision image detail");
+        }
+        media::decode::Image decoded;
+        try {
+            decoded = media::decode::decode_image(part.image.bytes, policy);
+        } catch (const media::decode::Error& error) {
+            if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
+                throw DecisionMediaError(image_index, DecisionMediaErrorKind::BudgetExceeded,
+                                         error.what());
+            }
+            throw;
+        } catch (const std::invalid_argument& error) {
+            throw DecisionMediaError(image_index, DecisionMediaErrorKind::InvalidMedia,
+                                     error.what());
+        } catch (const std::runtime_error& error) {
+            throw DecisionMediaError(image_index, DecisionMediaErrorKind::InvalidMedia,
+                                     error.what());
+        }
+        Prepared media;
+        try {
+            media = prepare_image(std::move(decoded), part.detail, options, stats);
+        } catch (const ProcessorError& error) {
+            if (error.kind() == ProcessorErrorKind::BudgetExceeded) {
+                throw DecisionMediaError(image_index, DecisionMediaErrorKind::BudgetExceeded,
+                                         error.what());
+            }
+            throw;
+        } catch (const std::invalid_argument& error) {
+            throw DecisionMediaError(image_index, DecisionMediaErrorKind::InvalidMedia,
+                                     error.what());
+        }
+        output.input_ids.push_back(tokenizer.token_id(kVisionStart));
+        output.input_ids.insert(output.input_ids.end(),
+                                static_cast<std::size_t>(media.item.grid.h / kMerge) *
+                                    (media.item.grid.w / kMerge),
+                                kImageToken);
+        output.input_ids.push_back(tokenizer.token_id(kVisionEnd));
+        append_media(output, std::move(media), part.image.bytes);
+    }
+    flush_text(text);
+    if (output.input_ids.size() > kDecisionMaxStateTokens) {
+        if (stats.media_items != 0 || input.overflow == DecisionStateOverflow::Reject) {
+            throw DecisionInputError("state too long: " + std::to_string(output.input_ids.size()) +
+                                     " tokens (state limit " +
+                                     std::to_string(kDecisionMaxStateTokens) + ")");
+        }
+        output.input_ids.resize(kDecisionMaxStateTokens);
+        result.truncated = true;
+    }
+    finish_processed(output, stats, options);
+    return result;
 }
 
 } // namespace ninfer::targets::qwen3_8::frontend_internal

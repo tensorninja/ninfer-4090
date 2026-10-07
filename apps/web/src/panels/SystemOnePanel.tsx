@@ -20,7 +20,8 @@ function detail(record: DecisionDoneRecord): string {
     request.model === request.adapter
       ? `${request.adapter} · request ${request.request_id}`
       : `${request.model} → ${request.adapter} · request ${request.request_id}`,
-    `x-typesafe-request-id ${request.x_request_id}`,
+    `${request.protocol === 'openai_decisions' ? 'x-request-id' : 'x-typesafe-request-id'} ${request.x_request_id}`,
+    `${count(request.images ?? 0)} images · ${count(request.vision_tokens ?? 0)} vision tokens · ${seconds(timings.vision ?? 0)} image encoding (within state)`,
     `${request.questions} questions · ${request.options} options · longest branch ${count(
       request.longest_branch,
     )} tokens`,
@@ -110,6 +111,8 @@ export function SystemOnePanel({
       <div className="stat-row">
         <Stat value={count(summary.count)} label="decisions" hint="systemOne" />
         <Stat value={count(summary.questions)} label="questions" />
+        <Stat value={count(summary.images)} label="images" />
+        <Stat value={count(summary.visionTokens)} label="vision tokens" />
         <Stat
           value={seconds(summary.latency.p50)}
           label="latency p50"
@@ -137,7 +140,7 @@ export function SystemOnePanel({
       </div>
 
       {summary.count === 0 ? (
-        <Empty>no decisions yet — POST /typesafe/v1/systemone</Empty>
+        <Empty>no decisions yet — POST /typesafe/v1/systemone or /v1/decisions</Empty>
       ) : (
         <>
           <div className="latency__split">
@@ -185,6 +188,7 @@ export function SystemOnePanel({
                 <th>model</th>
                 <th className="numeric">q · opt</th>
                 <th className="numeric">state</th>
+                <th className="numeric">img · vision</th>
                 <th className="numeric">
                   <Term k="stateReuse">reused</Term>
                 </th>
@@ -222,6 +226,9 @@ export function SystemOnePanel({
                       {request.questions} · {request.options}
                     </td>
                     <td className="numeric emphasis">{count(request.state_tokens)}</td>
+                    <td className="numeric">
+                      {count(request.images ?? 0)} · {count(request.vision_tokens ?? 0)}
+                    </td>
                     <td className="numeric">
                       {request.state_tokens === 0
                         ? '—'

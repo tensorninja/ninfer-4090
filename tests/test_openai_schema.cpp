@@ -876,7 +876,7 @@ int test_models_and_error() {
         {"qwen3.8-27b", 262144, true},
         {"qwen3.8-27b-qlora-math", 262144, true},
         {"qwen3.8-27b-qlora-sql", 262144, true},
-        {"decider", 73728, false, true, 65536},
+        {"decider", 73728, true, true, 65536},
     }};
     const Json with_adapters = Json::parse(make_models_list(models, 1));
     failures += check(with_adapters.at("data").size() == 4, "adapter models list size");
@@ -894,10 +894,17 @@ int test_models_and_error() {
                       "decision adapters advertise their endpoint and pool name");
     failures +=
         check(decision.at("context_window") == 73728 && decision.at("max_state_tokens") == 65536 &&
-                  decision.at("modalities").at("vision") == false,
-              "decision adapters advertise their own text context limits");
+                  decision.at("modalities").at("vision") == true,
+              "decision adapters advertise image support and their own context limits");
     failures += check(Json::parse(make_model_object(models.back(), 1)) == decision,
                       "decision model detail agrees with discovery");
+    OpenAIModel no_vision_decision = models.back();
+    no_vision_decision.vision      = false;
+    const Json no_vision_card      = Json::parse(make_model_object(no_vision_decision, 1));
+    failures +=
+        check(no_vision_card.at("modalities").at("vision") == false &&
+                  no_vision_card.at("supported_endpoints") == Json::array({"/v1/decisions"}),
+              "vision-disabled decisions retain text-only discovery");
     failures +=
         check(!with_adapters.at("data").at(0).contains("max_state_tokens") &&
                   with_adapters.at("data").at(0).at("supported_endpoints") ==

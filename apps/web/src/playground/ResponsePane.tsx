@@ -255,6 +255,11 @@ function CodeView({ body }: { body: RequestBody | null }) {
   const origin = window.location.origin
   return (
     <div className="pg-code">
+      <CodeBlock
+        title="Request JSON"
+        sub="the exact submitted body, including every image"
+        text={body.text}
+      />
       <CodeBlock title="curl" sub="the current request" text={curlSnippet(origin, body)} />
       <CodeBlock
         title="Python"

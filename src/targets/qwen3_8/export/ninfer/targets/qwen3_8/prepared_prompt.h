@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_8/frontend.h>
+#include <ninfer/types.h>
 
 #include <array>
 #include <cstddef>
@@ -10,6 +10,8 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_8 {
+
+class PreparedPrompt;
 
 enum class PromptModality : std::uint8_t {
     Image = 1,
@@ -35,6 +37,7 @@ struct VisionItem {
     // SHA-256 of the owned encoded media bytes. Grid/modality/span identity is carried
     // separately so this digest binds the content without retaining the request payload.
     std::array<std::uint8_t, 32> content_digest{};
+    std::array<std::uint8_t, 32> preprocessing_digest{};
     std::vector<double> timestamps;
     std::vector<TokenSpan> token_spans;
 };

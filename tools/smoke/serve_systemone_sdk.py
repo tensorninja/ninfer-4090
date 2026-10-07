@@ -1,7 +1,7 @@
 """Run TypeSafe and optional OpenAI Python SDKs against one real ninfer-serve process.
 
-The server is started once with a LoRA pool holding a decision adapter (and, optionally, a
-generative one). The wire contract the SDK does not exercise is checked over raw HTTP, and a greedy
+The server is started with and without Vision using a LoRA pool holding a decision adapter (and an
+optional generative one). The wire contract the SDK does not exercise is checked over raw HTTP, and a greedy
 chat reply (through the generative adapter when one is given) must stay bit-identical while
 decisions run beside it. Then this file re-runs itself under each `--sdk-python` interpreter (a
 virtual environment with one `typesafe-sdk` version installed) and drives the SDK's own client against
@@ -15,10 +15,12 @@ probability parity and strict overflow rejection. Use Python 3.11 environments; 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -242,7 +245,7 @@ def check_openai_answer(body: dict[str, Any], adapter: str,
             and usage["output_tokens_details"] == {"reasoning_tokens": 0}, f"usage details: {usage!r}")
 
 
-def check_openai_wire(base_url: str, adapter: str, model_id: str) -> dict[str, Any]:
+def check_openai_wire(base_url: str, adapter: str, model_id: str, vision: bool) -> dict[str, Any]:
     path = "/v1/decisions"
     questions = openai_questions()
     payload = {"model": adapter, "input": STATE, "questions": questions}
@@ -252,7 +255,7 @@ def check_openai_wire(base_url: str, adapter: str, model_id: str) -> dict[str, A
     status, _, card = http(base_url, "GET", f"/v1/models/{urllib.parse.quote(adapter, safe='')}",
                            headers=authorized())
     require(status == 200 and card["object"] == "model" and card["id"] == adapter
-            and card["supported_endpoints"] == [path] and card["modalities"]["vision"] is False
+            and card["supported_endpoints"] == [path] and card["modalities"]["vision"] is vision
             and card["context_window"] == min(73728, typesafe_card["max_context"])
             and card["max_state_tokens"] == min(65536, typesafe_card["max_context"]),
             f"OpenAI decision model card: {status} {card!r}")
@@ -333,12 +336,6 @@ def check_openai_wire(base_url: str, adapter: str, model_id: str) -> dict[str, A
         require(status == 400 and set(error) == {"error"}
                 and set(error["error"]) == {"message", "type", "param", "code"},
                 f"{name}: {status} {error!r}")
-    image = [{"role": "user", "content": [
-        {"type": "input_text", "text": STATE},
-        {"type": "input_image", "image_url": "data:image/png;base64,AA=="}]}]
-    status, _, error = http(base_url, "POST", path, {**payload, "input": image}, authorized())
-    require(status == 400 and error["error"]["code"] == "unsupported_modality",
-            f"an image was not explicitly rejected: {status} {error!r}")
     for model in ("no-such-model", "gpt-6-luna", DEFAULT_MODEL, model_id):
         status, _, error = http(base_url, "POST", path, {**payload, "model": model}, authorized())
         require(status == 404 and "error" in error, f"invalid decision model {model}: {status} {error!r}")
@@ -346,6 +343,155 @@ def check_openai_wire(base_url: str, adapter: str, model_id: str) -> dict[str, A
     require(status == 401 and "error" in error, f"unauthenticated decision: {status} {error!r}")
     return {"wire": "ok", "model": card, "parity_max_abs_delta": max(deltas),
             "parity_tolerance": tolerance, "usage": baseline["usage"]}
+
+
+def image_data_url(width: int = 64, height: int = 64) -> str:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data)))
+
+    compressor = zlib.compressobj()
+    row = b"\x00" + b"\xe0\x20\x20" * width
+    compressed = b"".join(compressor.compress(row) for _ in range(height)) + compressor.flush()
+    data = (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", compressed)
+            + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+
+def image_input(source: str | None = None, detail: str | None = None) -> list[dict[str, Any]]:
+    return [{"role": "user", "content": [
+        {"type": "input_text", "text": "Inspect the image.\n"},
+        {"type": "input_image", "image_url": source or image_data_url(), "detail": detail},
+        {"type": "input_text", "text": "\nUse the image as evidence."}]}]
+
+
+def check_images(base_url: str, adapter: str, vision: bool, log_path: Path) -> dict[str, Any]:
+    questions = [{"type": "predicate", "instructions": "Is the image mostly red?"}]
+    payload = {"model": adapter, "questions": questions, "input": image_input()}
+    invalid_source = "data:image/png;base64,AA=="
+    status, _, error = http(base_url, "POST", "/v1/decisions",
+                            {**payload, "input": image_input(invalid_source)}, authorized())
+    require(status == 400 and error["error"]["code"] == ("invalid_media" if vision else "vision_disabled"),
+            f"native image decode/disabled gate: {status} {error!r}")
+    require(error["error"]["param"] == ("input[0].content[1].image_url" if vision else "input"),
+            f"image error parameter: {error!r}")
+    records = []
+    for detail in (None, "auto", "low", "high", "original"):
+        status, headers, body = http(base_url, "POST", "/v1/decisions",
+                                     {**payload, "input": image_input(detail=detail)}, authorized())
+        if not vision:
+            require(status == 400 and body["error"]["code"] == "vision_disabled",
+                    f"vision-disabled image: {status} {body!r}")
+            continue
+        require(status == 200, f"image detail={detail}: {status} {body!r}")
+        check_openai_answer(body, adapter, questions)
+        records.append((headers["x-request-id"], body["usage"]["input_tokens"]))
+    too_many = [{"role": "user", "content": [image_input()[0]["content"][1]] * 129}]
+    status, _, error = http(base_url, "POST", "/v1/decisions",
+                            {**payload, "input": too_many}, authorized())
+    require(status == 400 and error["error"]["param"] == "input[0].content[128]",
+            f"129 image source limit: {status} {error!r}")
+    for source in ("https://invalid.example/image.png", "file:///not-read.png",
+                   "data:video/mp4;base64,AA=="):
+        status, _, error = http(base_url, "POST", "/v1/decisions",
+                                {**payload, "input": image_input(source)}, authorized())
+        require(status == 400 and error["error"]["code"] == "invalid_media"
+                and error["error"]["param"] == "input[0].content[1].image_url",
+                f"pure source validation: {status} {error!r}")
+    if vision:
+        status, _, error = http(base_url, "POST", "/v1/decisions",
+                                {**payload, "input": image_input(image_data_url(8193, 8193))}, authorized())
+        require(status == 413 and error["error"]["code"] == "media_budget_exceeded"
+                and error["error"]["param"] == "input[0].content[1].image_url",
+                f"native decoded image budget: {status} {error!r}")
+        mixed = image_input(detail="low")
+        mixed.append({"role": "user", "content": [
+            {"type": "input_text", "text": "Compare with this image."},
+            image_input(detail="high")[0]["content"][1]]})
+        status, headers, body = http(base_url, "POST", "/v1/decisions",
+                                     {**payload, "input": mixed}, authorized())
+        require(status == 200, f"ordered mixed-detail images: {status} {body!r}")
+        check_openai_answer(body, adapter, questions)
+        records.append((headers["x-request-id"], body["usage"]["input_tokens"]))
+        mixed[0]["content"].insert(0, {"type": "input_text", "text": " x" * 70000})
+        status, _, error = http(base_url, "POST", "/v1/decisions",
+                                {**payload, "input": mixed}, authorized())
+        require(status == 400 and error["error"]["code"] == "context_length_exceeded",
+                f"multimodal state must not truncate: {status} {error!r}")
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    for request_id, input_tokens in records:
+        event = next(item for item in events if item["event"] == "decision_done"
+                     and item["request"]["x_request_id"] == request_id)
+        request, timings = event["request"], event["timings_seconds"]
+        require(event["schema_version"] == 24 and request["images"] > 0
+                and request["vision_tokens"] > 0
+                and request["input_tokens"] == request["state_tokens"] + request["branch_tokens"] == input_tokens
+                and event["result"]["output_tokens"] == 0
+                and 0 <= timings["vision"] <= timings["state"], f"image request accounting: {event!r}")
+    require("data:image/" not in log_path.read_text(), "image payload leaked into request logs")
+    return {"vision": vision, "image_requests": len(records), "source_validation": "ok"}
+
+
+def check_image_admission(base_url: str, chat_model: str, adapter: str) -> dict[str, Any]:
+    status, _, telemetry = http(base_url, "GET", "/telemetry", headers=authorized())
+    require(status == 200, f"admission telemetry: {status}")
+    limits = telemetry["scheduler"]
+    count = limits["max_concurrency"] + limits["max_pending_requests"]
+    target = urllib.parse.urlparse(base_url)
+    sockets = []
+
+    def wait_for_occupancy(expected: int) -> None:
+        deadline = time.monotonic() + 15
+        while True:
+            status, _, telemetry = http(base_url, "GET", "/telemetry", headers=authorized())
+            require(status == 200, f"admission telemetry: {status}")
+            scheduler = telemetry["scheduler"]
+            if scheduler["running"] + scheduler["waiting"] == expected:
+                return
+            require(time.monotonic() < deadline, f"failed to fill bounded ingress: {scheduler!r}")
+            time.sleep(0.01)
+
+    try:
+        for index in range(count):
+            if index == count - 1:
+                wait_for_occupancy(count - 1)
+                path = "/v1/decisions"
+                request = {"model": adapter, "input": image_input(), "questions": openai_questions()}
+            else:
+                path = "/v1/chat/completions"
+                request = {"model": chat_model, "max_tokens": 2048, "stream": True,
+                           "messages": [{"role": "user", "content":
+                               f"Request {index}: write a long numbered list of 1000 distinct nouns."}]}
+            body = json.dumps(request).encode()
+            connection = socket.create_connection((target.hostname, target.port), timeout=10)
+            sockets.append(connection)
+            connection.sendall((f"POST {path} HTTP/1.1\r\nHost: {target.netloc}\r\n"
+                                f"Authorization: Bearer {API_KEY}\r\nContent-Type: application/json\r\n"
+                                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+        wait_for_occupancy(count)
+        payload = {"model": adapter, "input": image_input("data:image/png;base64,AA=="),
+                   "questions": openai_questions()}
+        status, _, body = http(base_url, "POST", "/v1/decisions", payload, authorized())
+        require(status == 429 and body["error"]["code"] == "server_overloaded",
+                f"image decoding occurred before bounded admission: {status} {body!r}")
+    finally:
+        for connection in sockets:
+            connection.close()
+    deadline = time.monotonic() + 40
+    while True:
+        status, _, telemetry = http(base_url, "GET", "/telemetry", headers=authorized())
+        scheduler = telemetry["scheduler"]
+        if scheduler["running"] + scheduler["waiting"] == 0:
+            break
+        require(time.monotonic() < deadline, f"disconnected admissions not released: {scheduler!r}")
+        time.sleep(0.05)
+    payload["input"] = image_input()
+    status, _, body = http(base_url, "POST", "/v1/decisions", payload, authorized())
+    require(status == 200, f"image request after cancellation: {status} {body!r}")
+    check_openai_answer(body, adapter, payload["questions"])
+    return {"capacity": count, "overload_before_decode": True, "recovery": "ok"}
 
 
 def check_chat_under_decisions(base_url: str, chat_model: str, adapter: str) -> dict[str, Any]:
@@ -520,7 +666,8 @@ def run_openai_sdk_client(base_url: str, adapter: str) -> dict[str, Any]:
         names = [model.id for model in client.models.list()]
         require(adapter in names and DEFAULT_MODEL not in names and "gpt-6-luna" not in names,
                 f"OpenAI SDK discovery: {names}")
-        require(client.models.retrieve(adapter).id == adapter, "OpenAI SDK model lookup failed")
+        card = client.models.retrieve(adapter)
+        require(card.id == adapter, "OpenAI SDK model lookup failed")
         questions = openai_questions()
         questions.append({"type": "choice", "instructions": "Choose the best label.",
                           "choices": [{"value": True}, {"value": "true"}]})
@@ -530,6 +677,16 @@ def run_openai_sdk_client(base_url: str, adapter: str) -> dict[str, Any]:
         require(type(result.answers[-1].probabilities[0].value) is bool
                 and type(result.answers[-1].probabilities[1].value) is str,
                 "OpenAI SDK lost boolean versus string choice values")
+        if card.model_dump()["modalities"]["vision"]:
+            image = client.decisions.create(model=adapter, input=image_input(detail="original"),
+                                            questions=questions)
+            check_openai_answer(image.model_dump(mode="json"), adapter, questions)
+        else:
+            try:
+                client.decisions.create(model=adapter, input=image_input(), questions=questions)
+                raise SmokeFailure("OpenAI SDK image request bypassed disabled vision")
+            except openai.BadRequestError as error:
+                require(error.code == "vision_disabled", f"OpenAI SDK disabled vision: {error}")
         try:
             client.decisions.create(model="no-such-model", input=STATE, questions=questions)
             raise SmokeFailure("OpenAI SDK answered an unknown model")
@@ -573,6 +730,7 @@ def main() -> None:
                         help="an extra ninfer-serve argument; repeatable")
     parser.add_argument("--startup-timeout", type=float, default=900.0)
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--vision-mode", choices=("off", "on", "both"), default="both")
     args = parser.parse_args()
     require(sys.version_info[:2] == (3, 11), "select a Python 3.11 interpreter for this smoke")
 
@@ -585,6 +743,8 @@ def main() -> None:
 
     if args.lora_dir is None or not args.sdk_python:
         parser.error("--lora-dir and at least one --sdk-python are required")
+    if any(argument.startswith("--vision") for argument in args.server_arg):
+        parser.error("use --vision-mode instead of vision flags in --server-arg")
     artifact = args.artifact.resolve()
     server_bin = args.server_bin.resolve()
     require(artifact.is_file(), f"artifact does not exist: {artifact}")
@@ -608,14 +768,16 @@ def main() -> None:
         "--lora-dir", str(args.lora_dir.resolve()),
         "--systemone-default", args.adapter,
         "--max-context", "4096", "--kv-capacity", "8192",
-        "--max-concurrency", "2", "--log-stats-interval-ms", "0",
+        "--max-concurrency", "2", "--max-pending-requests", "1", "--log-stats-interval-ms", "0",
         "--no-prefix-reuse",
         *args.server_arg,
     ]
-    with tempfile.TemporaryDirectory(prefix="ninfer-systemone-sdk-") as temporary:
-        server_log = Path(temporary) / "server.log"
+    def run_mode(vision: bool, temporary: str) -> dict[str, Any]:
+        server_log = Path(temporary) / f"server-vision-{vision}.log"
+        request_log = Path(temporary) / f"requests-vision-{vision}.jsonl"
+        launch = [*command, "--request-log-jsonl", str(request_log), *(["--vision"] if vision else [])]
         with server_log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True)
+            process = subprocess.Popen(launch, stdout=output, stderr=subprocess.STDOUT, text=True)
             try:
                 wait_for_server(base_url, process, args.startup_timeout)
                 status, _, body = http(base_url, "GET", "/v1/models", headers=authorized())
@@ -625,12 +787,15 @@ def main() -> None:
                               if args.generative_adapter else model_id)
                 report: dict[str, Any] = {
                     "wire": check_wire(base_url, args.adapter, args.generative_adapter, model_id),
-                    "openai_wire": check_openai_wire(base_url, args.adapter, model_id),
+                    "openai_wire": check_openai_wire(base_url, args.adapter, model_id, vision),
+                    "images": check_images(base_url, args.adapter, vision, request_log),
                     "chat_under_decisions": check_chat_under_decisions(base_url, chat_model,
                                                                        args.adapter),
                     "sdk": [],
                     "openai_sdk": None,
                 }
+                if vision:
+                    report["image_admission"] = check_image_admission(base_url, chat_model, args.adapter)
                 for interpreter, module, mode in interpreters:
                     completed = subprocess.run(
                         [str(interpreter), str(Path(__file__).resolve()), mode,
@@ -644,7 +809,7 @@ def main() -> None:
                         report["openai_sdk"] = result
                     else:
                         report["sdk"].append(result)
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return report
             except Exception as error:
                 output.flush()
                 tail = server_log.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
@@ -657,6 +822,11 @@ def main() -> None:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=30)
+
+    modes = (False, True) if args.vision_mode == "both" else (args.vision_mode == "on",)
+    with tempfile.TemporaryDirectory(prefix="ninfer-systemone-sdk-") as temporary:
+        reports = {"on" if vision else "off": run_mode(vision, temporary) for vision in modes}
+    print(json.dumps(reports, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -249,9 +249,9 @@ public:
     [[nodiscard]] RequestPlan<Variant> plan_decision_for_lane(std::uint32_t lane,
                                                               const DecisionPrompt& prompt,
                                                               const RequestBasePlan<Variant>& base);
-    [[nodiscard]] runtime::PrefillStepResult start_decision_lane(std::uint32_t lane,
-                                                                 DecisionPrompt&& prompt,
-                                                                 RequestPlan<Variant>&& plan);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_decision_lane(std::uint32_t lane, DecisionPrompt&& prompt, RequestPlan<Variant>&& plan,
+                        runtime::TransientRegion transient);
     [[nodiscard]] DecisionOutcome take_decision_lane(std::uint32_t lane);
     [[nodiscard]] bool retained_lane_holds_decision(std::uint32_t lane) const noexcept;
     // Continuation image kind `decision_state`: a retained decision state, its text KV and GDN

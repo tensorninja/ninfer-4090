@@ -10,9 +10,18 @@
 // after. Imperative DOM work (focus, selection, clipboard) stays in the components.
 
 import { useSyncExternalStore } from 'react'
+import { draftStorage, type DraftStorage } from './drafts'
 
 import { formatJson, lineCol, tryParse, type JsonNode, type ObjectNode } from './json'
-import { fetchCatalog, type Catalog } from './models'
+import { cardFor, fetchCatalog, type Catalog } from './models'
+import {
+  fileDataUrl,
+  inputImages,
+  insertImages,
+  MAX_IMAGES,
+  setImageDetail,
+  type ImageDetail,
+} from './images'
 import { PRESETS, presetsFor, type Preset } from './presets'
 import {
   editorFromSnap,
@@ -38,7 +47,7 @@ import {
   type Snap,
   type StateMode,
 } from './request'
-import { readShareHash, shareUrl, type SharedRequest } from './share'
+import { readRequest, readShareHash, shareUrl, type SharedRequest } from './share'
 import { endpointFor } from './snippets'
 import { analyze, type Analysis } from './validate'
 import { requestId } from './engine'
@@ -111,6 +120,7 @@ export interface CompletedRun {
 
 export interface PlaygroundSnapshot {
   booted: boolean
+  persistenceError: string | null
   editor: EditorState
   analysis: Analysis
   base: Base | null
@@ -134,7 +144,6 @@ export interface PlaygroundSnapshot {
   announcement: { text: string; seq: number }
 }
 
-const DRAFT_KEY = 'ninfer.playground.draft'
 const UI_KEY = 'ninfer.playground.ui'
 
 const storage = {
@@ -205,10 +214,13 @@ export class PlaygroundStore {
   private readonly catalogs = new Map<Protocol, Promise<Catalog>>()
   private saveTimer: ReturnType<typeof setTimeout> | undefined
   private toastSeq = 0
+  private booting: Promise<void> | undefined
+  private saving = Promise.resolve()
+  private draftsReadable = true
   /** The body canon an Undo toast was offered for; an edit past it withdraws the offer. */
   private undoCanon: string | null = null
 
-  constructor() {
+  constructor(private readonly persistence: DraftStorage = draftStorage) {
     const ui = readUi()
     const editor = editorFromSnap({
       protocol: 'typesafe',
@@ -221,6 +233,7 @@ export class PlaygroundStore {
     const analysis = analyze(editor, null)
     this.state = {
       booted: false,
+      persistenceError: null,
       editor,
       analysis,
       base: null,
@@ -257,14 +270,22 @@ export class PlaygroundStore {
    * `?preset=`, else the saved draft, else the example. `?model=` applies on top. The query is
    * then removed so a reload keeps later edits.
    */
-  boot() {
-    if (this.state.booted) return
-    this.set({ booted: true })
+  boot(): Promise<void> {
+    return (this.booting ??= this.loadDrafts())
+  }
+
+  private async loadDrafts() {
     const params = new URLSearchParams(window.location.search)
     const shared = readShareHash(window.location.hash)
     if (shared !== undefined) this.clearHash()
-    const saved = storage.get(DRAFT_KEY)
-    if (isRecord(saved) && saved.v === 2 && isRecord(saved.drafts)) {
+    let saved: unknown
+    try {
+      saved = await this.persistence.load()
+    } catch (error) {
+      this.draftsReadable = false
+      this.persistenceFailed('load', error)
+    }
+    if (isRecord(saved) && isRecord(saved.drafts)) {
       for (const protocol of ['typesafe', 'openai'] as const) {
         const draft = saved.drafts[protocol]
         if (!isRecord(draft) || !isSnap(draft.snap) || draft.snap.protocol !== protocol) continue
@@ -314,10 +335,15 @@ export class PlaygroundStore {
         window.location.pathname + (query ? `?${query}` : '') + window.location.hash,
       )
     }
+    this.set({ booted: true })
   }
 
   /** A share link pasted into the open playground. */
   readonly onHashChange = () => {
+    if (!this.state.booted) {
+      void this.boot().then(this.onHashChange)
+      return
+    }
     const shared = readShareHash(window.location.hash)
     if (shared === undefined) return
     this.clearHash()
@@ -446,6 +472,9 @@ export class PlaygroundStore {
       { stateMode, qMode },
       shared.protocol,
     )
+    snap.requestText = shared.text
+    snap.stateMode = 'json'
+    snap.qMode = 'json'
     this.rememberShared('shared', 'Shared request', snap)
     this.load('shared', 'Shared request', snap, withUndo)
   }
@@ -501,7 +530,9 @@ export class PlaygroundStore {
   private commit(editor: EditorState, extra: Partial<PlaygroundSnapshot> = {}) {
     const catalog = extra.catalog ?? this.state.catalog
     const names = catalog.state === 'ready' ? catalog.cards.map((c) => c.name) : null
-    const analysis = analyze(editor, names)
+    const vision =
+      catalog.state === 'ready' ? cardFor(catalog.cards, editor.model)?.vision : undefined
+    const analysis = analyze(editor, names, vision)
     const canon = analysis.body?.canon ?? ''
     const base = this.state.base
     const notes = { ...(extra.notes ?? this.state.notes) }
@@ -544,6 +575,43 @@ export class PlaygroundStore {
 
   setStateText(stateText: string) {
     this.edit({ stateText })
+  }
+
+  imageControlsEnabled(): boolean {
+    const { editor, catalog, pending } = this.state
+    return (
+      editor.protocol === 'openai' &&
+      !pending &&
+      !(
+        catalog.state === 'ready' &&
+        (!catalog.cards.length || cardFor(catalog.cards, editor.model)?.vision === false)
+      )
+    )
+  }
+
+  async addImageFiles(
+    files: readonly File[],
+    message: number,
+    position: number,
+    detail: ImageDetail,
+  ) {
+    if (!this.imageControlsEnabled())
+      throw new Error(
+        'Image insertion is unavailable for the current model or while a request is running.',
+      )
+    const editor = this.state.editor
+    if (inputImages(this.state.analysis.state.node).length + files.length > MAX_IMAGES)
+      throw new Error(`A decision can contain at most ${MAX_IMAGES} images.`)
+    const urls = []
+    for (const file of files) urls.push(await fileDataUrl(file))
+    if (this.state.editor !== editor || !this.imageControlsEnabled())
+      throw new Error('The request changed while reading images. Select the files again.')
+    this.setStateText(insertImages(editor.stateText, message, position, urls, detail))
+  }
+
+  setImageDetail(message: number, part: number, detail: ImageDetail) {
+    if (!this.imageControlsEnabled()) return
+    this.setStateText(setImageDetail(this.state.editor.stateText, message, part, detail))
   }
 
   setQText(qText: string) {
@@ -724,12 +792,44 @@ export class PlaygroundStore {
     return shareUrl(window.location.origin + window.location.pathname, body.text)
   }
 
+  exportRequest(): string {
+    const body = this.state.analysis.body
+    if (!body) throw new Error('Fix the JSON error before exporting a request.')
+    return body.text
+  }
+
+  importRequest(text: string) {
+    if (this.state.pending) throw new Error('Wait for the current run before importing a request.')
+    const request = readRequest(text)
+    if (!request)
+      throw new Error(
+        'Expected a native request object with input or state, questions, and a string model. Unsupported envelope fields are not discarded.',
+      )
+    this.loadShared(request, true)
+  }
+
   private saveDraft() {
     this.captureDraft()
-    storage.set(DRAFT_KEY, {
-      v: 2,
+    if (!this.draftsReadable) return this.saving
+    const saved = {
       protocol: this.state.editor.protocol,
       drafts: Object.fromEntries(this.drafts),
+    }
+    this.saving = this.saving.then(async () => {
+      try {
+        await this.persistence.save(saved)
+        this.set({ persistenceError: null })
+      } catch (error) {
+        this.persistenceFailed('save', error)
+      }
+    })
+    return this.saving
+  }
+
+  private persistenceFailed(action: string, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    this.set({
+      persistenceError: `Could not ${action} drafts: ${message}. Keep this page open and export your request before leaving.`,
     })
   }
 

@@ -1,7 +1,12 @@
 import { expect, test } from 'bun:test'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { EngineFacts } from '../playground/EngineFacts'
+import { SystemOnePanel } from '../panels/SystemOnePanel'
 
 import {
   adapterPool,
+  decisionPhases,
   percentile,
   summarizeByAdapter,
   summarizeChurn,
@@ -792,7 +797,7 @@ test('an empty decision window has no rates rather than zero ones', () => {
   expect(summary.count).toBe(0)
   expect(summary.latency.p50).toBe(0)
   expect(summary.stateReuse).toBe(0)
-  expect(summary.phaseShare).toEqual({ wait: 0, restore: 0, state: 0, branch: 0 })
+  expect(summary.phaseShare).toEqual({ wait: 0, restore: 0, state: 0, vision: 0, branch: 0 })
   expect(summary.stateTokensPerSecond).toBeNull()
   expect(summary.branchTokensPerSecond).toBeNull()
 })
@@ -921,4 +926,86 @@ test('schema-23 OpenAI and older TypeSafe records share the line reader and deci
     'decision_error',
   )
   expect(parseRecordLine('{"event":"decision_progress"}')).toBeNull()
+})
+
+test('schema-24 image decision timing splits vision out of state without double counting or inflating rates', () => {
+  const record: DecisionDoneRecord = {
+    ...DECISIONS[0]!,
+    schema_version: 24,
+    request: {
+      ...DECISIONS[0]!.request,
+      images: 2,
+      vision_tokens: 512,
+      state_tokens: 2000,
+      input_tokens: 2300,
+      state_truncated: false,
+    },
+    result: { ...DECISIONS[0]!.result, computed_state_tokens: 2000 },
+    timings_seconds: {
+      prepare: 0.1,
+      queue: 0.3,
+      restore: 0.1,
+      state: 2,
+      vision: 0.5,
+      branch: 0.4,
+      execution: 2.4,
+      total: 2.8,
+    },
+  }
+  expect(parseRecordLine(JSON.stringify(record))).toEqual(record)
+  expect(decisionPhases(record)).toEqual({
+    wait: 0.3 - 0.1,
+    restore: 0.1,
+    state: 1.5,
+    vision: 0.5,
+    branch: 0.4,
+  })
+  const summary = summarizeDecisions([record])
+  expect(summary.images).toBe(2)
+  expect(summary.visionTokens).toBe(512)
+  expect(summary.phaseShare.vision).toBeCloseTo(0.5 / 2.7)
+  expect(summary.phaseShare.state).toBeCloseTo(1.5 / 2.7)
+  expect(Object.values(summary.phaseShare).reduce((total, value) => total + value, 0)).toBeCloseTo(
+    1,
+  )
+  expect(summary.stateTokensPerSecond).toBe(1000)
+  const facts = renderToStaticMarkup(
+    createElement(EngineFacts, { facts: { kind: 'done', record }, onGoLive: () => {} }),
+  )
+  expect(facts).toContain('2 images')
+  expect(facts).toContain('512')
+  expect(facts).toContain('vision tokens')
+  expect(facts).toContain('vision 0.50s')
+  const panel = renderToStaticMarkup(
+    createElement(SystemOnePanel, {
+      decisions: [record],
+      summary,
+      active: [],
+      errors: [],
+      pool: [],
+      surface: undefined,
+      replay: true,
+    }),
+  )
+  expect(panel).toContain('img · vision')
+  expect(panel).toContain('vision tokens')
+  const text = {
+    ...record,
+    request: { ...record.request, images: 0, vision_tokens: 0 },
+    timings_seconds: { ...record.timings_seconds, vision: 0 },
+  }
+  expect(parseRecordLine(JSON.stringify(text))).toEqual(text)
+  expect(summarizeDecisions([text]).visionTokens).toBe(0)
+  expect(summarizeDecisions([DECISIONS[0]!]).images).toBe(0)
+  for (const malformed of [
+    { ...record, request: { ...record.request, images: undefined } },
+    { ...record, request: { ...record.request, vision_tokens: undefined } },
+    { ...record, request: { ...record.request, images: 0 } },
+    { ...record, request: { ...record.request, protocol: 'systemone' } },
+    { ...record, timings_seconds: { ...record.timings_seconds, vision: undefined } },
+    { ...record, timings_seconds: { ...record.timings_seconds, vision: 3 } },
+  ])
+    expect(parseRecordLine(JSON.stringify(malformed))).toBeNull()
+  const reused = { ...record, timings_seconds: { ...record.timings_seconds, state: 0, vision: 0 } }
+  expect(parseRecordLine(JSON.stringify(reused))).toEqual(reused)
 })

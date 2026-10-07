@@ -9,6 +9,16 @@
 namespace ninfer::serve {
 namespace {
 
+[[noreturn]] void throw_media_error(const DecisionMediaError& exception,
+                                    const std::vector<std::string>& params) {
+    const bool budget = exception.kind() == DecisionMediaErrorKind::BudgetExceeded;
+    throw ApiException({.status  = budget ? 413 : 400,
+                        .type    = "invalid_request_error",
+                        .message = exception.what(),
+                        .param   = params.at(exception.image_index()),
+                        .code    = budget ? "media_budget_exceeded" : "invalid_media"});
+}
+
 [[noreturn]] void throw_input_error(const DecisionInputError& exception) {
     throw ApiException({.status  = 400,
                         .type    = "invalid_request_error",
@@ -65,7 +75,8 @@ OpenAIDecisionsService::OpenAIDecisionsService(GenerationService& generation,
                                                const DecisionModels& models)
     : generation_(generation), models_(models) {}
 
-PreparedOpenAIDecision OpenAIDecisionsService::prepare(std::string_view body) const {
+PreparedOpenAIDecision OpenAIDecisionsService::prepare(std::string_view body,
+                                                       std::function<bool()> is_cancelled) const {
     namespace oa        = product::openai_decisions;
     const auto received = std::chrono::steady_clock::now();
     oa::Request request;
@@ -89,11 +100,16 @@ PreparedOpenAIDecision OpenAIDecisionsService::prepare(std::string_view body) co
     PreparedOpenAIDecision prepared;
     prepared.model     = adapter->name;
     prepared.questions = std::move(request.questions);
+    for (const auto& part : request.input.state) {
+        if (part.kind == DecisionPartKind::Image) { prepared.image_params.push_back(part.param); }
+    }
     const double parse_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count();
     try {
         prepared.decision = generation_.prepare_decision(std::move(request.input), adapter->name,
-                                                         DecisionOverflowPolicy::Reject);
+                                                         std::move(is_cancelled));
+    } catch (const DecisionMediaError& error) {
+        throw_media_error(error, prepared.image_params);
     } catch (const DecisionInputError& error) {
         throw_input_error(error);
     } catch (const RequestError& error) { throw_engine_error(error); }
@@ -106,6 +122,8 @@ OpenAIDecisionOutcome OpenAIDecisionsService::run(PreparedOpenAIDecision& prepar
     OpenAIDecisionOutcome outcome;
     try {
         outcome.result = generation_.decide(prepared.decision, std::move(is_cancelled));
+    } catch (const DecisionMediaError& error) {
+        throw_media_error(error, prepared.image_params);
     } catch (const DecisionInputError& error) {
         throw_input_error(error);
     } catch (const RequestError& error) { throw_engine_error(error); }

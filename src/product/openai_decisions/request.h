@@ -1,10 +1,13 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "product/media_acquire/source.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,9 +25,23 @@ struct QuestionMeta {
     std::vector<std::string> labels;
 };
 
+struct SourcePart {
+    DecisionPartKind kind = DecisionPartKind::Text;
+    std::string text;
+    media_acquire::Source image;
+    ImageDetail detail = ImageDetail::Auto;
+    std::string param;
+};
+
+struct Input {
+    std::vector<SourcePart> state;
+    std::vector<DecisionQuestion> questions;
+    std::size_t images = 0;
+};
+
 struct Request {
     std::string model;
-    DecisionInput input;
+    Input input;
     std::vector<QuestionMeta> questions;
 };
 
@@ -45,5 +62,6 @@ private:
 };
 
 [[nodiscard]] Request parse_request(std::string_view body);
-
+[[nodiscard]] DecisionInput
+to_decision_input(Input input, const std::function<OwnedMedia(const SourcePart&)>& acquire);
 }

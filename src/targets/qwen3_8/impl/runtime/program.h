@@ -333,6 +333,9 @@ struct RequestControl {
     struct Decision {
         DecisionPrompt prompt;
         std::shared_ptr<const DecisionPlan> plan;
+        std::optional<VisionPrefillPlan> vision_plan;
+        std::unique_ptr<schedule::VisionPrefillSession> vision;
+        bool host_input_consumed_pending  = false;
         std::uint32_t reused_state_tokens = 0;
         std::uint32_t state_cursor        = 0;
         std::size_t next_pass             = 0;
@@ -370,9 +373,9 @@ public:
                                                      const runtime::ResolvedDecisionOptions& options);
     [[nodiscard]] RequestPlan plan_decision_for_lane(std::uint32_t lane, const DecisionPrompt& prompt,
                                                      const RequestBasePlan& base);
-    [[nodiscard]] runtime::PrefillStepResult start_decision_lane(std::uint32_t lane,
-                                                                 DecisionPrompt&& prompt,
-                                                                 RequestPlan&& plan);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_decision_lane(std::uint32_t lane, DecisionPrompt&& prompt, RequestPlan&& plan,
+                        runtime::TransientRegion transient);
     [[nodiscard]] DecisionOutcome take_decision_lane(std::uint32_t lane);
     [[nodiscard]] bool retained_lane_holds_decision(std::uint32_t lane) const noexcept {
         return lane < max_concurrency && sequences[lane].retained &&

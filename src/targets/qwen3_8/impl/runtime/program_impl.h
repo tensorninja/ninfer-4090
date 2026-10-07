@@ -2965,7 +2965,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
             dflash_host_ingress,
-            lora_slot(sequence.adapter)};
+            lora_slot(sequence.adapter),
+            qwen3_8::TextPhase::Prefill,
+            sequence.rope_delta};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -3012,11 +3014,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 image::next_prefill_checkpoint(staged.cursor, staged.capture_frontiers,
                                                staged.turn_checkpoint_capture_frontier,
                                                staged.user_turn_capture_frontier);
-            if (staged.vision) {
-                mark_workspace_usage(workspace_plan.vision_encode);
-                result = schedule::prefill_multimodal_chunk(
-                    schedule_state, staged.prompt, *staged.vision, nominal,
-                    capture_frontier, final_candidate);
+            if (staged.prompt.has_media()) {
+                if (staged.vision) { mark_workspace_usage(workspace_plan.vision_encode); }
+                result = schedule::prefill_multimodal_chunk(schedule_state, staged.prompt,
+                                                            staged.vision.get(), nominal,
+                                                            capture_frontier, final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,

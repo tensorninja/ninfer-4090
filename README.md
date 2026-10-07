@@ -131,9 +131,12 @@ print(result.answers[0].probability)
 ```
 
 Use OpenAI Python SDK **3.26.0 or newer**. `/v1/models` lists decision adapters by their actual
-pool names with `supported_endpoints: ["/v1/decisions"]`, `modalities.vision: false`, and their
-decision context limit. They cannot generate chat. There is no `gpt-6-luna` alias: this is
-text-only wire compatibility, not Luna output, image, or refusal-policy parity.
+pool names with `supported_endpoints: ["/v1/decisions"]`, startup-dependent `modalities.vision`, and
+their decision context limit. With `--vision`, the OpenAI endpoint also accepts inline base64 images
+and text in one shared state, with `low`, `high`, `auto`, and `original` image detail
+([image decisions](docs/serving.md#decisions-image-input)). They cannot generate chat. There is no
+`gpt-6-luna` alias: wire compatibility does not promise Luna outputs, preprocessing, calibration,
+or refusal policy. TypeSafe's existing text-rendered state contract is unchanged.
 
 Or use the unchanged TypeSafe surface:
 
@@ -167,7 +170,10 @@ image name, as in the [quick start](#quick-start-linux) profiles.
 
 ### Limits
 
-- **Qualified on BF16 KV.** Decisions meet kev's per-question tolerance on `bf16` KV, the
+- **Text fidelity is not image-task qualification.** Enabling image input does not establish the
+  existing text-trained adapters' image accuracy or confidence calibration. Image decisions use
+  the same pointer head and six LoRA modules, not a separately trained Vision decision model.
+- **Qualified on BF16 KV.** Text decisions meet kev's per-question tolerance on `bf16` KV, the
   configuration they are qualified on, and on `int8`. The rotated codecs, including the 262K
   `rk4v4` profile, keep task-level quality but miss the probability bar on a few questions
   ([System One fidelity](docs/serving.md#system-one-fidelity)).
@@ -234,7 +240,7 @@ being waited on.
 
 The work specific to this branch, each with the measurement that established it:
 
-- **One model, two systems.** One process answers text-only OpenAI Decisions under `/v1/decisions`
+- **One model, two systems.** One process answers OpenAI Decisions under `/v1/decisions`
   and TypeSafe's System One protocol (`noul`, `choice` and `score` questions over one state) under
   `/typesafe` beside OpenAI- and Anthropic-compatible
   chat, on one resident copy of the weights, one KV pool and one LoRA bank. A decision adapter — a
@@ -942,9 +948,10 @@ switch with the thinking mode.
 
 OpenAI Chat Completions, OpenAI Responses with streaming and local continuation state, Anthropic
 Messages, prompt-rendered function tools with parsed tool calls, compatible-prefix reuse, and
-JSONL request logs — and, from the same process, text-only OpenAI Decisions under `/v1/decisions`
+JSONL request logs — and, from the same process, OpenAI Decisions under `/v1/decisions`
 (OpenAI Python SDK ≥3.26.0) and TypeSafe's System One decisions under `/typesafe` for the
-TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
+TypeSafe SDK 0.6 and 0.7. OpenAI decision images require `--vision`; TypeSafe remains unchanged.
+See [HTTP serving](docs/serving.md),
 [OpenAI Decisions](docs/serving.md#openai-decisions),
 [System One decisions](docs/serving.md#system-one-decisions) and [CLI usage](docs/cli.md).
 

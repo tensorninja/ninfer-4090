@@ -234,7 +234,8 @@ public:
     // same lane, KV and adapter-slot rules. `adapter_name` is echoed in the result.
     DecisionSubmission submit_decision(targets::qwen3_8::DecisionPrompt prompt,
                                        ResolvedDecisionOptions options, std::string adapter_name,
-                                       Clock::time_point pending_deadline = {}) {
+                                       Clock::time_point pending_deadline = {},
+                                       HostInputLease host_input          = {}) {
         const Clock::time_point submitted = Clock::now();
         pending_deadline                  = resolve_pending_deadline(submitted, pending_deadline);
         const std::uint64_t request_id    = claim_outstanding();
@@ -263,15 +264,15 @@ public:
                 std::ranges::none_of(state_continuation.candidates, [](const auto& item) {
                     return item.status == cache::CacheLookupStatus::Hit;
                 });
-            request = std::make_shared<Request>(
-                request_id,
-                DecisionWork{.summary       = prompt.summary,
-                             .prompt        = std::move(prompt),
-                             .options       = options,
-                             .adapter       = std::move(adapter_name),
-                             .state_alias   = std::move(state_alias),
-                             .publish_state = publish_state},
-                pending_deadline, submitted, std::move(state_continuation));
+            request = std::make_shared<Request>(request_id,
+                                                DecisionWork{.summary     = prompt.summary,
+                                                             .prompt      = std::move(prompt),
+                                                             .options     = options,
+                                                             .adapter     = std::move(adapter_name),
+                                                             .state_alias = std::move(state_alias),
+                                                             .publish_state = publish_state},
+                                                pending_deadline, submitted, std::move(host_input),
+                                                std::move(state_continuation));
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -1578,12 +1579,13 @@ private:
         // lane, and the cached image of exactly its state, looked up under `state_alias` and
         // carried as the stable candidate pool.
         Request(std::uint64_t request_identity, DecisionWork work, Clock::time_point limit,
-                Clock::time_point submit_time, CachedContinuation state_continuation)
-            : id(request_identity),
-              prompt_summary{.prompt_tokens = work.summary.input_tokens(), .has_media = false},
-              prepare_seconds(work.prompt.prepare_seconds), deadline(limit),
-              submitted(submit_time), stable_continuation(std::move(state_continuation)),
-              decision(std::move(work)) {
+                Clock::time_point submit_time, HostInputLease input_lease,
+                CachedContinuation state_continuation)
+            : id(request_identity), host_input(std::move(input_lease)),
+              prompt_summary{.prompt_tokens = work.summary.input_tokens(),
+                             .has_media     = work.prompt.state.has_media()},
+              prepare_seconds(work.prompt.prepare_seconds), deadline(limit), submitted(submit_time),
+              stable_continuation(std::move(state_continuation)), decision(std::move(work)) {
             options.execution.adapter            = decision->options.adapter;
             options.execution.allow_prefix_reuse = decision->options.allow_prefix_reuse;
             continuation.lookup_microseconds     = stable_continuation.lookup_microseconds;
@@ -1937,6 +1939,7 @@ private:
         release_stable_builders(request);
         release_planning_state(request);
         request->prompt = {};
+        if (request->decision) { request->decision->prompt = {}; }
         request->host_input.reset();
         {
             std::lock_guard lock(request->mutex);
@@ -2579,6 +2582,7 @@ private:
     void resolve_decision_step(const std::shared_ptr<Request>& request,
                                const PrefillStepResult& step, bool cancel_at_boundary) {
         if (!request->lane) { throw std::logic_error("decision step has no request lane"); }
+        if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         const std::uint32_t lane = *request->lane;
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         cumulative_stats_.decision_prefill_tokens += step.processed_prompt_tokens;
@@ -2587,16 +2591,15 @@ private:
         request->prefill_reused.store(step.summary.reused_prompt_tokens,
                                       std::memory_order_relaxed);
         consume_service_work(request, 1);
-        if (!step.complete) {
-            if (cancel_at_boundary) {
-                leave_prefill(lane);
-                instance_.program->abort_lane(lane);
-                lane_sessions_[lane].reset();
-                complete_cancelled(request);
-                remove_completed_slot(lane);
-            }
+        if (cancel_at_boundary) {
+            leave_prefill(lane);
+            instance_.program->abort_lane(lane);
+            lane_sessions_[lane].reset();
+            complete_cancelled(request);
+            remove_completed_slot(lane);
             return;
         }
+        if (!step.complete) { return; }
 
         leave_prefill(lane);
         request->begin = step.summary;
@@ -2618,17 +2621,17 @@ private:
         result.adapter           = work.adapter;
         result.slot              = static_cast<std::int32_t>(lane);
         const Clock::time_point admitted = request->admitted.value_or(request->submitted);
-        result.timings = DecisionTimings{
-            .prepare_seconds = request->prepare_seconds,
-            .queue_seconds   = std::chrono::duration<double>(admitted - request->submitted).count(),
-            .restore_seconds =
+        result.timings                   = DecisionTimings{
+                              .prepare_seconds = request->prepare_seconds,
+                              .queue_seconds   = std::chrono::duration<double>(admitted - request->submitted).count(),
+                              .restore_seconds =
                 static_cast<double>(request->continuation.restore_microseconds) / 1e6,
-            .state_seconds   = outcome.state_seconds,
-            .branch_seconds  = outcome.branch_seconds,
-            .execution_seconds = std::chrono::duration<double>(completed - admitted).count(),
-            .total_seconds =
-                request->prepare_seconds +
-                std::chrono::duration<double>(completed - request->submitted).count(),
+                              .state_seconds     = outcome.state_seconds,
+                              .vision_seconds    = outcome.vision_seconds,
+                              .branch_seconds    = outcome.branch_seconds,
+                              .execution_seconds = std::chrono::duration<double>(completed - admitted).count(),
+                              .total_seconds     = request->prepare_seconds +
+                             std::chrono::duration<double>(completed - request->submitted).count(),
         };
         lane_sessions_[lane].reset();
         if (instance_.program->has_retained_lane(lane)) {
@@ -3600,8 +3603,9 @@ private:
             const auto opening_watts      = sample_board_watts();
             const PrefillStepResult first =
                 request->decision
-                    ? instance_.program->start_decision_lane(
-                          lane, std::move(request->decision->prompt), std::move(selected_plan))
+                    ? instance_.program->start_decision_lane(lane,
+                                                             std::move(request->decision->prompt),
+                                                             std::move(selected_plan), transient)
                     : instance_.program->start_prefill_lane(lane, std::move(request->prompt),
                                                             std::move(selected_plan), transient);
             const auto unit_ended    = Clock::now();

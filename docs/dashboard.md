@@ -81,7 +81,8 @@ phases:
 - **wait** — queued for a lane in the bounded FIFO shared with chat, which is where the two systems
   contend;
 - **restore** — importing a cached state from L2 or L3;
-- **state** — prefilling the state tokens that no lane or tier already held;
+- **state** — computing the state tokens that no lane or tier already held, including any required
+  Vision encode;
 - **branches** — the branch passes, their readouts, and the pointer head.
 
 Latency is System One's own `latency_ms`, restore plus execution, which excludes the wait: it is
@@ -90,6 +91,11 @@ lists each decision's adapter, question and option counts, state size, reused sh
 branch tokens with a per-decision phase bar; hovering a timestamp shows the full record. The empty
 state distinguishes a pool with no decision adapter from one that has answered no decision yet, and
 a target that cannot answer decisions at all says so.
+
+Schema 24 adds decision image counts, merged visual-token counts and Vision time. Vision time is
+a subset of state time, not another charge to add to execution. Exact-state reuse reports zero
+Vision time even when the prepared input contains images. The input counts describe the request,
+not a count of images newly encoded. Neither the log nor the event stream contains image payloads.
 
 ## Adapter bank
 
@@ -303,19 +309,42 @@ instructions, an empty state, or a model the server does not list. F8 steps thro
 lists the keyboard shortcuts. Token budgets are left to the server.
 
 **OpenAI request.** Input and questions use native JSON editors, not the TypeSafe forms. Input is
-a quoted text string or an array of user messages with text content. Questions are an ordered array
+a quoted text string or an array of user messages with ordered text and inline image parts. Questions are an ordered array
 of `predicate`, `choice`, and `score` objects with required string instructions. The checks enforce
-1–200 questions, 2–255 string/boolean choices, and 2–10 score levels; unsupported fields and images
-are errors. Duplicate names and choice values are valid and retain their positions and types.
-Native presets cover the billing example, mixed boolean/string choices, and text-message input.
+1–200 questions, 2–255 string/boolean choices, 2–10 score levels and at most 128 image parts;
+unsupported fields, remote image URLs, files and videos are errors. Duplicate names and choice
+values are valid and retain their positions and types.
+Native presets cover the billing example, mixed boolean/string choices and text-message input.
+Image presets embed their sample bytes, so they run without uploads or external image URLs:
+
+| Preset | What it demonstrates |
+|---|---|
+| Image: colors and shapes | Simple predicates, categories and counting levels |
+| Image: product damage | Product damage versus packaging damage, category and severity |
+| Image: packaging-only damage | The same questions with a visibly intact product beside a damaged box |
+| Images: before and after | Two ordered images, a visible-damage comparison and an explicit unclear option |
+| Image: support screenshot triage | Reading an interface, routing an issue and scoring a documented workaround |
+
+The damage check and screenshot routing/severity questions adapt the patterns in the
+[OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions). The bundled samples
+are synthetic demonstrations, not evaluation data or accuracy claims. The screenshot uses `original`
+detail to preserve its text; the product examples use `high`. Each question is independent and reads
+the shared input, not another question's answer.
+
 The server checks token budgets and rejects overflow rather than truncating input. These are local
-text-only decision adapters, not a promise of Luna predictions, calibration, or refusal policy.
+decision adapters, not a promise of Luna predictions, preprocessing, calibration, or refusal policy.
+Image input requires server startup with `--vision`. Image controls insert native base64 data-URL
+parts and select `low`, `high`, `auto` or `original`; the native JSON remains the request authority.
+The [image profiles and resource limits](serving.md#decisions-image-input) are enforced by the
+server. Existing text-trained adapters have not thereby acquired image-task qualification.
 
 **Models.** Each protocol reads its catalog once per page load. TypeSafe uses
 `GET /typesafe/v1/models`; a new request leaves `model` out, so the server's `jev-latest` alias
 answers. OpenAI uses `GET /v1/models`, filtered to models advertising `/v1/decisions`, and selects
 an actual decision adapter name; it requires `model` and cannot use `jev-latest`. Its card shows
-the state and context limits. If discovery fails, a model name can be entered manually.
+the state and context limits and startup-resolved image capability. Image controls are unavailable
+when the selected model explicitly reports Vision disabled. If discovery fails, a model name can
+be entered manually.
 The TypeSafe card also reports the KV codec. On a rotated codec (`rk*`) it adds a caution: decisions
 there keep task-level quality but are not qualified to kev's 0.03 bar, which `bf16` is
 ([System One fidelity](serving.md#system-one-fidelity)).
@@ -342,10 +371,14 @@ replaying a file instead of following the live stream. OpenAI cannot join its in
 until its response ID arrives. Playground runs appear in the System One panel like any other decision.
 
 **Sharing and drafts.** Copy link puts the whole request in the URL fragment (`#r=`, base64url of
-the body text), which is never sent to a server. The native `state` or `input` field selects the
+the body text), which is never sent to a server. Oversized links are refused rather than dropping
+image data; exact request JSON export/import handles larger requests. The native `state` or `input` field selects the
 protocol when opening the link. Both drafts and the selected protocol are kept in the browser,
 invalid text included, and restored on the next visit; a link takes precedence over `?preset=`,
 which takes precedence over that protocol's draft, and `?model=` picks the model on top of either.
+Request drafts use IndexedDB so ordinary image payloads are not constrained by localStorage's
+small quota; lightweight UI preferences remain in localStorage. Storage failures are reported,
+and the in-memory request remains usable rather than silently disappearing.
 
 The original six presets come from [laya](https://github.com/NandhaKishorM/laya)'s playground
 (Apache-2.0), rewritten as System One requests, and the editor and answer views follow its design.

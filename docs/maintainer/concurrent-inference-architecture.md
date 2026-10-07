@@ -368,7 +368,15 @@ RECEIVED → WAITING → PREFILL(state chunks, branch units) → MODEL_FINISHED
   proposal 或 turn checkpoint。最后一个 unit 直接产出全部 question 的 probabilities。
 - Units：未复用的 state suffix 按 `prefill_chunk` 切成普通 prefill chunks；之后每个 packed branch pass
   （按 first-fit 把若干短 branch 装进至多 `prefill_chunk` 列）和每个长 branch 的每个 chunk 各是一个
-  `PrefillChunk(request)` unit。Admission 的 service work 与这些 units 一一对应。
+  `PrefillChunk(request)` unit。Image item 边界可以缩短 state chunk，admission work 计数必须包含这些
+  分界。所有 decoder units 都显式使用 `TextPhase::Decision`，不因视觉输入落回 A8 prefill。
+- OpenAI decision state 可包含图片，条件是启动时启用 Vision；TypeSafe state rendering 不变。图片
+  复用 generation 的 processor、VisionControl、单个 shared transient 与 admission 仲裁，不使用 chat
+  template。state 保有完整 MRoPE geometry，未缓存的图片只在 state prefill 编码一次；question branches
+  不执行 Vision。HostInputLease 持有 preparation permit，直到所需图片 payload 消费完或请求终止。
+- Branch 的 logical KV index 仍从 `Ls` 开始，RoPE index 从 `Ls + state.rope_delta` 开始；packed 与
+  long branches 都显式传递该 offset。已复用图片后只追加 text，也保留 MRoPE geometry，而不强制创建
+  Vision session。
 - Branch 只看到 state 与自身。Packed pass 由 segmented mixers 一次执行：attention 对每个 segment 经 KV
   codec 读取 state 的 KV `[0,Ls)`，自身 causal past 直接取自该 pass 的 BF16 K/V，不写任何 page；GDN
   convolution/recurrence 让每个 segment 从 lane 的 current slot 起步；它们只读该 slot，不写出任何 final
@@ -376,12 +384,14 @@ RECEIVED → WAITING → PREFILL(state chunks, branch units) → MODEL_FINISHED
   其 KV 写在 `Ls` 之后、该 lane 自己的 pages 中（`paged-kv-cache.md` §9.6），只在该 branch 内被读取。
 - 完成时 KV trim 回 `Ls`，释放 growth entitlement；`allow_prefix_reuse` 时 lane 把 `[0,Ls)` 保留为
   retained decision state（带 adapter），否则清空 lane。下一 decision 仅在 adapter 相同、其 state tokens
-  以 retained frontier 为前缀时复用它，只 prefill 剩余 state suffix。Generation 不复用 decision state，
+  与 token types、位置、图片内容及 preprocessing identity 都匹配 retained frontier 时复用它；frontier
+  不能切开一个图片的 consumer span。只 prefill 剩余 state suffix。Generation 不复用 decision state，
   decision 也不复用 generation 的 retained state。
 - L2/L3 只匹配完整的 exact state（`continuation-cache.md` 的 System One decision states 一节）：提交时
   decision 只按 adapter-scoped exact-state alias 查询 descriptors；admission 仅在没有 idle lane retained
-  整个 state 时，把 `decision_state` image（main-text KV `[0,Ls)` 与 current GDN slot）restore 到一个
-  idle lane，之后只运行 branch units。完成时若提交时的查询没有可用 image，执行线程只 fence lane 并入队，
+  整个 state 时，把 `decision_state` image（main-text KV `[0,Ls)`、current GDN slot 与 MRoPE offset）
+  restore 到一个 idle lane，之后只运行 branch units，不重新编码图片。完成时若提交时的查询没有可用
+  image，执行线程只 fence lane 并入队，
   由 publication worker 导出并发布。前缀延伸复用仍只属于 L1 lane planning；chat 与 decision 的 image
   互不消费。
 - Cancellation 在 unit boundary 生效：未完成的 decision 丢弃 lane state，与 generation 的 prefill

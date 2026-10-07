@@ -129,8 +129,13 @@ const DecisionSummary& PreparedDecision::summary() const noexcept {
 
 PreparedDecision::operator bool() const noexcept { return impl_ != nullptr; }
 
-std::span<const TokenId> PreparedDecision::token_ids() const noexcept {
-    return impl_ != nullptr ? std::span<const TokenId>(impl_->value.tokens)
+std::span<const TokenId> PreparedDecision::state_token_ids() const noexcept {
+    return impl_ != nullptr ? std::span<const TokenId>(impl_->value.state.token_ids)
+                            : std::span<const TokenId>();
+}
+
+std::span<const TokenId> PreparedDecision::branch_token_ids() const noexcept {
+    return impl_ != nullptr ? std::span<const TokenId>(impl_->value.branch_tokens)
                             : std::span<const TokenId>();
 }
 
@@ -478,6 +483,13 @@ PreparedDecision Engine::prepare_decision(DecisionInput input) const {
         throw RequestError(RequestErrorKind::Unavailable,
                            "target '" + impl_->load.target + "' does not serve decisions");
     }
+    if (!impl_->load.decision_images_supported &&
+        std::ranges::any_of(input.state, [](const DecisionPart& part) {
+            return part.kind == DecisionPartKind::Image;
+        })) {
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "image decisions are unavailable for this Engine");
+    }
     return std::visit(
         [&](const auto& target_ptr) -> PreparedDecision {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
@@ -592,12 +604,17 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
 }
 
 DecisionHandle Engine::submit_decision(PreparedDecision decision, DecisionOptions options,
-                                       std::chrono::steady_clock::time_point pending_deadline) {
+                                       std::chrono::steady_clock::time_point pending_deadline,
+                                       HostInputLease host_input) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (decision.impl_ == nullptr) { throw std::invalid_argument("PreparedDecision is empty"); }
     if (!impl_->load.decisions_supported) {
         throw RequestError(RequestErrorKind::Unavailable,
                            "target '" + impl_->load.target + "' does not serve decisions");
+    }
+    if (decision.impl_->value.state.has_media() && !impl_->load.decision_images_supported) {
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "image decisions are unavailable for this Engine");
     }
     const runtime::ResolvedDecisionOptions resolved{
         .adapter = resolve_adapter(impl_->load.lora_adapters, LoraAdapterKind::Decision,
@@ -610,9 +627,9 @@ DecisionHandle Engine::submit_decision(PreparedDecision decision, DecisionOption
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                auto submission =
-                    executor->submit_decision(std::move(decision.impl_->value), resolved,
-                                              std::move(options.adapter), pending_deadline);
+                auto submission = executor->submit_decision(
+                    std::move(decision.impl_->value), resolved, std::move(options.adapter),
+                    pending_deadline, std::move(host_input));
                 return DecisionHandle(
                     std::make_unique<DecisionHandle::Impl>(impl_, std::move(submission)));
             }

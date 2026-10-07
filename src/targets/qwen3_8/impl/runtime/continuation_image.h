@@ -28,8 +28,7 @@
 
 namespace ninfer::targets::qwen3_8::detail::continuation {
 
-// Version 4: packed 4-bit KV pages hold the midrise codec, and E8-lattice keys are gone.
-inline constexpr std::uint32_t kTargetImageVersion = 4;
+inline constexpr std::uint32_t kTargetImageVersion = 5;
 class Writer {
 public:
     void u8(std::uint8_t value) { bytes_.push_back(value); }
@@ -196,6 +195,7 @@ inline cache::Bytes encode_prefix(const std::vector<TokenId>& ledger,
         out.u64(item.patch_begin);
         out.u64(item.patch_count);
         out.raw(item.content_digest);
+        out.raw(item.preprocessing_digest);
         out.u64(item.timestamps.size());
         for (const double timestamp : item.timestamps) { out.f64(timestamp); }
         out.u64(item.token_spans.size());
@@ -240,6 +240,7 @@ inline PrefixData decode_prefix(
         item.patch_begin   = in.u64();
         item.patch_count   = in.u64();
         for (std::uint8_t& byte : item.content_digest) { byte = in.u8(); }
+        for (std::uint8_t& byte : item.preprocessing_digest) { byte = in.u8(); }
         item.timestamps.resize(in.count(maximum_tokens, sizeof(double)));
         for (double& timestamp : item.timestamps) { timestamp = in.f64(); }
         item.token_spans.resize(in.count(maximum_tokens, 2 * sizeof(std::uint64_t)));
@@ -375,29 +376,21 @@ decision_state_compatibility_key(std::span<const std::uint8_t> continuation_key)
     return std::move(out).finish();
 }
 
-// A decision state is text at ordinal positions on every MRoPE axis - the identity a text prompt of
-// the same tokens has - and names no vision item.
-inline ResidentPrefixIdentitySnapshot ordinal_text_identity(std::size_t tokens) {
-    ResidentPrefixIdentitySnapshot out;
-    out.token_types.assign(tokens, 0);
-    for (auto& axis : out.positions) {
-        axis.resize(tokens);
-        for (std::size_t index = 0; index < tokens; ++index) {
-            axis[index] = static_cast<std::int32_t>(index);
-        }
-    }
-    return out;
-}
-
 // The canonical exact prefix of a decision state, and its SHA-256, the image's frontier digest.
-inline cache::Bytes decision_state_prefix(std::span<const TokenId> state) {
-    return encode_prefix(std::vector<TokenId>(state.begin(), state.end()),
-                         ordinal_text_identity(state.size()));
+inline cache::Bytes decision_state_prefix(const PreparedPromptData& state) {
+    ResidentPrefixIdentity identity;
+    identity.assign(state);
+    return encode_prefix(state.token_ids, identity.export_prefix(state.token_ids.size()));
 }
 
-inline cache::Bytes decision_state_digest(std::span<const std::uint8_t> prefix) {
+inline cache::Bytes decision_state_digest(std::span<const std::uint8_t> prefix,
+                                          std::int32_t rope_delta) {
+    Writer canonical;
+    canonical.blob(prefix);
+    canonical.i32(rope_delta);
+    const auto bytes = std::move(canonical).finish();
     artifact::Sha256 hash;
-    hash.update(std::as_bytes(prefix));
+    hash.update(std::as_bytes(std::span(bytes)));
     const artifact::Sha256Digest digest = hash.finish();
     return cache::Bytes(digest.begin(), digest.end());
 }
@@ -406,22 +399,24 @@ inline cache::Bytes decision_state_digest(std::span<const std::uint8_t> prefix) 
 // Only the whole state is named. A decision continuing a retained shorter state is an L1 lane
 // decision; a cached image serves exactly the state it holds.
 inline std::string decision_state_alias(std::span<const std::uint8_t> decision_key,
-                                        std::span<const TokenId> state) {
-    if (state.empty() || state.size() > std::numeric_limits<std::uint32_t>::max()) {
+                                        const PreparedPromptData& state) {
+    if (state.token_ids.empty() ||
+        state.token_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("decision state alias needs a state row");
     }
     Writer canonical;
     canonical.string("ninfer/qwen3.8/decision-state-alias");
-    canonical.u32(1);
+    canonical.u32(2);
     canonical.blob(decision_key);
-    canonical.u32(static_cast<std::uint32_t>(state.size()));
+    canonical.u32(static_cast<std::uint32_t>(state.token_ids.size()));
+    canonical.i32(state.rope_delta);
     canonical.blob(decision_state_prefix(state));
     const cache::Bytes bytes = std::move(canonical).finish();
     artifact::Sha256 hash;
     hash.update(std::as_bytes(std::span(bytes)));
     const artifact::Sha256Digest digest = hash.finish();
     constexpr char hex[]                = "0123456789abcdef";
-    std::string alias("@decision/v1/");
+    std::string alias("@decision/v2/");
     alias.reserve(alias.size() + 64);
     for (const std::uint8_t byte : digest) {
         alias.push_back(hex[byte >> 4]);
@@ -434,6 +429,7 @@ inline std::string decision_state_alias(std::span<const std::uint8_t> decision_k
 // decision adapter whose weights the KV and GDN state encode.
 struct DecisionStateMetadata {
     std::uint32_t state_tokens = 0;
+    std::int32_t rope_delta    = 0;
     std::array<std::uint8_t, 32> adapter{};
 };
 
@@ -441,6 +437,7 @@ inline cache::Bytes encode_decision_state(const DecisionStateMetadata& metadata)
     Writer out;
     write_header(out, "qwen-decision-state");
     out.u32(metadata.state_tokens);
+    out.i32(metadata.rope_delta);
     out.raw(metadata.adapter);
     return std::move(out).finish();
 }
@@ -450,6 +447,7 @@ inline DecisionStateMetadata decode_decision_state(std::span<const std::uint8_t>
     read_header(in, "qwen-decision-state");
     DecisionStateMetadata out;
     out.state_tokens = in.u32();
+    out.rope_delta   = in.i32();
     for (std::uint8_t& byte : out.adapter) { byte = in.u8(); }
     in.finish();
     return out;

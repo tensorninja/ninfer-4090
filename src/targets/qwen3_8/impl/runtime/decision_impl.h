@@ -16,12 +16,12 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // System One decisions (decision.h) on the family Program. A decision is a prefill-only lane: its
@@ -35,46 +35,37 @@ namespace ninfer::targets::qwen3_8::detail::NINFER_QWEN38_RUNTIME_NS {
 namespace {
 
 std::uint64_t decision_state_units(std::uint32_t state, std::uint32_t reuse_base,
-                                   std::uint32_t chunk) noexcept {
-    const std::uint32_t suffix = state - reuse_base;
-    return suffix == 0 ? 0ULL : 1ULL + (static_cast<std::uint64_t>(suffix) - 1ULL) / chunk;
-}
-
-// A decision state is text-only with ordinal positions on every MRoPE axis, exactly the identity
-// a text prompt of the same tokens has.
-bool ordinal_text_prefix(const ResidentPrefixIdentity& identity, std::uint32_t tokens) {
-    if (identity.size() < tokens || !identity.vision_items().empty()) { return false; }
-    const std::vector<std::uint8_t>& types = identity.token_types();
-    if (std::any_of(types.begin(), types.begin() + tokens,
-                    [](std::uint8_t type) { return type != 0; })) {
-        return false;
-    }
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        const std::vector<std::int32_t>& positions = identity.position_axis(axis);
-        for (std::uint32_t index = 0; index < tokens; ++index) {
-            if (positions[index] != static_cast<std::int32_t>(index)) { return false; }
+                                   std::uint32_t chunk,
+                                   const qwen3_8::VisionControl* vision) noexcept {
+    std::uint64_t units = 0;
+    while (reuse_base < state) {
+        std::uint32_t end = reuse_base + std::min(chunk, state - reuse_base);
+        bool active       = false;
+        if (vision != nullptr) {
+            for (const auto& item : vision->items) {
+                if (static_cast<std::uint32_t>(item.scatter_indices.back()) < reuse_base) {
+                    continue;
+                }
+                const auto begin = static_cast<std::uint32_t>(item.scatter_indices.front());
+                if (begin >= end) { break; }
+                if (active) {
+                    end = begin;
+                    break;
+                }
+                active = true;
+            }
         }
+        reuse_base = end;
+        ++units;
     }
-    return true;
+    return units;
 }
 
 bool decision_state_matches(const SequenceState& sequence, const DecisionPrompt& prompt,
                             std::uint32_t frontier) {
     return frontier != 0 && frontier <= prompt.state_tokens() &&
-           sequence.ledger.size() >= frontier &&
-           std::equal(prompt.tokens.begin(),
-                      prompt.tokens.begin() + static_cast<std::ptrdiff_t>(frontier),
-                      sequence.ledger.begin()) &&
-           ordinal_text_prefix(sequence.prefix_identity, frontier);
-}
-
-void assign_ordinal_identity(ResidentPrefixIdentity& identity, std::uint32_t tokens) {
-    std::array<std::vector<std::int32_t>, 3> positions;
-    for (std::vector<std::int32_t>& axis : positions) {
-        axis.resize(tokens);
-        std::iota(axis.begin(), axis.end(), 0);
-    }
-    identity.restore(std::vector<std::uint8_t>(tokens, 0), std::move(positions), {});
+           prefix_matches(prompt.state, sequence.ledger, sequence.prefix_identity, frontier) &&
+           (frontier != prompt.state_tokens() || sequence.rope_delta == prompt.state.rope_delta);
 }
 
 void upload_i32(const std::vector<std::int32_t>& host, const Tensor& device, cudaStream_t stream) {
@@ -163,23 +154,23 @@ schedule::PrefillContext ProgramImplCore::decision_prefill_context(SequenceState
                                                                        max_concurrency);
     const std::int32_t checkpoint =
         LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency);
-    return schedule::PrefillContext{
-        {device, model, work, decoder->linear_attention, nullptr, io, prefill_hidden,
-         prefill_chunk, proposal_head},
-        text_kv_view(sequence),
-        qwen3_8::PagedKVCacheView(),
-        decoder->text_kv,
-        nullptr,
-        nullptr,
-        base,
-        nullptr,
-        &sequence.turn_checkpoint_hidden,
-        current_slot,
-        current_slot == checkpoint ? resident : checkpoint,
-        0,
-        nullptr,
-        lora_slot(sequence.adapter),
-        qwen3_8::TextPhase::Decision};
+    return schedule::PrefillContext{{device, model, work, decoder->linear_attention, nullptr, io,
+                                     prefill_hidden, prefill_chunk, proposal_head},
+                                    text_kv_view(sequence),
+                                    qwen3_8::PagedKVCacheView(),
+                                    decoder->text_kv,
+                                    nullptr,
+                                    nullptr,
+                                    base,
+                                    nullptr,
+                                    &sequence.turn_checkpoint_hidden,
+                                    current_slot,
+                                    current_slot == checkpoint ? resident : checkpoint,
+                                    0,
+                                    nullptr,
+                                    lora_slot(sequence.adapter),
+                                    qwen3_8::TextPhase::Decision,
+                                    sequence.rope_delta};
 }
 
 RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt,
@@ -205,14 +196,26 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
     }
 
     const std::uint32_t state = prompt.state_tokens();
-    if (state == 0 || state > prompt.tokens.size() || prompt.branches.empty()) {
+    if (state == 0 || state != prompt.state.token_ids.size() || prompt.branches.empty()) {
         throw std::invalid_argument("decision prompt holds no state or no question");
     }
-    std::uint64_t cursor = state;
+    if (prompt.state.token_types.size() != state || prompt.state.positions.size() != 3ULL * state ||
+        prompt.state.has_media() != !prompt.state.patches.empty()) {
+        throw std::invalid_argument("decision state metadata or media payload is incomplete");
+    }
+    if (prompt.state.has_media() && (!vision_enabled || !model.vision)) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+    if (std::any_of(
+            prompt.state.vision_items.begin(), prompt.state.vision_items.end(),
+            [](const VisionItem& item) { return item.modality != PromptModality::Image; })) {
+        throw std::invalid_argument("decisions support image media only");
+    }
+    std::uint64_t cursor = 0;
     for (const DecisionBranch& branch : prompt.branches) {
         if (branch.begin != cursor || branch.length < 2 ||
-            branch.length > prompt.tokens.size() - cursor) {
-            throw std::invalid_argument("decision branches must follow the state back to back");
+            branch.length > prompt.branch_tokens.size() - cursor) {
+            throw std::invalid_argument("decision branches must tile their token buffer");
         }
         if (branch.option_readouts.empty() ||
             branch.option_readouts.size() > kMaximumDecisionOptions) {
@@ -227,19 +230,22 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
         }
         cursor += branch.length;
     }
-    if (cursor != prompt.tokens.size()) {
-        throw std::invalid_argument("decision branches must end the prompt");
+    if (cursor != prompt.branch_tokens.size()) {
+        throw std::invalid_argument("decision branches must end their token buffer");
     }
-    for (const TokenId id : prompt.tokens) {
-        if (id < 0 || id >= TextConfig::token_domain) {
-            throw std::invalid_argument("decision prompt contains a token outside the token domain");
+    for (const auto* tokens : {&prompt.state.token_ids, &prompt.branch_tokens}) {
+        for (const TokenId id : *tokens) {
+            if (id < 0 || id >= TextConfig::token_domain) {
+                throw std::invalid_argument(
+                    "decision prompt contains a token outside the token domain");
+            }
         }
     }
 
     const std::uint32_t pass_columns = std::min(prefill_chunk, capacity);
     auto plan                        = std::make_shared<DecisionPlan>();
     plan->state_tokens               = state;
-    plan->input_tokens               = static_cast<std::uint32_t>(prompt.tokens.size());
+    plan->input_tokens = state + static_cast<std::uint32_t>(prompt.branch_tokens.size());
     plan->pass_columns               = pass_columns;
     for (std::uint32_t index = 0; index < prompt.branches.size(); ++index) {
         const std::uint32_t length = prompt.branches[index].length;
@@ -274,6 +280,29 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
     base->summary.effective_limit_reason = FinishReason::None;
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
+    if (prompt.state.has_media()) {
+        auto control =
+            std::make_shared<qwen3_8::VisionControl>(qwen3_8::build_vision_control(prompt.state));
+        std::uint32_t previous_end = 0;
+        for (const auto& item : control->items) {
+            if (item.scatter_indices.empty() || item.scatter_indices.front() < 0 ||
+                static_cast<std::uint32_t>(item.scatter_indices.front()) < previous_end ||
+                static_cast<std::uint32_t>(item.scatter_indices.back()) >= state) {
+                throw std::invalid_argument("decision image consumer spans are invalid");
+            }
+            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+                throw std::invalid_argument(
+                    "decision image exceeds the Program workspace envelope");
+            }
+            previous_end = static_cast<std::uint32_t>(item.scatter_indices.back()) + 1;
+            base->vision_transient_bytes =
+                std::max(base->vision_transient_bytes,
+                         schedule::VisionContext::output_transient_bytes(item.merged_count));
+        }
+        base->vision_control              = std::move(control);
+        base->summary.transient_alignment = 256;
+        base->summary.transient_bytes     = base->vision_transient_bytes;
+    }
     base->text_kv_page_entitlement       = pages_for_tokens(state + plan->scratch_extent);
     base->text_kv_page_ceiling           = base->text_kv_page_entitlement;
     base->summary.admission              = runtime::AdmissionResources{
@@ -282,7 +311,8 @@ RequestBasePlan ProgramImplCore::plan_decision_base(const DecisionPrompt& prompt
                      .backend_kv_pages = 0,
     };
     base->summary.service_work_quanta =
-        decision_state_units(state, 0, pass_columns) + plan->branch_units;
+        decision_state_units(state, 0, pass_columns, base->vision_control.get()) +
+        plan->branch_units;
     base->adapter            = options.adapter;
     base->allow_prefix_reuse = options.allow_prefix_reuse;
     base->decision           = std::move(plan);
@@ -303,7 +333,7 @@ RequestPlan ProgramImplCore::plan_decision_for_lane(std::uint32_t lane, const De
     }
     const RequestBasePlanImpl& base = *base_plan.impl_;
     const DecisionPlan& decision    = *base.decision;
-    if (prompt.tokens.size() != decision.input_tokens ||
+    if (prompt.state.token_ids.size() + prompt.branch_tokens.size() != decision.input_tokens ||
         prompt.state_tokens() != decision.state_tokens) {
         throw std::invalid_argument("decision base plan does not describe the prompt");
     }
@@ -326,28 +356,50 @@ RequestPlan ProgramImplCore::plan_decision_for_lane(std::uint32_t lane, const De
         plan->reuse_base = sequence.execution_frontier;
     }
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    plan->summary.transient_alignment    = 1;
+    plan->summary.transient_bytes        = 0;
+    if (base.vision_control) {
+        VisionPrefillPlan vision;
+        vision.control = base.vision_control;
+        for (std::size_t index = 0; index < vision.control->items.size(); ++index) {
+            const auto& item = vision.control->items[index];
+            const auto begin = static_cast<std::uint32_t>(item.scatter_indices.front());
+            const auto end   = static_cast<std::uint32_t>(item.scatter_indices.back()) + 1;
+            if (end <= plan->reuse_base) { continue; }
+            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
+            plan->summary.transient_bytes =
+                std::max(plan->summary.transient_bytes,
+                         schedule::VisionContext::output_transient_bytes(item.merged_count));
+        }
+        if (!vision.uses.empty()) {
+            plan->summary.transient_alignment = 256;
+            plan->vision                      = std::move(vision);
+        }
+    }
     plan->summary.service_work_quanta =
-        decision_state_units(decision.state_tokens, plan->reuse_base, decision.pass_columns) +
+        decision_state_units(decision.state_tokens, plan->reuse_base, decision.pass_columns,
+                             base.vision_control.get()) +
         decision.branch_units;
     return RequestPlan(std::move(plan));
 }
 
-runtime::PrefillStepResult ProgramImplCore::start_decision_lane(std::uint32_t lane,
-                                                                DecisionPrompt&& prompt,
-                                                                RequestPlan&& plan) {
+runtime::PrefillStepResult
+ProgramImplCore::start_decision_lane(std::uint32_t lane, DecisionPrompt&& prompt,
+                                     RequestPlan&& plan, runtime::TransientRegion transient) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
     if (plan.impl_ == nullptr || !plan.impl_->decision) {
         throw std::invalid_argument("request plan is not a decision");
     }
-    const RequestPlanImpl& request_plan = *plan.impl_;
+    RequestPlanImpl& request_plan                           = *plan.impl_;
     const std::shared_ptr<const DecisionPlan> decision_plan = request_plan.decision;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
         throw std::logic_error("a decision requires a free request lane");
     }
-    if (prompt.tokens.size() != decision_plan->input_tokens ||
+    if (prompt.state.token_ids.size() + prompt.branch_tokens.size() !=
+            decision_plan->input_tokens ||
         prompt.state_tokens() != decision_plan->state_tokens) {
         throw std::invalid_argument("request plan does not describe the decision");
     }
@@ -383,8 +435,7 @@ runtime::PrefillStepResult ProgramImplCore::start_decision_lane(std::uint32_t la
         sequence.text_kv_valid = base;
         bind_sequence_kv(sequence);
         materialize_sequence_kv(sequence, state + decision_plan->scratch_extent, 0);
-        sequence.rope_delta = 0;
-        set_device_i32(io.rope_delta, 0);
+        sequence.rope_delta = prompt.state.rope_delta;
 
         sequence.execution_frontier      = base;
         sequence.ledger_frontier         = base;
@@ -394,21 +445,29 @@ runtime::PrefillStepResult ProgramImplCore::start_decision_lane(std::uint32_t la
         sequence.tail_hidden_valid       = false;
         sequence.turn_checkpoint         = {};
         sequence.user_turn_anchor        = {};
-        sequence.ledger.assign(prompt.tokens.begin(),
-                               prompt.tokens.begin() + static_cast<std::ptrdiff_t>(state));
-        assign_ordinal_identity(sequence.prefix_identity, state);
+        sequence.ledger                  = prompt.state.token_ids;
+        sequence.prefix_identity.assign(prompt.state);
         request.timings                 = {};
         request.pending                 = {};
         request.text_kv_page_ceiling    = request_plan.text_kv_page_ceiling;
         request.backend_kv_page_ceiling = 0;
 
         const std::size_t questions = prompt.branches.size();
+        const bool host_input_consumed = !request_plan.vision;
+        if (host_input_consumed) { prompt.state.release_media_payload(); }
         request.decision.emplace(RequestControl::Decision{
-            .prompt              = std::move(prompt),
-            .plan                = decision_plan,
-            .reused_state_tokens = base,
-            .state_cursor        = base,
+            .prompt                      = std::move(prompt),
+            .plan                        = decision_plan,
+            .vision_plan                 = std::move(request_plan.vision),
+            .host_input_consumed_pending = host_input_consumed,
+            .reused_state_tokens         = base,
+            .state_cursor                = base,
         });
+        auto& staged = *request.decision;
+        if (staged.vision_plan) {
+            staged.vision = std::make_unique<schedule::VisionPrefillSession>(
+                device, model, work, staged.prompt.state, *staged.vision_plan, transient);
+        }
         request.decision->outcome.probabilities.resize(questions);
         request.decision->outcome.reused_state_tokens = base;
         request.lifecycle                             = Lifecycle::Prefilling;
@@ -437,26 +496,41 @@ runtime::PrefillStepResult ProgramImplCore::advance_decision(SequenceState& sequ
                                                                   : ReusePath::FullReset,
     };
     const auto started = Clock::now();
+    bool host_input_consumed = std::exchange(decision.host_input_consumed_pending, false);
     try {
         select_prefill_kv_rows(sequence);
         std::uint32_t processed = 0;
         if (decision.state_cursor < plan.state_tokens) {
-            // Chunks of pass_columns, the width the service projection counted.
             const std::uint32_t nominal =
                 std::min(plan.pass_columns, plan.state_tokens - decision.state_cursor);
             schedule::PrefillContext context = decision_prefill_context(
                 sequence, decision.state_cursor,
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency));
             mark_workspace_usage(workspace_plan.decision_pass);
-            const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                context, std::span<const TokenId>(decision.prompt.tokens.data(), plan.state_tokens),
-                nominal, std::nullopt, false);
-            if (result.processed_tokens != nominal) {
-                throw std::logic_error("decision state chunk did not consume its planned width");
+            schedule::PrefillChunkResult result;
+            if (decision.prompt.state.has_media()) {
+                if (decision.vision) { mark_workspace_usage(workspace_plan.vision_encode); }
+                result = schedule::prefill_multimodal_chunk(context, decision.prompt.state,
+                                                            decision.vision.get(), nominal,
+                                                            std::nullopt, false);
+            } else {
+                result = schedule::prefill_text_chunk(context, decision.prompt.state.token_ids,
+                                                      nominal, std::nullopt, false);
+            }
+            if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
+                throw std::logic_error("decision state chunk made invalid progress");
+            }
+            if (decision.vision && decision.vision->release_consumed_media_payload()) {
+                host_input_consumed = true;
             }
             processed = result.processed_tokens;
             decision.state_cursor += processed;
             sequence.text_kv_valid = decision.state_cursor;
+            if (decision.state_cursor == plan.state_tokens && decision.vision) {
+                decision.outcome.vision_seconds = decision.vision->elapsed_seconds();
+                decision.vision.reset();
+                decision.vision_plan.reset();
+            }
             decision.outcome.state_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
         } else if (decision.next_pass < plan.passes.size()) {
@@ -478,7 +552,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_decision(SequenceState& sequ
                             decision.next_long == plan.long_branches.size();
         return runtime::PrefillStepResult{.summary                 = summary,
                                           .processed_prompt_tokens = processed,
-                                          .complete                = decision.complete};
+                                          .complete                = decision.complete,
+                                          .host_input_consumed     = host_input_consumed};
     } catch (...) {
         try {
             device.synchronize();
@@ -509,7 +584,7 @@ void ProgramImplCore::decision_pass_unit(SequenceState& sequence,
         const auto column            = static_cast<std::int32_t>(ids.size());
         const auto length            = static_cast<std::int32_t>(branch.length);
         segments.push_back(schedule::DecisionSegment{.column = column, .length = length});
-        const auto first = prompt.tokens.begin() + static_cast<std::ptrdiff_t>(branch.begin);
+        const auto first = prompt.branch_tokens.begin() + static_cast<std::ptrdiff_t>(branch.begin);
         ids.insert(ids.end(), first, first + length);
         questions.push_back(static_cast<std::int32_t>(query_columns.size()));
         questions.push_back(static_cast<std::int32_t>(key_columns.size()));
@@ -573,11 +648,9 @@ std::uint32_t ProgramImplCore::decision_long_unit(SequenceState& sequence,
         // The branch continues a copy of the state's GDN slot in the lane's otherwise unused
         // turn-checkpoint slot; its KV lands above the state like a prompt suffix.
         decoder->linear_attention.copy_slot(current_slot, branch_slot, device.stream);
-        decision.long_row.assign(decision.prompt.tokens.begin(),
-                                 decision.prompt.tokens.begin() +
-                                     static_cast<std::ptrdiff_t>(plan.state_tokens));
+        decision.long_row = decision.prompt.state.token_ids;
         const auto first =
-            decision.prompt.tokens.begin() + static_cast<std::ptrdiff_t>(branch.begin);
+            decision.prompt.branch_tokens.begin() + static_cast<std::ptrdiff_t>(branch.begin);
         decision.long_row.insert(decision.long_row.end(), first,
                                  first + static_cast<std::ptrdiff_t>(branch.length));
         decision.long_keys = 0;
@@ -701,10 +774,11 @@ DecisionOutcome ProgramImplCore::take_decision_lane(std::uint32_t lane) {
 std::optional<std::string>
 ProgramImplCore::decision_state_alias(const DecisionPrompt& prompt) const {
     const std::uint32_t state = prompt.state_tokens();
-    if (state == 0 || state > capacity || state > prompt.tokens.size()) { return std::nullopt; }
+    if (state == 0 || state > capacity || state != prompt.state.token_ids.size()) {
+        return std::nullopt;
+    }
     try {
-        return image::decision_state_alias(decision_state_compatibility_key,
-                                           std::span<const TokenId>(prompt.tokens.data(), state));
+        return image::decision_state_alias(decision_state_compatibility_key, prompt.state);
     } catch (...) { return std::nullopt; }
 }
 
@@ -721,8 +795,7 @@ ProgramImplCore::export_decision_state_background(std::uint32_t lane) const {
         sequence.kv->text.bound_row() >= 0 || state == 0 || state > capacity ||
         sequence.text_kv_valid != state || sequence.ledger_frontier != state ||
         sequence.ledger.size() != state || sequence.prefix_identity.size() != state ||
-        !ordinal_text_prefix(sequence.prefix_identity, state) || !model.lora ||
-        sequence.adapter < 0 ||
+        !model.lora || sequence.adapter < 0 ||
         static_cast<std::size_t>(sequence.adapter) >= model.lora->fingerprints.size()) {
         throw std::logic_error("lane holds no complete exportable decision state");
     }
@@ -731,11 +804,14 @@ ProgramImplCore::export_decision_state_background(std::uint32_t lane) const {
     out.format_version    = image::kTargetImageVersion;
     out.compatibility_key = decision_state_compatibility_key;
     out.frontier_tokens   = state;
-    out.prefix_identity   = image::decision_state_prefix(std::span<const TokenId>(sequence.ledger));
-    out.frontier_prefix_digest = image::decision_state_digest(out.prefix_identity);
-    out.frontier_metadata      = image::encode_decision_state(image::DecisionStateMetadata{
-             .state_tokens = state,
-             .adapter      = model.lora->fingerprints[static_cast<std::size_t>(sequence.adapter)]});
+    out.prefix_identity =
+        image::encode_prefix(sequence.ledger, sequence.prefix_identity.export_prefix(state));
+    out.frontier_prefix_digest =
+        image::decision_state_digest(out.prefix_identity, sequence.rope_delta);
+    out.frontier_metadata = image::encode_decision_state(image::DecisionStateMetadata{
+        .state_tokens = state,
+        .rope_delta   = sequence.rope_delta,
+        .adapter      = model.lora->fingerprints[static_cast<std::size_t>(sequence.adapter)]});
     image::emit_paged(
         out.segments, "main.text_kv",
         export_paged_kv_logical(sequence.kv->text, state, export_transfer, export_stream));
@@ -755,13 +831,14 @@ std::uint32_t ProgramImplCore::preflight_decision_state_metadata(
         if (candidate.status != cache::CacheLookupStatus::Hit ||
             candidate.image_format_version != image::kTargetImageVersion ||
             candidate.compatibility_key != decision_state_compatibility_key || state == 0 ||
-            state > capacity || state > prompt.tokens.size() ||
+            state > capacity || state != prompt.state.token_ids.size() ||
             candidate.frontier_tokens != state || candidate.boundary_tokens != 0 ||
             !candidate.boundary_prefix_digest.empty()) {
             return 0;
         }
-        return image::decision_state_digest(image::decision_state_prefix(std::span<const TokenId>(
-                   prompt.tokens.data(), state))) == candidate.frontier_prefix_digest
+        return image::decision_state_digest(image::decision_state_prefix(prompt.state),
+                                            prompt.state.rope_delta) ==
+                       candidate.frontier_prefix_digest
                    ? state
                    : 0;
     } catch (...) { return 0; }
@@ -776,17 +853,15 @@ ProgramImplCore::preflight_decision_state(const cache::ContinuationImage& candid
         const std::uint32_t state = prompt.state_tokens();
         if (candidate.format_version != image::kTargetImageVersion ||
             candidate.compatibility_key != decision_state_compatibility_key || state == 0 ||
-            state > capacity || state > prompt.tokens.size() ||
+            state > capacity || state != prompt.state.token_ids.size() ||
             candidate.frontier_tokens != state || candidate.boundary_tokens != 0 ||
             !candidate.boundary_prefix_digest.empty() || !candidate.boundary_metadata.empty() ||
             !model.lora || adapter < 0 ||
             static_cast<std::size_t>(adapter) >= model.lora->fingerprints.size()) {
             return 0;
         }
-        // The exact state row with its ordinal text identity - one comparison of canonical prefix
-        // bytes - and the adapter whose weights the state encodes.
-        const std::span<const TokenId> row(prompt.tokens.data(), state);
-        const cache::Bytes expected = image::decision_state_prefix(row);
+        const std::span<const TokenId> row(prompt.state.token_ids);
+        const cache::Bytes expected = image::decision_state_prefix(prompt.state);
         const bool exact            = candidate.prefix_identity == expected;
         if (divergence_tokens != nullptr) {
             if (exact) {
@@ -803,8 +878,10 @@ ProgramImplCore::preflight_decision_state(const cache::ContinuationImage& candid
         const image::DecisionStateMetadata metadata =
             image::decode_decision_state(candidate.frontier_metadata);
         if (!exact || metadata.state_tokens != state ||
+            metadata.rope_delta != prompt.state.rope_delta ||
             metadata.adapter != model.lora->fingerprints[static_cast<std::size_t>(adapter)] ||
-            candidate.frontier_prefix_digest != image::decision_state_digest(expected)) {
+            candidate.frontier_prefix_digest !=
+                image::decision_state_digest(expected, metadata.rope_delta)) {
             return 0;
         }
         std::set<std::string> inventory{"main.gdn"};
@@ -874,13 +951,12 @@ ContinuationRestoreFailure ProgramImplCore::import_decision_state_lane(
         device.synchronize();
 
         // Exactly the lane take_decision_lane leaves for this state.
-        sequence.ledger.assign(prompt.tokens.begin(),
-                               prompt.tokens.begin() + static_cast<std::ptrdiff_t>(state));
-        assign_ordinal_identity(sequence.prefix_identity, state);
+        sequence.ledger = prompt.state.token_ids;
+        sequence.prefix_identity.assign(prompt.state);
         sequence.execution_frontier      = state;
         sequence.ledger_frontier         = state;
         sequence.text_kv_valid           = state;
-        sequence.rope_delta              = 0;
+        sequence.rope_delta              = prompt.state.rope_delta;
         sequence.mtp_kv_valid            = 0;
         sequence.dflash_context_frontier = 0;
         sequence.mtp_draft_count         = 0;

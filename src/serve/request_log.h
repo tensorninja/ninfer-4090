@@ -19,9 +19,7 @@
 
 namespace ninfer::serve {
 
-// Schema 23 distinguishes TypeSafe and OpenAI decisions by protocol within the shared decision
-// events, adapter inventory, decision prefill counters and LoRA bank metrics.
-inline constexpr int kRequestLogSchemaVersion        = 23;
+inline constexpr int kRequestLogSchemaVersion        = 24;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 // The --kv-dtype spelling of a KV storage.

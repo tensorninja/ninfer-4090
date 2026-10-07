@@ -79,6 +79,7 @@ export interface QuestionDraft {
 }
 
 export interface EditorState {
+  requestText?: string
   protocol: Protocol
   stateMode: StateMode
   qMode: QuestionsMode
@@ -345,14 +346,42 @@ export function buildBody(
   questions: JsonNode,
   model: string,
   protocol: Protocol = 'typesafe',
+  requestText?: string,
 ): RequestBody {
-  const root = bodyNode(state, questions, model, protocol)
+  let root = bodyNode(state, questions, model, protocol)
+  let text = compactJson(root)
+  const envelope = requestText === undefined ? null : tryParse(requestText).ast
+  if (envelope?.t === 'obj' && requestText !== undefined) {
+    const changes: Array<{ s: number; e: number; text: string }> = []
+    for (const entry of root.entries) {
+      const previous = lastEntry(envelope, entry.k)
+      if (previous) {
+        if (compactJson(previous.v) !== compactJson(entry.v))
+          changes.push({ s: previous.v.s, e: previous.v.e, text: compactJson(entry.v) })
+      } else {
+        changes.push({
+          s: envelope.e - 1,
+          e: envelope.e - 1,
+          text: `${envelope.entries.length ? ',' : ''}${JSON.stringify(entry.k)}:${compactJson(entry.v)}`,
+        })
+      }
+    }
+    if (protocol === 'typesafe' && !model) {
+      const previous = lastEntry(envelope, 'model')
+      if (previous && compactJson(previous.v) !== '""')
+        changes.push({ s: previous.v.s, e: previous.v.e, text: '""' })
+    }
+    text = requestText
+    for (const change of changes.sort((a, b) => b.s - a.s))
+      text = text.slice(0, change.s) + change.text + text.slice(change.e)
+    root = tryParse(text).ast as ObjectNode
+  }
   return {
     protocol,
     state,
     questions,
     model,
-    text: compactJson(root),
+    text,
     canon:
       protocol +
       '\u0000' +
@@ -364,6 +393,7 @@ export function buildBody(
 // --- snapshots: an editor's text, for drafts, presets, undo and share links ------------------
 
 export interface Snap {
+  requestText?: string
   protocol: Protocol
   stateMode: StateMode
   qMode: QuestionsMode
@@ -374,6 +404,7 @@ export interface Snap {
 
 export function snapOf(editor: EditorState): Snap {
   return {
+    requestText: editor.requestText,
     protocol: editor.protocol,
     stateMode: editor.stateMode,
     qMode: editor.qMode,
@@ -404,6 +435,7 @@ export function editorFromSnap(snap: Snap): EditorState {
       ? (qs.ast as ObjectNode).entries.map(questionFromEntry)
       : null
   return {
+    requestText: snap.requestText,
     protocol: snap.protocol,
     stateMode: fields ? 'fields' : 'json',
     qMode: questions ? 'form' : 'json',

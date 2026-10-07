@@ -1,3 +1,4 @@
+#include <ninfer/targets/qwen3_8/decision.h>
 #include <ninfer/targets/qwen3_8/frontend.h>
 #include <ninfer/targets/qwen3_8/frontend_resources.h>
 
@@ -152,13 +153,14 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     return result;
 }
 
-std::vector<std::uint8_t> gradient_ppm() {
+std::vector<std::uint8_t> gradient_ppm(int width = 64, int height = 64) {
     std::vector<std::uint8_t> ppm;
-    const std::string header = "P6\n64 64\n255\n";
+    const std::string header =
+        "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
     for (const char byte : header) {
         ppm.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
     }
-    for (int index = 0; index < 64 * 64; ++index) {
+    for (int index = 0; index < width * height; ++index) {
         ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
         ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
         ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
@@ -1380,6 +1382,410 @@ int test_ill_formed_utf8_is_replaced() {
     return failures;
 }
 
+FrontendResources decision_resources() {
+    FrontendResources result = generated_bytes_resources({});
+    auto tokenizer           = nlohmann::json::parse(result.tokenizer_json);
+    for (const auto& token :
+         {added(248060, "<|fim_prefix|>", true), added(248061, "<|fim_middle|>", true),
+          added(248049, "<|box_start|>", true), added(248050, "<|box_end|>", true),
+          added(248062, "<|fim_suffix|>", true)}) {
+        tokenizer["added_tokens"].push_back(token);
+    }
+    tokenizer["model"]["vocab"]["ab"] = 3000;
+    tokenizer["model"]["merges"]      = nlohmann::json::array({"a b"});
+    result.tokenizer_json             = tokenizer.dump();
+    return result;
+}
+
+ninfer::DecisionPart decision_image(int width, int height, ninfer::ImageDetail detail) {
+    ninfer::DecisionPart part;
+    part.kind             = ninfer::DecisionPartKind::Image;
+    part.detail           = detail;
+    part.image.kind       = ninfer::MediaKind::Image;
+    part.image.bytes      = gradient_ppm(width, height);
+    part.image.media_type = "image/x-portable-pixmap";
+    return part;
+}
+
+ninfer::DecisionInput decision_input(std::vector<ninfer::DecisionPart> parts) {
+    ninfer::DecisionInput input;
+    input.state     = std::move(parts);
+    input.questions = {{.instructions = "", .options = {"x", ""}},
+                       {.instructions = "x", .options = {"x"}}};
+    return input;
+}
+
+template <class Callable>
+bool throws_media_budget(Callable&& callable) {
+    try {
+        callable();
+    } catch (const ninfer::RequestError& error) {
+        return error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
+    }
+    return false;
+}
+
+template <class Callable>
+bool throws_decision_media(std::size_t index, ninfer::DecisionMediaErrorKind kind,
+                           Callable&& callable) {
+    try {
+        callable();
+    } catch (const ninfer::DecisionMediaError& error) {
+        return error.image_index() == index && error.kind() == kind && *error.what() != '\0';
+    }
+    return false;
+}
+
+int test_decision_layout() {
+    const auto owned        = decision_resources();
+    const Frontend frontend = FrontendFactory::create_component(owned);
+    auto input              = decision_input({decision_image(64, 64, ninfer::ImageDetail::High)});
+    const auto image        = frontend.prepare_decision(input);
+    const auto& state       = image.state;
+    int failures =
+        check(state.token_ids == std::vector<ninfer::TokenId>{248060, 248053, 248056, 248056,
+                                                              248056, 248056, 248054} &&
+                  state.token_types == std::vector<std::uint8_t>{0, 0, 1, 1, 1, 1, 0},
+              "image-only decision must use the state delimiter, not the chat template");
+    failures += check(state.positions == std::vector<std::int32_t>{0, 1, 2, 2, 2, 2, 4, 0, 1, 2, 2,
+                                                                   3, 3, 4, 0, 1, 2, 3, 2, 3, 4} &&
+                          state.rope_delta == -2,
+                      "decision state MRoPE positions/rope delta differ from exact image layout");
+    const std::vector<ninfer::TokenId> branches{
+        248061, 248049,           kByteToken + 'x', 248050,           248049, 248050, 248062,
+        248061, kByteToken + 'x', 248049,           kByteToken + 'x', 248050, 248062};
+    failures += check(image.branch_tokens == branches && image.branches.size() == 2 &&
+                          image.branches[0].begin == 0 && image.branches[0].length == 7 &&
+                          image.branches[0].option_readouts == std::vector<std::uint32_t>{3, 5} &&
+                          image.branches[1].begin == 7 && image.branches[1].length == 6 &&
+                          image.branches[1].option_readouts == std::vector<std::uint32_t>{4},
+                      "decision branches must use a separate tape and relative readouts");
+    failures += check(image.summary.state_tokens == 7 && image.summary.branch_tokens == 13 &&
+                          image.summary.longest_branch == 7 && image.summary.questions == 2 &&
+                          image.summary.options == 3 && image.summary.images == 1 &&
+                          image.summary.vision_tokens == 4 && !image.summary.state_truncated &&
+                          image.summary.input_tokens() == 20 &&
+                          ninfer::targets::qwen3_8::decision_context_tokens(image) == 14 &&
+                          state.prepare.raw_patches == 16 && state.prepare.attention_pairs == 256 &&
+                          state.prepare.patch_bytes == 16 * 1536 * sizeof(float) &&
+                          state.identity.reusable && !state.starts_in_reasoning,
+                      "decision accounting must include state media but not concatenate branches");
+    failures += check(state.vision_items.size() == 1 &&
+                          state.vision_items[0].content_digest == kGradientDigest &&
+                          state.vision_items[0].token_spans.size() == 1 &&
+                          state.vision_items[0].token_spans[0].begin == 2 &&
+                          state.vision_items[0].token_spans[0].count == 4,
+                      "decision media spans/source digest are incorrect");
+    auto chat              = frontend.prepare(image_input());
+    const auto& chat_state = FrontendFactory::inspect(chat);
+    failures += check(state.patches == chat_state.patches &&
+                          state.vision_items[0].preprocessing_digest ==
+                              chat_state.vision_items[0].preprocessing_digest,
+                      "decision high must retain native chat image processing");
+
+    input.state               = {{.text = "a"},  {.text = "b<|image_"}, {.text = "pad|>"},
+                                 input.state[0], {.text = "a"},         {.text = "b"}};
+    const auto mixed          = frontend.prepare_decision(input);
+    const std::string escaped = "<\xC2\xA6image_pad\xC2\xA6>";
+    std::vector<ninfer::TokenId> expected{248060, 3000};
+    for (const unsigned char byte : escaped) { expected.push_back(kByteToken + byte); }
+    expected.insert(expected.end(), state.token_ids.begin() + 1, state.token_ids.end());
+    expected.push_back(3000);
+    failures += check(mixed.state.token_ids == expected && mixed.branch_tokens == branches &&
+                          mixed.summary.images == 1 && mixed.summary.vision_tokens == 4 &&
+                          mixed.state.patches == state.patches,
+                      "mixed state must coalesce adjacent text before escaping and BPE");
+    input.state     = {{.text = "a"}, {.text = "b"}};
+    const auto text = frontend.prepare_decision(input);
+    failures += check(text.state.token_ids == std::vector<ninfer::TokenId>{248060, 3000} &&
+                          text.state.positions == std::vector<std::int32_t>{0, 1, 0, 1, 0, 1} &&
+                          text.state.token_types == std::vector<std::uint8_t>{0, 0} &&
+                          text.state.rope_delta == 0 && !text.state.has_media(),
+                      "text-only decision must preserve merged tokenization and linear positions");
+    input.state.clear();
+    failures += check(frontend.prepare_decision(input).state.token_ids ==
+                          std::vector<ninfer::TokenId>{248060},
+                      "empty text state must retain its delimiter");
+    return failures;
+}
+
+bool original_pixels_match(const ninfer::targets::qwen3_8::PreparedPromptData& state, int width,
+                           int height) {
+    const int padded_width  = ((width + 31) / 32) * 32;
+    const int padded_height = ((height + 31) / 32) * 32;
+    if (state.patches.size() != static_cast<std::size_t>(padded_width) * padded_height * 6) {
+        return false;
+    }
+    for (int y = 0; y < padded_height; ++y) {
+        for (int x = 0; x < padded_width; ++x) {
+            const int source = std::min(y, height - 1) * width + std::min(x, width - 1);
+            const std::size_t row =
+                ((y / 32) * (padded_width / 32) + x / 32) * 4 + (y % 32 / 16) * 2 + x % 32 / 16;
+            for (int c = 0; c < 3; ++c) {
+                const int multiplier = c == 0 ? 1 : c == 1 ? 3 : 7;
+                const float expected =
+                    static_cast<float>((source * multiplier) & 255) / 127.5F - 1.0F;
+                for (int t = 0; t < 2; ++t) {
+                    const std::size_t feature = c * 512 + t * 256 + (y % 16) * 16 + x % 16;
+                    if (state.patches[row * 1536 + feature] != expected) { return false; }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+int test_decision_image_profiles() {
+    const Frontend frontend = FrontendFactory::create_component(decision_resources());
+    using Detail            = ninfer::ImageDetail;
+
+    struct Case {
+        int width;
+        int height;
+        Detail detail;
+        int out_width;
+        int out_height;
+    };
+
+    const std::vector<Case> cases{
+        {1000, 400, Detail::Low, 800, 320},  {1000, 400, Detail::High, 992, 384},
+        {1000, 400, Detail::Auto, 992, 384}, {1000, 400, Detail::Original, 1024, 416},
+        {1024, 256, Detail::Low, 1024, 256}, {33, 17, Detail::Original, 64, 32},
+        {1, 1, Detail::Original, 32, 32},    {1, 1, Detail::High, 64, 64},
+        {1, 1, Detail::Low, 64, 64},         {201, 1, Detail::Original, 224, 32}};
+    int failures = 0;
+    for (const Case& value : cases) {
+        const auto prompt = frontend.prepare_decision(
+            decision_input({decision_image(value.width, value.height, value.detail)}));
+        const auto& grid = prompt.state.vision_items[0].grid;
+        failures +=
+            check(grid.width == value.out_width / 16 && grid.height == value.out_height / 16 &&
+                      grid.temporal == 1 &&
+                      prompt.summary.vision_tokens == value.out_width * value.out_height / 1024,
+                  "decision profile smartresize/pad geometry differs from exact expected grid");
+        if (value.detail == Detail::Original) {
+            failures +=
+                check(original_pixels_match(prompt.state, value.width, value.height),
+                      "original must preserve every pixel and replicate only right/bottom edges");
+        }
+    }
+    failures += check(throws_invalid_argument([&] {
+                          (void)frontend.prepare_decision(
+                              decision_input({decision_image(201, 1, Detail::High)}));
+                      }),
+                      "native high aspect limit must not be applied to original");
+    const auto low =
+        frontend.prepare_decision(decision_input({decision_image(500, 500, Detail::Low)}));
+    const auto high =
+        frontend.prepare_decision(decision_input({decision_image(500, 500, Detail::High)}));
+    const auto automatic =
+        frontend.prepare_decision(decision_input({decision_image(500, 500, Detail::Auto)}));
+    const auto original =
+        frontend.prepare_decision(decision_input({decision_image(500, 500, Detail::Original)}));
+    failures += check(low.state.token_ids == high.state.token_ids &&
+                          high.state.token_ids == original.state.token_ids &&
+                          high.state.vision_items[0].grid.width == 32 &&
+                          high.state.vision_items[0].grid.height == 32 &&
+                          high.state.patches == automatic.state.patches &&
+                          high.state.patches == low.state.patches &&
+                          high.state.patches != original.state.patches &&
+                          original_pixels_match(original.state, 500, 500),
+                      "500x500 same-grid resize/pad regression");
+    const auto& high_item = high.state.vision_items[0];
+    failures += check(
+        high_item.content_digest == original.state.vision_items[0].content_digest &&
+            high_item.preprocessing_digest ==
+                automatic.state.vision_items[0].preprocessing_digest &&
+            high_item.preprocessing_digest != original.state.vision_items[0].preprocessing_digest &&
+            high_item.preprocessing_digest != std::array<std::uint8_t, 32>{},
+        "effective preprocessing identity must unify auto/high and distinguish resize/pad");
+    auto capped_resources = decision_resources();
+    auto config           = nlohmann::json::parse(capped_resources.preprocessor_config_json);
+    config["size"]["longest_edge"]            = 262144;
+    capped_resources.preprocessor_config_json = config.dump();
+    const Frontend capped                     = FrontendFactory::create_component(capped_resources);
+    const auto native =
+        capped.prepare_decision(decision_input({decision_image(1000, 400, Detail::High)}));
+    failures += check(native.state.vision_items[0].grid.width == 50 &&
+                          native.state.vision_items[0].grid.height == 20,
+                      "high must obey embedded native max area rather than a hardcoded limit");
+    const auto equivalent =
+        capped.prepare_decision(decision_input({decision_image(500, 500, Detail::High)}));
+    failures += check(equivalent.state.vision_items[0].preprocessing_digest ==
+                          low.state.vision_items[0].preprocessing_digest,
+                      "preprocessing identity must use effective parameters, not the profile name");
+    return failures;
+}
+
+int test_decision_budgets() {
+    const auto owned        = decision_resources();
+    const Frontend frontend = FrontendFactory::create_component(owned);
+    using Detail            = ninfer::ImageDetail;
+    auto small              = decision_image(1, 1, Detail::Original);
+    auto many               = decision_input(std::vector<ninfer::DecisionPart>(128, small));
+    const auto full         = frontend.prepare_decision(many);
+    int failures =
+        check(full.summary.images == 128 && full.summary.vision_tokens == 128 &&
+                  full.summary.state_tokens == 385 && full.state.prepare.raw_patches == 512 &&
+                  full.state.prepare.attention_pairs == 2048 &&
+                  full.state.vision_items.back().patch_begin == 508 &&
+                  full.state.vision_items.back().token_spans[0].begin == 383,
+              "decision-specific image limit/counts must allow 128 small images");
+    const auto native_many = frontend.prepare_decision(
+        decision_input(std::vector<ninfer::DecisionPart>(128, decision_image(1, 1, Detail::Auto))));
+    failures +=
+        check(native_many.summary.images == 128 && native_many.summary.vision_tokens == 512 &&
+                  native_many.summary.state_tokens == 769,
+              "128 default-profile images must count native-minimum vision tokens");
+    many.state.push_back(small);
+    failures += check(throws_media_budget([&] { (void)frontend.prepare_decision(many); }),
+                      "decision must reject 129 images");
+    auto chat = image_input();
+    chat.messages[0].parts.resize(17, chat.messages[0].parts[0]);
+    failures += check(throws_media_budget([&] { (void)frontend.prepare(chat); }),
+                      "chat image limit must remain 16");
+    const Frontend disabled = FrontendFactory::create_component(owned, false);
+    auto image              = decision_input({small});
+    failures += check(throws_invalid_argument([&] { (void)disabled.prepare_decision(image); }),
+                      "Vision-disabled frontend must reject decision images");
+    failures +=
+        check(disabled.prepare_decision(decision_input({{.text = "x"}})).summary.state_tokens == 2,
+              "Vision-disabled frontend must accept text decisions");
+    image.state[0].image.kind = ninfer::MediaKind::Video;
+    failures += check(throws_decision_media(0, ninfer::DecisionMediaErrorKind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(image); }),
+                      "decisions must reject video media");
+    image.state[0].image.kind       = ninfer::MediaKind::Image;
+    image.state[0].image.media_type = "video/mp4";
+    failures += check(throws_decision_media(0, ninfer::DecisionMediaErrorKind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(image); }),
+                      "decisions must reject video media types");
+    const Frontend limited = FrontendFactory::create_component(owned, true, 3);
+    image                  = decision_input({decision_image(64, 64, Detail::Original)});
+    failures += check(throws_decision_media(0, ninfer::DecisionMediaErrorKind::BudgetExceeded,
+                                            [&] { (void)limited.prepare_decision(image); }),
+                      "decision must honor resident vision token capacity without downscaling");
+    const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
+                                   .tokenizer_config_json  = owned.tokenizer_config_json,
+                                   .generation_config_json = owned.generation_config_json});
+    const auto check_budget = [&](fi::ProcessorOptions options) {
+        return throws_decision_media(0, ninfer::DecisionMediaErrorKind::BudgetExceeded, [&] {
+            (void)fi::process_decision_state(tokenizer, 248060, image, options);
+        });
+    };
+    fi::ProcessorOptions options;
+    options.max_media_bytes = image.state[0].image.bytes.size() - 1;
+    failures += check(check_budget(options), "decision encoded byte limit was not enforced");
+    options                    = {};
+    options.max_decoded_pixels = 4095;
+    failures += check(check_budget(options), "decision decoded pixel limit was not enforced");
+    options                 = {};
+    options.max_raw_patches = 15;
+    failures += check(check_budget(options), "decision patch limit was not enforced");
+    options                     = {};
+    options.max_attention_pairs = 255;
+    failures += check(check_budget(options), "decision attention-pair limit was not enforced");
+    options                   = {};
+    options.max_prompt_tokens = 6;
+    bool prompt_budget        = false;
+    try {
+        (void)fi::process_decision_state(tokenizer, 248060, image, options);
+    } catch (const fi::ProcessorError& error) {
+        prompt_budget = error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
+    }
+    failures += check(prompt_budget, "decision prompt-token limit was not enforced");
+
+    auto text            = decision_input({{.text = std::string(65536, 'x')}});
+    const auto truncated = frontend.prepare_decision(text);
+    failures += check(
+        truncated.summary.state_truncated && truncated.summary.state_tokens == 65536 &&
+            truncated.state.token_ids.front() == 248060 &&
+            std::all_of(truncated.state.token_ids.begin() + 1, truncated.state.token_ids.end(),
+                        [](auto id) { return id == kByteToken + 'x'; }),
+        "default text truncation must retain the exact TypeSafe head");
+    text.overflow = ninfer::DecisionStateOverflow::Reject;
+    failures += check(throws_invalid_argument([&] { (void)frontend.prepare_decision(text); }),
+                      "explicit Reject must not truncate text states");
+    text.state[0].text.resize(65535);
+    failures += check(!frontend.prepare_decision(text).summary.state_truncated,
+                      "state limit includes exactly one delimiter token");
+    text.overflow = ninfer::DecisionStateOverflow::TruncateText;
+    text.state.push_back(small);
+    failures += check(throws_invalid_argument([&] { (void)frontend.prepare_decision(text); }),
+                      "multimodal state must reject rather than clip text or images");
+    text.state[0].text.resize(65532);
+    failures += check(frontend.prepare_decision(text).summary.state_tokens == 65536,
+                      "multimodal state at the exact token limit must fit");
+    text.questions = {{.instructions = std::string(8188, 'x'), .options = {""}}};
+    failures += check(
+        ninfer::targets::qwen3_8::decision_context_tokens(frontend.prepare_decision(text)) == 73728,
+        "decision row limit must count state and longest branch, not total branches");
+    text.questions[0].instructions.push_back('x');
+    failures += check(throws_invalid_argument([&] { (void)frontend.prepare_decision(text); }),
+                      "multimodal decision must reject an overbudget branch");
+    return failures;
+}
+
+int test_decision_media_errors() {
+    const auto owned        = decision_resources();
+    const Frontend frontend = FrontendFactory::create_component(owned);
+    using Kind              = ninfer::DecisionMediaErrorKind;
+    using Detail            = ninfer::ImageDetail;
+    const auto first        = decision_image(32, 32, Detail::Original);
+    auto invalid            = first;
+    invalid.image.bytes     = {0x00, 0x01, 0x02, 0x03};
+    auto input              = decision_input({{.text = "x"}, first, {.text = "x"}, invalid});
+    int failures            = check(throws_decision_media(1, Kind::InvalidMedia,
+                                                          [&] { (void)frontend.prepare_decision(input); }),
+                                    "corrupt second image must report image index 1, not state-part index 3");
+    input.state.back().image.bytes.clear();
+    failures += check(throws_decision_media(1, Kind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(input); }),
+                      "empty second image must retain its image index");
+    input.state.back() = first;
+    input.state.back().image.bytes.resize(14);
+    failures += check(throws_decision_media(1, Kind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(input); }),
+                      "truncated decoded image must retain its image index");
+    input.state.back()            = first;
+    input.state.back().image.kind = ninfer::MediaKind::Video;
+    failures += check(throws_decision_media(1, Kind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(input); }),
+                      "second image source validation must retain its image index");
+    input.state.back()        = first;
+    input.state.back().detail = static_cast<Detail>(255);
+    failures += check(throws_decision_media(1, Kind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(input); }),
+                      "invalid second image detail must retain its image index");
+    input.state.back() = decision_image(201, 1, Detail::High);
+    failures += check(throws_decision_media(1, Kind::InvalidMedia,
+                                            [&] { (void)frontend.prepare_decision(input); }),
+                      "image resize validation must retain its image index");
+    input.state.back()     = decision_image(64, 64, Detail::Original);
+    const Frontend limited = FrontendFactory::create_component(owned, true, 4);
+    failures += check(throws_decision_media(1, Kind::BudgetExceeded,
+                                            [&] { (void)limited.prepare_decision(input); }),
+                      "cumulative vision capacity must attribute the image that exceeds it");
+    const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
+                                   .tokenizer_config_json  = owned.tokenizer_config_json,
+                                   .generation_config_json = owned.generation_config_json});
+    fi::ProcessorOptions options;
+    options.max_decoded_pixels = 1024;
+    failures +=
+        check(throws_decision_media(
+                  1, Kind::BudgetExceeded,
+                  [&] { (void)fi::process_decision_state(tokenizer, 248060, input, options); }),
+              "decoder pixel resource limits must retain the second image index");
+    options                 = {};
+    options.max_media_bytes = first.image.bytes.size();
+    failures +=
+        check(throws_decision_media(
+                  1, Kind::BudgetExceeded,
+                  [&] { (void)fi::process_decision_state(tokenizer, 248060, input, options); }),
+              "decoder encoded-byte resource limits must retain the second image index");
+    return failures;
+}
+
 int test_disabled_vision() {
     const Frontend frontend = FrontendFactory::create_component(resources(), false);
     int failures = check(throws_invalid_argument([&] { (void)frontend.prepare(image_input()); }),
@@ -1423,5 +1829,9 @@ int main() {
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_ill_formed_utf8_is_replaced();
     failures += test_disabled_vision();
+    failures += test_decision_layout();
+    failures += test_decision_image_profiles();
+    failures += test_decision_budgets();
+    failures += test_decision_media_errors();
     return failures == 0 ? 0 : 1;
 }

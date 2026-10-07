@@ -60,6 +60,7 @@ struct PrefillContext {
     std::int32_t adapter = -1;
     // Decision for every unit of a System One decision, which admits no INT8 activations.
     qwen3_8::TextPhase phase = qwen3_8::TextPhase::Prefill;
+    std::int32_t rope_delta  = 0;
 };
 
 struct OrdinaryBatchContext {
@@ -148,7 +149,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         VisionPrefillSession* vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> turn_checkpoint_capture_frontier,
                          bool finalize_at_end);
 

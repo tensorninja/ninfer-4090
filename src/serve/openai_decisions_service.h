@@ -14,6 +14,7 @@ namespace ninfer::serve {
 struct PreparedOpenAIDecision {
     std::string model;
     std::vector<product::openai_decisions::QuestionMeta> questions;
+    std::vector<std::string> image_params;
     PreparedDecisionRequest decision;
 };
 
@@ -25,7 +26,8 @@ struct OpenAIDecisionOutcome {
 class OpenAIDecisionsService {
 public:
     OpenAIDecisionsService(GenerationService& generation, const DecisionModels& models);
-    [[nodiscard]] PreparedOpenAIDecision prepare(std::string_view body) const;
+    [[nodiscard]] PreparedOpenAIDecision prepare(std::string_view body,
+                                                 std::function<bool()> is_cancelled = {}) const;
     [[nodiscard]] OpenAIDecisionOutcome run(PreparedOpenAIDecision& prepared,
                                             std::function<bool()> is_cancelled);
 

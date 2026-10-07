@@ -256,7 +256,7 @@ test('curl and Python send what the playground sends', () => {
   )
   const curl = curlSnippet('http://h:8080', body)
   expect(curl.split('\n')[0]).toBe('curl -s http://h:8080/typesafe/v1/systemone \\')
-  expect(curl).toContain('"note": "it\'\\\'\'s"')
+  expect(curl).toContain('"note":"it\'s"')
   const py = pythonSnippet('http://h:8080', body)
   expect(py).toContain('from typesafe_sdk import Noul, TypeSafeClient')
   expect(py).toContain('base_url="http://h:8080/typesafe"')

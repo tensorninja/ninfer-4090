@@ -86,7 +86,7 @@ std::string fixture_text(const Json& value) {
 
 ninfer::DecisionInput decision_input(const Json& input) {
     ninfer::DecisionInput decision;
-    decision.state = fixture_text(input.at("state"));
+    decision.state.push_back({.text = fixture_text(input.at("state"))});
     for (const Json& question : input.at("questions")) {
         ninfer::DecisionQuestion& target = decision.questions.emplace_back();
         target.instructions              = fixture_text(question.at("instructions"));
@@ -160,7 +160,7 @@ void check_user_tokens(const q8::Frontend& frontend, const std::vector<TokenId>&
     const auto text = item.at("text").get<std::string>();
     const auto ids  = item.at("ids").get<std::vector<TokenId>>();
     ninfer::DecisionInput input;
-    input.state = text;
+    input.state.push_back({.text = text});
     input.questions.push_back({.instructions = text, .options = {text}});
 
     std::vector<TokenId> expected;
@@ -172,8 +172,16 @@ void check_user_tokens(const q8::Frontend& frontend, const std::vector<TokenId>&
     expected.push_back(delimiters[4]);
 
     const q8::DecisionPrompt prompt = frontend.prepare_decision(input);
-    failures.check(std::ranges::equal(prompt.tokens, expected), label,
-                   difference(prompt.tokens, expected));
+    const std::span<const TokenId> expected_span(expected);
+    failures.check(std::ranges::equal(prompt.state.token_ids, expected_span.first(ids.size() + 1)),
+                   label, "state tokens differ from kev's");
+    failures.check(std::ranges::equal(prompt.branch_tokens, expected_span.subspan(ids.size() + 1)),
+                   label, "branch tokens differ from kev's");
+    input.state      = {{.text = text.substr(0, text.size() / 2)},
+                        {.text = text.substr(text.size() / 2)}};
+    const auto split = frontend.prepare_decision(input);
+    failures.check(split.state.token_ids == prompt.state.token_ids, label,
+                   "adjacent text parts differ from kev's contiguous text");
 }
 
 void check_encode(const q8::Frontend& frontend, const Json& item, const std::string& label,
@@ -193,7 +201,9 @@ void check_encode(const q8::Frontend& frontend, const Json& item, const std::str
         return;
     }
     const q8::DecisionPrompt prompt = frontend.prepare_decision(input);
-    check_ids(item, prompt.tokens, label, failures);
+    std::vector<TokenId> kev_tape   = prompt.state.token_ids;
+    kev_tape.insert(kev_tape.end(), prompt.branch_tokens.begin(), prompt.branch_tokens.end());
+    check_ids(item, kev_tape, label, failures);
 
     const ninfer::DecisionSummary& summary = prompt.summary;
     const auto state_tokens                = item.at("state_tokens").get<std::uint32_t>();
@@ -204,6 +214,29 @@ void check_encode(const q8::Frontend& frontend, const Json& item, const std::str
                        std::to_string(state_tokens));
     failures.check(summary.state_truncated == item.at("state_truncated").get<bool>(), label,
                    "state truncation flag differs from kev's");
+    failures.check(prompt.state.token_ids.size() == state_tokens &&
+                       prompt.state.positions.size() == state_tokens * 3 &&
+                       prompt.state.token_types == std::vector<std::uint8_t>(state_tokens, 0) &&
+                       prompt.state.rope_delta == 0 && summary.images == 0 &&
+                       summary.vision_tokens == 0 && !prompt.state.has_media(),
+                   label, "text-only state metadata differs from kev's");
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto positions = prompt.state.position_axis(axis);
+        bool linear          = true;
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            linear = linear && positions[i] == static_cast<std::int32_t>(i);
+        }
+        failures.check(linear, label, "text-only positions are not sequential");
+    }
+    if (summary.state_truncated) {
+        auto reject     = input;
+        reject.overflow = ninfer::DecisionStateOverflow::Reject;
+        bool rejected   = false;
+        try {
+            (void)frontend.prepare_decision(reject);
+        } catch (const ninfer::DecisionInputError&) { rejected = true; }
+        failures.check(rejected, label, "Reject overflow policy silently truncated the state");
+    }
     if (prompt.branches.size() != decide.size()) {
         failures.check(false, label,
                        std::to_string(prompt.branches.size()) + " branches, kev " +
@@ -218,13 +251,13 @@ void check_encode(const q8::Frontend& frontend, const Json& item, const std::str
         const q8::DecisionBranch& branch = prompt.branches[k];
         const std::string where          = label + " branch " + std::to_string(k);
         const std::uint32_t length       = decide[k] + 1 - begin;
-        failures.check(branch.begin == begin && branch.length == length, where,
+        failures.check(branch.begin == begin - state_tokens && branch.length == length, where,
                        "spans [" + std::to_string(branch.begin) + ", +" +
                            std::to_string(branch.length) + "), kev [" + std::to_string(begin) +
                            ", +" + std::to_string(length) + ")");
         std::vector<std::uint32_t> readouts;
         for (const std::uint32_t offset : branch.option_readouts) {
-            readouts.push_back(branch.begin + offset);
+            readouts.push_back(state_tokens + branch.begin + offset);
         }
         failures.check(readouts == options[k], where, "option readouts differ from kev's");
         longest = std::max(longest, length);
@@ -234,7 +267,7 @@ void check_encode(const q8::Frontend& frontend, const Json& item, const std::str
     failures.check(summary.questions == decide.size() && summary.options == count &&
                        summary.branch_tokens == begin - state_tokens &&
                        summary.longest_branch == longest &&
-                       summary.input_tokens() == prompt.tokens.size(),
+                       summary.input_tokens() == kev_tape.size(),
                    label, "summary counts differ from kev's layout");
 }
 

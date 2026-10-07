@@ -8,6 +8,7 @@ import {
 } from './json'
 import { buildBody, quote, type EditorState, type Section } from './request'
 import type { Analysis, Problem, SectionResult } from './validate'
+import { imagePayloadError, MAX_IMAGES } from './images'
 
 const STRING_LIMIT = 1048576
 const INPUT_LIMIT = 10485760
@@ -24,8 +25,12 @@ function exceedsLimit(value: string, limit: number): boolean {
 
 class Validator {
   readonly problems: Problem[] = []
+  private images = 0
 
-  constructor(readonly sec: Section) {}
+  constructor(
+    readonly sec: Section,
+    readonly vision?: boolean,
+  ) {}
 
   error(where: string, node: JsonNode, msg: string) {
     this.problems.push({
@@ -117,6 +122,12 @@ class Validator {
       }
       this.content(this.required(message, 'content', path), `${path}.content`)
     })
+    if (this.images && this.vision === false)
+      this.error(
+        'input',
+        node,
+        'This model has vision disabled; start the server with --vision to use images.',
+      )
   }
 
   content(node: JsonNode | undefined, path: string) {
@@ -132,14 +143,29 @@ class Validator {
       const type = this.text(typeNode, `${partPath}.type`)
       if (type === undefined) return
       if (type === 'input_image') {
-        this.error(`${partPath}.type`, typeNode!, 'Decisions supports text input only.')
+        this.fields(part, partPath, ['type', 'image_url', 'detail'])
+        if (++this.images > MAX_IMAGES)
+          this.error(partPath, part, `Decisions supports at most ${MAX_IMAGES} images per request.`)
+        const url = this.required(part, 'image_url', partPath)
+        if (url?.t !== 'str') {
+          if (url) this.error(`${partPath}.image_url`, url, 'Expected a string.')
+        } else {
+          const error = imagePayloadError(url.v)
+          if (error) this.error(`${partPath}.image_url`, url, error)
+        }
+        const detail = lastEntry(part, 'detail')?.v
+        if (detail && !(detail.t === 'lit' && detail.v === null)) {
+          const value = this.text(detail, `${partPath}.detail`)
+          if (value !== undefined && !['low', 'high', 'auto', 'original'].includes(value))
+            this.error(`${partPath}.detail`, detail, 'Expected auto, low, high, or original.')
+        }
+        return
+      }
+      if (type !== 'input_text') {
+        this.error(`${partPath}.type`, typeNode!, 'Expected input_text or input_image.')
         return
       }
       this.fields(part, partPath, ['type', 'text'])
-      if (type !== 'input_text') {
-        this.error(`${partPath}.type`, typeNode!, 'Expected input_text.')
-        return
-      }
       this.text(this.required(part, 'text', partPath), `${partPath}.text`, INPUT_LIMIT)
     })
   }
@@ -202,7 +228,7 @@ class Validator {
   }
 }
 
-function analyzeSection(sec: Section, text: string): SectionResult {
+function analyzeSection(sec: Section, text: string, vision?: boolean): SectionResult {
   const parsed = tryParse(text)
   const path = sec === 'state' ? 'input' : 'questions'
   if (parsed.error) {
@@ -223,7 +249,7 @@ function analyzeSection(sec: Section, text: string): SectionResult {
     }
   }
   const node = parsed.ast
-  const validator = new Validator(sec)
+  const validator = new Validator(sec, vision)
   if (sec === 'state') validator.input(node)
   else if (validator.array(node, path, 1, 200)) {
     node.items.forEach((question, i) => validator.question(question, `${path}[${i}]`))
@@ -232,10 +258,32 @@ function analyzeSection(sec: Section, text: string): SectionResult {
   return { problems: validator.problems, node, blocker: '' }
 }
 
-export function analyzeOpenAI(editor: EditorState, models: readonly string[] | null): Analysis {
-  const state = analyzeSection('state', editor.stateText)
+export function analyzeOpenAI(
+  editor: EditorState,
+  models: readonly string[] | null,
+  vision?: boolean,
+): Analysis {
+  const state = analyzeSection('state', editor.stateText, vision)
   const questions = analyzeSection('questions', editor.qText)
   const problems = [...state.problems, ...questions.problems]
+  const envelope = editor.requestText ? tryParse(editor.requestText).ast : null
+  const safety = envelope?.t === 'obj' ? lastEntry(envelope, 'safety_identifier')?.v : undefined
+  if (
+    safety &&
+    !(safety.t === 'lit' && safety.v === null) &&
+    (safety.t !== 'str' || exceedsLimit(safety.v, 128))
+  ) {
+    problems.push({
+      sec: 'model',
+      severity: 'error',
+      where: 'safety_identifier',
+      loc: null,
+      msg:
+        safety.t !== 'str'
+          ? 'Expected a string.'
+          : 'String exceeds the maximum of 128 Unicode characters.',
+    })
+  }
   const modelProblem = (severity: Problem['severity'], msg: string) => {
     problems.push({ sec: 'model', severity, msg, where: 'model', loc: { el: 'model' } })
   }
@@ -263,7 +311,7 @@ export function analyzeOpenAI(editor: EditorState, models: readonly string[] | n
     warnings: problems.length - errors,
     body:
       state.node && questions.node
-        ? buildBody(state.node, questions.node, editor.model, 'openai')
+        ? buildBody(state.node, questions.node, editor.model, 'openai', editor.requestText)
         : null,
   }
 }

@@ -66,6 +66,10 @@ function CardTip({ card }: { card: ModelCard }) {
     ['kv cache', card.kv_cache],
     ['max context', card.max_context ? `${count(card.max_context)} tokens` : ''],
     ['max state', card.max_state_tokens ? `${count(card.max_state_tokens)} tokens` : ''],
+    [
+      'vision',
+      card.vision === undefined ? '' : card.vision ? 'enabled' : 'disabled (--vision required)',
+    ],
     ['prefix reuse', card.prefix_reuse === undefined ? '' : card.prefix_reuse ? 'on' : 'off'],
   ]
   return (
@@ -191,8 +195,11 @@ export function Playground({
   const problemsPop = usePopover()
   const sharePop = usePopover()
   const [shared, setShared] = useState('')
+  const importFile = useRef<HTMLInputElement>(null)
 
-  useEffect(() => store.boot(), [store])
+  useEffect(() => {
+    void store.boot()
+  }, [store])
 
   useEffect(() => {
     window.addEventListener('hashchange', store.onHashChange)
@@ -209,7 +216,7 @@ export function Playground({
     )
     observer.observe(bar)
     return () => observer.disconnect()
-  }, [])
+  }, [s.booted])
 
   const jump = useCallback((loc: Loc | null) => {
     if (!loc) return
@@ -281,7 +288,13 @@ export function Playground({
   }, [run, nextProblem])
 
   const share = async (button: HTMLElement) => {
-    const url = store.shareLink()
+    let url: string | null
+    try {
+      url = store.shareLink()
+    } catch (error) {
+      store.showToast(error instanceof Error ? error.message : String(error))
+      return
+    }
     if (!url) {
       store.showToast('Fix the JSON error before copying a link.')
       return
@@ -308,8 +321,20 @@ export function Playground({
     return (section?.offsetHeight ?? 0) / (editorHeight() || 1)
   }
 
+  if (!s.booted)
+    return (
+      <main className="playground">
+        <p>Loading local drafts…</p>
+      </main>
+    )
+
   return (
     <main ref={root} className="playground" data-layout={layout}>
+      {s.persistenceError ? (
+        <p className="pg-err" role="alert">
+          {s.persistenceError}
+        </p>
+      ) : null}
       <h1 className="sr-only">Decision playground</h1>
       <div className="pg-bar">
         <label className="pg-bar__label" htmlFor="pg-protocol">
@@ -355,6 +380,59 @@ export function Playground({
           ))}
         </select>
         {s.edited ? <Pill tone="warning">edited</Pill> : null}
+        <button
+          type="button"
+          className="button"
+          disabled={Boolean(s.pending)}
+          onClick={() => importFile.current?.click()}
+        >
+          import JSON
+        </button>
+        <input
+          ref={importFile}
+          type="file"
+          accept="application/json,.json"
+          hidden
+          onChange={async (event) => {
+            const file = event.currentTarget.files?.[0]
+            event.currentTarget.value = ''
+            if (!file) return
+            const previous = store.getSnapshot().editor
+            try {
+              const text = await file.text()
+              if (store.getSnapshot().editor !== previous)
+                throw new Error('The request changed while reading the file. Import it again.')
+              if (
+                store.getSnapshot().edited &&
+                !window.confirm('Replace your edited request with the imported JSON?')
+              )
+                return
+              store.importRequest(text)
+            } catch (error) {
+              store.showToast(error instanceof Error ? error.message : String(error))
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="button"
+          onClick={() => {
+            try {
+              const url = URL.createObjectURL(
+                new Blob([store.exportRequest()], { type: 'application/json' }),
+              )
+              const link = document.createElement('a')
+              link.href = url
+              link.download = `${editor.protocol}-decision.json`
+              link.click()
+              setTimeout(() => URL.revokeObjectURL(url), 1000)
+            } catch (error) {
+              store.showToast(error instanceof Error ? error.message : String(error))
+            }
+          }}
+        >
+          export JSON
+        </button>
         <button
           type="button"
           className="button"

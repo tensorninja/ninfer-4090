@@ -124,8 +124,7 @@ PreparedSystemOne SystemOneService::prepare(std::string_view body) const {
     prepared.questions = std::move(request.questions);
     const double parse_seconds = std::chrono::duration<double>(Clock::now() - received).count();
     try {
-        prepared.decision = generation_.prepare_decision(std::move(request.input), adapter->name,
-                                                         DecisionOverflowPolicy::TruncateState);
+        prepared.decision = generation_.prepare_decision(std::move(request.input), adapter->name);
     } catch (const ninfer::DecisionInputError& error) {
         throw SystemOneError(422, error.what());
     } catch (const ninfer::RequestError& error) { throw_engine_error(error); }

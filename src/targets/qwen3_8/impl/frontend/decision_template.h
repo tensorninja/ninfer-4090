@@ -17,11 +17,7 @@ namespace ninfer::targets::qwen3_8::frontend_internal {
 // Resolves the five delimiters by name. Throws std::out_of_range when one is absent.
 [[nodiscard]] DecisionDelimiters resolve_decision_delimiters(const Tokenizer& tokenizer);
 
-// Escapes, tokenizes and lays out one decision with kev's serving limits. Throws
-// std::invalid_argument for a malformed input and DecisionInputError when a branch exceeds its row
-// budget, with kev's detail text.
-[[nodiscard]] DecisionPrompt layout_decision(const Tokenizer& tokenizer,
-                                             const DecisionDelimiters& delimiters,
-                                             const DecisionInput& input);
+void layout_decision_branches(const Tokenizer& tokenizer, const DecisionDelimiters& delimiters,
+                              const DecisionInput& input, DecisionPrompt& prompt);
 
 } // namespace ninfer::targets::qwen3_8::frontend_internal

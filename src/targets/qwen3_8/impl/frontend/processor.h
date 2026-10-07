@@ -52,6 +52,7 @@ struct VisionItem {
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
     std::array<std::uint8_t, 32> content_digest{};
+    std::array<std::uint8_t, 32> preprocessing_digest{};
     std::vector<double> timestamps;
     std::vector<TokenSpan> token_spans;
 };
@@ -119,6 +120,15 @@ void adjust_rendered_boundaries_for_replacement(RenderedChat& rendered, std::siz
                                                 std::size_t replacement_size);
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
+
+struct ProcessedDecisionState {
+    ProcessedInput input;
+    bool truncated = false;
+};
+
+ProcessedDecisionState process_decision_state(const Tokenizer& tokenizer, TokenId state_token,
+                                              const DecisionInput& input,
+                                              const ProcessorOptions& options);
 
 class Processor {
 public:

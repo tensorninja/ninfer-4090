@@ -311,6 +311,8 @@ Json decision_request_json(const DecisionLogContext& context) {
                 {"allow_prefix_reuse", context.allow_prefix_reuse},
                 {"questions", summary.questions},
                 {"options", summary.options},
+                {"images", summary.images},
+                {"vision_tokens", summary.vision_tokens},
                 {"state_tokens", summary.state_tokens},
                 {"state_truncated", summary.state_truncated},
                 {"branch_tokens", summary.branch_tokens},
@@ -568,6 +570,7 @@ std::string format_decision_start(const DecisionLogContext& context) {
     out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] "
         << context.protocol << " model=" << context.model << " adapter=" << context.adapter
         << " questions=" << summary.questions << " options=" << summary.options
+        << " images=" << summary.images << " vision_tokens=" << summary.vision_tokens
         << " state=" << summary.state_tokens << (summary.state_truncated ? " (truncated)" : "")
         << " branches=" << summary.branch_tokens << " longest_branch=" << summary.longest_branch
         << " reuse=" << (context.allow_prefix_reuse ? "on" : "off") << " \xE2\x86\x92 submitted";
@@ -584,12 +587,14 @@ std::string format_decision_done(const DecisionLogContext& context,
     out << "[req " << context.id << " x_request_id=" << context.x_request_id
         << "] done decision protocol=" << context.protocol
         << " questions=" << result.summary.questions << " state=" << result.summary.state_tokens
+        << " images=" << result.summary.images << " vision_tokens=" << result.summary.vision_tokens
         << " reused=" << result.reused_state_tokens
         << " source=" << continuation_source_name(result.state_source)
         << " branches=" << result.summary.branch_tokens << " passes=" << result.branch_passes
         << " long_chunks=" << result.long_branch_chunks << " slot=" << result.slot
         << " output_tokens=" << output_tokens << std::fixed << std::setprecision(1)
         << " queue=" << timings.queue_seconds * 1000.0 << "ms"
+        << " vision=" << timings.vision_seconds * 1000.0 << "ms"
         << " state_prefill=" << rate(computed_state, timings.state_seconds)
         << " branch_prefill=" << rate(result.summary.branch_tokens, timings.branch_seconds)
         << " execution=" << timings.execution_seconds * 1000.0 << "ms" << " wall="
@@ -880,6 +885,7 @@ std::string format_decision_done_json(const std::string& server_instance_id,
              {"queue", timings.queue_seconds},
              {"restore", timings.restore_seconds},
              {"state", timings.state_seconds},
+             {"vision", timings.vision_seconds},
              {"branch", timings.branch_seconds},
              {"execution", timings.execution_seconds},
              {"total", context.prepare_seconds + timings.total_seconds - timings.prepare_seconds}};

@@ -1,10 +1,18 @@
 // The state: a list of name/value fields for the common case, or any JSON value.
 
-import { useRef, type CSSProperties, type RefObject } from 'react'
+import { useRef, useState, type CSSProperties, type RefObject } from 'react'
 
 import { cx } from '../components/ui'
 import { CodeEditor, plainEnter, type CodeEditorHandle } from './CodeEditor'
 import { kindOf } from './json'
+import {
+  IMAGE_DETAILS,
+  imagePayloadError,
+  inputImages,
+  inputMessages,
+  MAX_IMAGES,
+  type ImageDetail,
+} from './images'
 import { filledFields, nextId, plural, type EditorState, type StateMode } from './request'
 import { EditorSection, GrowArea, marksFor, severities, useFocusAfterRender } from './Section'
 import type { Note, PlaygroundStore } from './store'
@@ -50,6 +58,20 @@ export function StateEditor({
               : kindOf(node)
   const sev = severities(result.problems)
   const parse = result.problems.find((p) => p.parse)?.parse
+  const [messageIndex, setMessageIndex] = useState(0)
+  const [position, setPosition] = useState('end')
+  const [detail, setDetail] = useState<ImageDetail>('auto')
+  const [reading, setReading] = useState(false)
+  const files = useRef<HTMLInputElement>(null)
+  const messages = inputMessages(node)
+  const message = messages.find((item) => item.index === messageIndex) ?? messages[0]
+  const length = message?.content.t === 'arr' ? message.content.items.length : message ? 1 : 0
+  const images = inputImages(node)
+  const enabled = store.imageControlsEnabled() && !reading
+  const canInsert =
+    enabled &&
+    images.length < MAX_IMAGES &&
+    (Boolean(message) || (node?.t === 'arr' && !node.items.length))
 
   const addField = () => {
     const id = nextId()
@@ -77,6 +99,144 @@ export function StateEditor({
       style={style}
     >
       <div ref={root} className="pg-state">
+        {editor.protocol === 'openai' ? (
+          <div className="pg-images">
+            <div className="pg-images__tools">
+              <button
+                type="button"
+                className="button"
+                disabled={!canInsert}
+                onClick={() => files.current?.click()}
+              >
+                {reading ? 'reading images…' : '+ images'}
+              </button>
+              <input
+                ref={files}
+                type="file"
+                accept="image/*"
+                multiple
+                hidden
+                onChange={async (event) => {
+                  const selected = Array.from(event.currentTarget.files ?? [])
+                  event.currentTarget.value = ''
+                  if (!selected.length) return
+                  setReading(true)
+                  try {
+                    await store.addImageFiles(
+                      selected,
+                      message?.index ?? 0,
+                      position === 'end' ? length : Number(position),
+                      detail,
+                    )
+                  } catch (error) {
+                    store.showToast(error instanceof Error ? error.message : String(error))
+                  } finally {
+                    setReading(false)
+                  }
+                }}
+              />
+              <select
+                className="pg-select"
+                aria-label="Image message"
+                disabled={!canInsert}
+                value={message?.index ?? 0}
+                onChange={(event) => {
+                  setMessageIndex(Number(event.target.value))
+                  setPosition('end')
+                }}
+              >
+                {messages.length ? (
+                  messages.map((item) => (
+                    <option key={item.index} value={item.index}>
+                      message {item.index + 1}
+                    </option>
+                  ))
+                ) : (
+                  <option value={0}>new user message</option>
+                )}
+              </select>
+              <select
+                className="pg-select"
+                aria-label="Image insertion position"
+                disabled={!canInsert}
+                value={position}
+                onChange={(event) => setPosition(event.target.value)}
+              >
+                <option value="end">after all parts</option>
+                {Array.from({ length }, (_, index) => (
+                  <option key={index} value={index}>
+                    before part {index + 1}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="pg-select"
+                aria-label="New image detail"
+                disabled={!canInsert}
+                value={detail}
+                onChange={(event) => setDetail(event.target.value as ImageDetail)}
+              >
+                {IMAGE_DETAILS.map((value) => (
+                  <option key={value} value={value}>
+                    {value === 'missing' ? 'omit detail' : value}
+                  </option>
+                ))}
+              </select>
+              <span>
+                {images.length}/{MAX_IMAGES} images
+              </span>
+            </div>
+            <p className="pg-ans__sub">
+              Inline files only; bytes are preserved. JSON controls message and part order. The
+              server’s request and media budgets still apply.{' '}
+              {!store.imageControlsEnabled() && !store.getSnapshot().pending
+                ? 'Image controls require a model with vision enabled (--vision).'
+                : ''}
+            </p>
+            {images.length ? (
+              <div className="pg-images__list">
+                {images.map((image) => (
+                  <figure key={`${image.message}:${image.part}`} className="pg-image">
+                    {image.url && !imagePayloadError(image.url) ? (
+                      <img
+                        src={image.url}
+                        alt={`Message ${image.message + 1}, image part ${image.part + 1}`}
+                        loading="lazy"
+                      />
+                    ) : (
+                      <span>invalid inline image</span>
+                    )}
+                    <figcaption>
+                      message {image.message + 1} · part {image.part + 1}
+                      <select
+                        className="pg-select"
+                        aria-label={`Detail for message ${image.message + 1} part ${image.part + 1}`}
+                        disabled={!enabled}
+                        value={image.detail}
+                        onChange={(event) =>
+                          store.setImageDetail(
+                            image.message,
+                            image.part,
+                            event.target.value as ImageDetail,
+                          )
+                        }
+                      >
+                        {!IMAGE_DETAILS.some((value) => value === image.detail) ? (
+                          <option value={image.detail}>invalid detail</option>
+                        ) : null}
+                        {IMAGE_DETAILS.map((value) => (
+                          <option key={value} value={value}>
+                            {value === 'missing' ? 'omit detail' : value}
+                          </option>
+                        ))}
+                      </select>
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {editor.stateMode === 'json' ? (
           <CodeEditor
             ref={editorRef}

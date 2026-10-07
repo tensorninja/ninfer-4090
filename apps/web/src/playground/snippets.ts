@@ -5,8 +5,8 @@
 // System One does not read, so those are left out of the Python with a comment, and a question
 // the classes cannot express is passed as the plain dict the SDK also accepts.
 
-import { dedupe, formatJson, lastEntry, type JsonNode, type ObjectNode } from './json'
-import { bodyNode, isQuestionType, type Protocol, type RequestBody } from './request'
+import { dedupe, lastEntry, tryParse, type JsonNode, type ObjectNode } from './json'
+import { isQuestionType, type Protocol, type RequestBody } from './request'
 
 const ENDPOINT = '/typesafe/v1/systemone'
 
@@ -14,11 +14,11 @@ export const endpointFor = (protocol: Protocol): string =>
   protocol === 'openai' ? '/v1/decisions' : ENDPOINT
 
 export function curlSnippet(origin: string, body: RequestBody): string {
-  const json = formatJson(bodyNode(body.state, body.questions, body.model, body.protocol))
+  const json = body.text
   return (
     `curl -s ${origin}${endpointFor(body.protocol)} \\\n` +
     `  -H 'content-type: application/json' \\\n` +
-    `  -d '${json.replace(/'/g, "'\\''")}'`
+    `  --data-binary @- <<'NINFER_REQUEST'\n${json}\nNINFER_REQUEST`
   )
 }
 
@@ -87,6 +87,8 @@ function sdkQuestion(question: JsonNode, indent: number): { code: string; cls: s
 export function pythonSnippet(origin: string, body: RequestBody): string {
   const questions = dedupe(body.questions)
   if (body.protocol === 'openai') {
+    const root = tryParse(body.text).ast
+    const safety = root?.t === 'obj' ? lastEntry(root, 'safety_identifier')?.v : undefined
     return (
       `from openai import OpenAI\n\n` +
       `client = OpenAI(api_key="local", base_url=${JSON.stringify(origin + '/v1')})\n\n` +
@@ -94,6 +96,7 @@ export function pythonSnippet(origin: string, body: RequestBody): string {
       `${PAD}model=${JSON.stringify(body.model)},\n` +
       `${PAD}input=${toPy(dedupe(body.state), 1)},\n` +
       `${PAD}questions=${toPy(questions, 1)},\n` +
+      (safety ? `${PAD}safety_identifier=${toPy(safety)},\n` : '') +
       `)\n` +
       `for index, answer in enumerate(response.answers):\n` +
       `${PAD}print(index, answer)\n`

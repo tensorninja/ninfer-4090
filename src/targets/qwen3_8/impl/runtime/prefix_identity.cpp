@@ -25,6 +25,7 @@ bool same_item(const VisionItem& left, const VisionItem& right) {
     return left.modality == right.modality && same_grid(left.grid, right.grid) &&
            left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
            left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
+           left.preprocessing_digest == right.preprocessing_digest &&
            same_spans(left.token_spans, right.token_spans);
 }
 

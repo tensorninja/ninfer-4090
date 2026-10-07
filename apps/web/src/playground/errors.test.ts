@@ -275,6 +275,9 @@ test('OpenAI errors retain the message, code, type and positional parameter path
 })
 
 test('OpenAI model, modality, overflow and retry errors explain their native contracts', () => {
+  const vision = openaiFailure(400, 'vision_disabled', 'input', 'Vision is disabled')
+  expect(vision.title).toBe('Vision is disabled (HTTP 400)')
+  expect(vision.help).toContain('--vision')
   const model = openaiFailure(404, 'model_not_found', 'model', "decision model 'nope' not found")
   expect(model.title).toBe('Unknown model (HTTP 404)')
   expect(model.lines[0]!.loc).toEqual(['model'])

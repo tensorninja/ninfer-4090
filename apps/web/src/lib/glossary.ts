@@ -217,7 +217,7 @@ export const GLOSSARY = {
   },
   decisionPhases: {
     title: 'Decision phases',
-    body: 'Summed engine time split into waiting for a lane, restoring a cached state from host memory or disk, prefilling the state, and the branch passes with their readout. State-dominated means states are being computed rather than reused; wait-dominated means the lanes are busy with chat or other decisions.',
+    body: 'Summed engine time split into waiting for a lane, restoring a cached state, image encoding, the remaining state prefill, and branch passes with their readout. Vision is a subset of logged state time, separated here rather than counted twice. State-dominated means states are being computed rather than reused; wait-dominated means the lanes are busy with chat or other decisions.',
   },
   stateReuse: {
     title: 'State reuse',

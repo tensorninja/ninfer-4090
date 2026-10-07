@@ -7,6 +7,8 @@
 import { lastEntry, tryParse, type JsonNode } from './json'
 import type { Protocol } from './request'
 
+export const MAX_SHARE_LENGTH = 32768
+
 export function b64urlEncode(text: string): string {
   const bytes = new TextEncoder().encode(text)
   let binary = ''
@@ -26,10 +28,16 @@ export function b64urlDecode(encoded: string): string {
 }
 
 export function shareUrl(base: string, bodyText: string): string {
+  const bytes = new TextEncoder().encode(bodyText).length
+  if (base.length + 3 + Math.ceil((bytes * 4) / 3) > MAX_SHARE_LENGTH)
+    throw new Error(
+      'This request is too large for a share link (32 KiB maximum). Export JSON instead; no images were omitted.',
+    )
   return `${base}#r=${b64urlEncode(bodyText)}`
 }
 
 export interface SharedRequest {
+  text: string
   protocol: Protocol
   state: JsonNode
   questions: JsonNode
@@ -43,12 +51,17 @@ export interface SharedRequest {
 export function readShareHash(hash: string): SharedRequest | null | undefined {
   const m = /^#r=(.*)$/s.exec(hash)
   if (!m) return undefined
+  if (hash.length > MAX_SHARE_LENGTH) return null
   let text: string
   try {
     text = b64urlDecode(decodeURIComponent(m[1]!))
   } catch {
     return null
   }
+  return readRequest(text)
+}
+
+export function readRequest(text: string): SharedRequest | null {
   const parsed = tryParse(text)
   if (!parsed.ast || parsed.ast.t !== 'obj') return null
   const input = lastEntry(parsed.ast, 'input')?.v
@@ -56,7 +69,14 @@ export function readShareHash(hash: string): SharedRequest | null | undefined {
   const questions = lastEntry(parsed.ast, 'questions')?.v
   if ((!state && !input) || (state && input) || !questions) return null
   const model = lastEntry(parsed.ast, 'model')?.v
+  if (model && model.t !== 'str') return null
+  if (input && !model) return null
+  const allowed = input
+    ? ['input', 'questions', 'model', 'safety_identifier']
+    : ['state', 'questions', 'model']
+  if (parsed.ast.entries.some((entry) => !allowed.includes(entry.k))) return null
   return {
+    text,
     protocol: input ? 'openai' : 'typesafe',
     state: (input ?? state)!,
     questions,

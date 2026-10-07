@@ -61,18 +61,21 @@ Json prepared_json(const PreparedDecision& prepared) {
     Json branches = Json::array();
     for (const DecisionBranch& branch : prepared.branches()) {
         Json entry               = Json::object();
-        entry["begin"]           = branch.begin;
+        entry["begin"]           = prepared.state_token_ids().size() + branch.begin;
         entry["length"]          = branch.length;
         entry["option_readouts"] = branch.option_readouts;
         branches.push_back(std::move(entry));
     }
-    const std::span<const TokenId> tokens = prepared.token_ids();
+    const auto state           = prepared.state_token_ids();
+    const auto branches_tokens = prepared.branch_token_ids();
+    std::vector<TokenId> tokens(state.begin(), state.end());
+    tokens.insert(tokens.end(), branches_tokens.begin(), branches_tokens.end());
     Json out                              = Json::object();
     out["format"]                         = "ninfer-decision-prepared";
     out["format_version"]                 = 1;
     out["state_tokens"]                   = prepared.summary().state_tokens;
     out["state_truncated"]                = prepared.summary().state_truncated;
-    out["tokens"]                         = std::vector<TokenId>(tokens.begin(), tokens.end());
+    out["tokens"]                         = std::move(tokens);
     out["branches"]                       = std::move(branches);
     return out;
 }

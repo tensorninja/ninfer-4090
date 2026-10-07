@@ -40,11 +40,28 @@ states, branches longer than a pass) through the engine CLI with every state col
 
 The reference needs the GPU alone after the engine runs; its result is reused while its inputs
 are unchanged. `report.json` in the work directory holds every number.
+
+Image decisions use native OpenAI requests with base64 data-URL images, not Engine-prepared
+tokens or pixels. First run a BF16-KV server with prefix/continuation reuse disabled:
+
+    python -m tools.parity.qwen3_8_27b.decision image-capture --requests images.jsonl \
+        --base-url http://127.0.0.1:8080/v1 --out served.jsonl
+
+Stop the server to release the GPU, then run the independent reference and probability gate:
+
+    python -m tools.parity.qwen3_8_27b.decision image-gates --requests images.jsonl \
+        --responses served.jsonl --weights models/qwen3_8_27b.ninfer --peft <peft_dir> \
+        --work-dir <dir>
+
+The trainer's head defaults to <peft_dir>/decision_head.safetensors. An explicit --reference
+reuses an already computed reference JSONL instead of running GPU inference. These gates test
+numerical equivalence, not image-task accuracy of a text-trained adapter.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import platform
 import random
 import struct
@@ -889,6 +906,132 @@ def gates(arguments: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def openai_probabilities(request: dict, response: dict) -> list[list[float]]:
+    """Read native typed answers in request order, rejecting a mismatched capture."""
+    if response.get("model") != request["model"]:
+        raise ValueError("response model does not match the request's adapter")
+    answers = response["answers"]
+    if len(answers) != len(request["questions"]):
+        raise ValueError("response question count mismatch")
+    rows = []
+    for question, answer in zip(request["questions"], answers, strict=True):
+        kind = question["type"]
+        if answer["type"] != kind or answer["name"] != question.get("name"):
+            raise ValueError("response question order/type/name mismatch")
+        if kind == "predicate":
+            probability = float(answer["probability"])
+            row = [1.0 - probability, probability]
+        else:
+            distribution = answer["probabilities"]
+            expected = ([entry["value"] for entry in question["choices"]]
+                        if kind == "choice" else list(range(len(question["levels"]))))
+            actual = [entry["value"] for entry in distribution]
+            if (actual != expected or any(type(a) is not type(b)
+                                          for a, b in zip(actual, expected))):
+                raise ValueError("response option order/value/type mismatch")
+            if kind == "score" and [entry["label"] for entry in distribution] != [
+                entry["label"] for entry in question["levels"]
+            ]:
+                raise ValueError("response level labels mismatch")
+            row = [float(entry["probability"]) for entry in distribution]
+        if (not row or any(not math.isfinite(p) or not 0.0 <= p <= 1.0 for p in row)
+                or abs(sum(row) - 1.0) > 1e-5):
+            raise ValueError("response probabilities are not a finite normalized distribution")
+        rows.append(row)
+    usage = response["usage"]
+    if (usage["output_tokens"] != 0 or usage["output_tokens_details"]["reasoning_tokens"] != 0
+            or usage["total_tokens"] != usage["input_tokens"]):
+        raise ValueError("decision capture must be prefill-only")
+    if usage["input_tokens_details"]["cached_tokens"] != 0:
+        raise ValueError("image qualification needs cold requests; disable prefix/continuation reuse")
+    return rows
+
+
+def image_capture(arguments: argparse.Namespace) -> None:
+    """Capture native replies without importing the numerical stack or occupying another GPU."""
+    import os
+    from urllib.request import Request, urlopen
+
+    requests = read_jsonl(arguments.requests)
+    if not requests:
+        raise SystemExit("requests JSONL is empty")
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("OPENAI_API_KEY"):
+        headers["Authorization"] = "Bearer " + os.environ["OPENAI_API_KEY"]
+    responses = []
+    for body in requests:
+        request = Request(arguments.base_url.rstrip("/") + "/decisions",
+                          data=json.dumps(body).encode("utf-8"), headers=headers)
+        with urlopen(request, timeout=arguments.timeout) as reply:
+            response = json.load(reply)
+        openai_probabilities(body, response)
+        responses.append(response)
+    write_jsonl(arguments.out, responses)
+    print(f"captured {len(responses)} cold requests to {arguments.out}; "
+          "stop the server before image-gates")
+
+
+def image_gates(arguments: argparse.Namespace) -> None:
+    """BF16 first: independently prepare the original native requests, then compare responses."""
+    work = arguments.work_dir
+    work.mkdir(parents=True, exist_ok=True)
+    requests = read_jsonl(arguments.requests)
+    responses = read_jsonl(arguments.responses)
+    if not requests or len(requests) != len(responses):
+        raise SystemExit("requests and responses must contain the same nonzero number of lines")
+    engine = [row for request, response in zip(requests, responses, strict=True)
+              for row in openai_probabilities(request, response)]
+    reference = arguments.reference
+    head = arguments.decision_head or arguments.peft / "decision_head.safetensors"
+    if reference is None:
+        reference = work / "image-reference.jsonl"
+        command = [sys.executable, "-m", "tools.reference.qwen3_8_27b.decision",
+                   "--weights", str(arguments.weights.resolve()),
+                   "--lora", str(arguments.peft.resolve()),
+                   "--decision-head", str(head.resolve()),
+                   "--openai-requests", str(arguments.requests.resolve()),
+                   "--out", str(reference.resolve()), "--kv-dtype", "bf16",
+                   "--prefill-chunk", str(arguments.reference_prefill_chunk)]
+        log = work / "image-reference.log"
+        with log.open("wb") as output:
+            status = subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                                    check=False).returncode
+        if status:
+            raise SystemExit(f"image reference failed ({status}); see {log}")
+    oracle = read_jsonl(reference)
+    if len(oracle) != len(requests):
+        raise SystemExit("reference request count mismatch")
+    for request, response, result in zip(requests, responses, oracle, strict=True):
+        if (result.get("format") != "ninfer-decision-probabilities"
+                or result.get("format_version") != 1
+                or len(result["questions"]) != len(request["questions"])):
+            raise SystemExit("reference format/question count mismatch")
+        if result.get("kv_dtype") != "bf16":
+            raise SystemExit("image qualification requires a BF16-KV reference")
+        if any(not row or any(not math.isfinite(p) or not 0 <= p <= 1 for p in row)
+               or abs(sum(row) - 1) > 1e-5 for row in result["questions"]):
+            raise SystemExit("reference probabilities are not finite normalized distributions")
+        if response["usage"]["input_tokens"] != result["input_tokens"]:
+            raise SystemExit("Engine token usage differs from independent native preparation")
+    if not any(result["image_grid_thw"] for result in oracle):
+        raise SystemExit("image qualification needs at least one image-bearing state")
+    comparison = agreement(engine, [row for result in oracle for row in result["questions"]])
+    report = {"configuration": {
+        "weights": str(arguments.weights), "peft": str(arguments.peft), "head": str(head),
+        "requests": str(arguments.requests), "responses": str(arguments.responses),
+        "reference": str(reference), "engine_kv_dtype_declared": "bf16",
+        "reference_kv_dtype": "bf16",
+        "reference_prefill_chunks": sorted({result["prefill_chunk"] for result in oracle}),
+        "requests_count": len(requests)}, "served_vs_reference": comparison,
+        "input_tokens_exact": True,
+        "image_grids": [result["image_grid_thw"] for result in oracle],
+        "rope_deltas": [result["rope_delta"] for result in oracle]}
+    (work / "image-report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    print(json.dumps(comparison, indent=1))
+    if not comparison["passed"]:
+        raise SystemExit(1)
+
+
 def fixtures(arguments: argparse.Namespace) -> None:
     kev_dir = arguments.kev.resolve()
     sys.path.insert(0, str(kev_dir))
@@ -939,6 +1082,26 @@ def main() -> None:
     gate.add_argument("--max-context", type=int, default=8192)
     gate.add_argument("--reference-kv-dtype", choices=("bf16", "int8"), default="bf16")
     gate.set_defaults(run=gates)
+
+    capture = commands.add_parser("image-capture", help="capture cold native OpenAI image decisions")
+    capture.add_argument("--requests", type=Path, required=True, help="native requests JSONL; "
+                         "use data-URL images, actual adapter pool names, a BF16-KV cold server")
+    capture.add_argument("--base-url", required=True, help="server API root ending in /v1")
+    capture.add_argument("--out", type=Path, required=True)
+    capture.add_argument("--timeout", type=float, default=600)
+    capture.set_defaults(run=image_capture)
+
+    image = commands.add_parser("image-gates", help="independent BF16 image-decision parity; "
+                                "stop the server first to release the GPU")
+    image.add_argument("--requests", type=Path, required=True)
+    image.add_argument("--responses", type=Path, required=True, help="image-capture JSONL")
+    image.add_argument("--weights", type=Path, required=True)
+    image.add_argument("--peft", type=Path, required=True)
+    image.add_argument("--decision-head", type=Path)
+    image.add_argument("--reference", type=Path, help="already computed native reference JSONL")
+    image.add_argument("--reference-prefill-chunk", type=int, default=1024)
+    image.add_argument("--work-dir", type=Path, required=True)
+    image.set_defaults(run=image_gates)
 
     arguments = parser.parse_args()
     arguments.run(arguments)

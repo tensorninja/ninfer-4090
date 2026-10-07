@@ -723,7 +723,7 @@ Request parse_request(std::string_view body) {
     // kev to_record.
     Request request;
     request.model       = model != nullptr ? model->text : std::string(kDefaultModel);
-    request.input.state = render(*state);
+    request.input.state = {{.text = render(*state)}};
     request.input.questions.reserve(types.size());
     request.questions.reserve(types.size());
     for (std::size_t q = 0; q < types.size(); ++q) {

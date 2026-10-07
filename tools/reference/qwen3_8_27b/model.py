@@ -250,7 +250,7 @@ class RefModel:
     def _prefill_text_chunk(
         self, part: list[int], chunk: int, tap
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Run one text-only chunk at the resident cursor with plain positions and advance it.
+        """Run one text-only chunk at the resident cursor and advance it.
 
         Returns the last layer's residual stream (before the final norm), the chunk's positions,
         and its start position.
@@ -259,9 +259,7 @@ class RefModel:
         start = state.position
         x = self.embed(part)
         self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
-        positions = torch.arange(
-            start, start + len(part), device=self.device, dtype=torch.int32
-        )
+        positions = self._positions(start, len(part))
         x = run_text(
             self,
             x,
@@ -306,6 +304,39 @@ class RefModel:
                 target = torch.tensor([index for index, _ in picked], device=self.device)
                 hidden[target] = self.final_hidden(x.index_select(0, source))
         return hidden
+
+    def prefill_multimodal_hidden(
+        self, batch: MultimodalBatch, vision: VisionOutput
+    ) -> None:
+        """Prefill a fresh multimodal decision state without logits, sampling, or MTP.
+
+        The resulting snapshot retains the three-axis position delta, so text-only branches
+        appended with prefill_hidden continue this state rather than reverting to ordinal RoPE.
+        """
+        _, state = self._ready()
+        ids = batch.input_ids.tolist()
+        if state.position != 0 or not ids:
+            raise ValueError("multimodal hidden prefill requires a fresh state and nonempty input")
+        if len(ids) > state.capacity:
+            raise ValueError("multimodal hidden prefill exceeds prepared context capacity")
+        if batch.mm_token_type_ids.numel() != len(ids) or batch.position_ids.shape != (3, len(ids)):
+            raise ValueError("multimodal token metadata shape mismatch")
+        state.mrope = True
+        state.rope_delta = batch.rope_delta
+        tap = NullTap()
+        for chunk, offset in enumerate(range(0, len(ids), self.prefill_chunk)):
+            part = ids[offset : offset + self.prefill_chunk]
+            x = self.embed(part)
+            batch.scatter_visual_embeddings_(
+                x, vision.image_embeddings, vision.video_embeddings, offset=offset
+            )
+            positions = batch.position_ids[:, offset : offset + len(part)].to(
+                device=self.device, dtype=torch.int32
+            )
+            run_text(self, x, positions, state.position, phase="prefill", step=0,
+                     chunk=chunk, tap=tap)
+            state.position += len(part)
+            state.kv.length = state.position
 
     def prefill(
         self,

@@ -24,6 +24,39 @@
   font: inherit;
 }
 
+.pg-images {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pg-images__tools,
+.pg-images__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.pg-image {
+  margin: 0;
+  width: 140px;
+}
+
+.pg-image img {
+  display: block;
+  width: 140px;
+  height: 100px;
+  object-fit: contain;
+  background: var(--bg);
+}
+
+.pg-image figcaption {
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 10px;
+}
+
 /* --- the request picker row ------------------------------------------------------------------ */
 
 .pg-bar {

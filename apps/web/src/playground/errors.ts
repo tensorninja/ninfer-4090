@@ -185,6 +185,13 @@ export function describeFailure(
     }
   }
   if (status === 400 && protocol === 'openai') {
+    if (error?.code === 'vision_disabled') {
+      return {
+        title: 'Vision is disabled (HTTP 400)',
+        help: 'Start the server with --vision to use inline images, or remove the image parts. GET /v1/models advertises modalities.vision for each decision model.',
+        lines,
+      }
+    }
     if (error?.code === 'context_length_exceeded') {
       return {
         title: 'The decision does not fit (HTTP 400)',
@@ -195,7 +202,7 @@ export function describeFailure(
     if (error?.code === 'unsupported_modality') {
       return {
         title: 'Unsupported input modality (HTTP 400)',
-        help: 'This decision adapter accepts text-only user input, not images or other modalities.',
+        help: 'OpenAI Decisions accepts inline base64 images only when the server starts with --vision. Remote URLs, file IDs and video are not supported; check the selected model’s modalities.vision.',
         lines,
       }
     }

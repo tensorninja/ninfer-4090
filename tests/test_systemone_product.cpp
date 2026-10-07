@@ -167,7 +167,11 @@ void test_requests(const Json& golden) {
                 continue;
             }
             check(request.model == item["model"].get<std::string>(), label + ": model");
-            check(request.input.state == item["state"].get<std::string>(), label + ": state");
+            check(request.input.state.size() == 1 &&
+                      request.input.state[0].kind == ninfer::DecisionPartKind::Text &&
+                      request.input.state[0].text == item["state"].get<std::string>() &&
+                      request.input.overflow == ninfer::DecisionStateOverflow::TruncateText,
+                  label + ": one rendered text part with TypeSafe truncation");
             const Json& questions = item["questions"];
             const Json& meta      = item["meta"];
             check(request.input.questions.size() == questions.size() &&

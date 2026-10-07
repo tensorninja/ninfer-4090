@@ -71,6 +71,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
             ? static_cast<std::int64_t>(*turn_checkpoint_capture_frontier)
             : -1);
     card.set_prefill_phase(state.phase);
+    card.set_rope_delta(state.rope_delta);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -82,7 +83,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
 
 PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         VisionPrefillSession* vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> turn_checkpoint_capture_frontier,
                          bool finalize_at_end) {
     if (state.dflash != nullptr) {
@@ -100,6 +101,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         turn_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*turn_checkpoint_capture_frontier)
             : -1);
+    card.set_prefill_phase(state.phase);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
@@ -114,6 +116,7 @@ void decision_pass(PrefillContext& state, std::span<const TokenId> ids,
                      state.text_kv_base, qwen3_8::PagedKVCacheView(), &state.text_cache, nullptr);
     configure_text_card(card, state.execution, nullptr, state.current_state_slot,
                         state.turn_checkpoint_state_slot, 0, state.adapter);
+    card.set_rope_delta(state.rope_delta);
     card.decision_pass(std::span<const int>(ids.data(), ids.size()), segments, state.text_kv_base);
 }
 

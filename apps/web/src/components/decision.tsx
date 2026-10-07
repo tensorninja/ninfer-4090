@@ -21,10 +21,16 @@ export const DECISION_PHASES = [
     hint: 'Importing a cached state from host memory (L2) or disk (L3).',
   },
   {
+    key: 'vision',
+    label: 'vision',
+    color: CHART.accent,
+    hint: 'Image encoding within state execution. Shown separately from the remaining state prefill, never counted twice.',
+  },
+  {
     key: 'state',
     label: 'state',
     color: CHART.violet,
-    hint: 'Prefilling the state tokens that no lane or tier already held.',
+    hint: 'Prefilling state tokens, excluding image encoding shown as vision.',
   },
   {
     key: 'branch',
@@ -43,7 +49,7 @@ export function DecisionWaterfall({
   height?: number
 }) {
   const phases = decisionPhases(record)
-  const total = phases.wait + phases.restore + phases.state + phases.branch
+  const total = phases.wait + phases.restore + phases.vision + phases.state + phases.branch
   return (
     <StackedBar
       height={height}

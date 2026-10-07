@@ -124,19 +124,25 @@ target profiles, corpora and training reports belong to the separate `llm-datase
 Merging into base weights, rescanning the directory after startup, and adapters for
 `qwen3.6-35b-a3b` are outside the current product.
 
-The 27B target also answers text-only decisions through OpenAI's `POST /v1/decisions` wire
-contract and TypeSafe's System One API with kev's semantics. A decision adapter is a LoRA adapter
+The 27B target also answers decisions through OpenAI's `POST /v1/decisions` wire
+contract and TypeSafe's System One API with kev's semantics. OpenAI accepts ordered text and inline
+image inputs when Vision is enabled at startup; TypeSafe retains its text-rendered state contract.
+A decision adapter is a LoRA adapter
 plus a pointer head (converted with `--decision-head`); it lives in the same pool and slots as
 generative adapters and is selected per request by its actual pool name on both surfaces, in the
 same process and weights as chat.
-OpenAI model discovery advertises decision-only endpoints and text-only modalities; generation
+OpenAI model discovery advertises decision-only endpoints and startup-resolved image capability; generation
 still rejects decision adapters. `jev-latest` is a TypeSafe-only alias, and there is no
-`gpt-6-luna` alias. OpenAI compatibility does not promise Luna outputs, images, confidence
-calibration, or refusal policy: there is no trained refusal detector or fabricated refusal.
+`gpt-6-luna` alias. OpenAI compatibility does not promise Luna outputs, image preprocessing,
+confidence calibration, or refusal policy: there is no trained refusal detector or fabricated refusal.
+Image detail uses explicit Qwen profiles: low-area resize, native high/auto resize, and original
+pixels with trailing replicated-edge padding. Capacity limits reject rather than silently downgrade
+an image. Image execution support does not qualify a text-trained adapter's image-task accuracy.
 OpenAI rejects state truncation and reports prefill-only usage; TypeSafe retains its existing
 truncation, rounding, usage and errors. `docs/serving.md` owns the exact wire contracts.
 A decision is a prefill-only request (the state, then one branch per question, each continuing the
-state alone) whose readouts feed the pointer head; it never samples, decodes or drafts. Decisions
+state alone) whose readouts feed the pointer head; it never samples, decodes or drafts. Vision is
+computed only for uncached state images, not once per question. Text decisions
 are qualified to kev's per-question serving tolerance on BF16 KV; the other codecs serve them with
 the measured deviation `docs/serving.md` publishes, and nothing enforces a codec. Decision
 training, its corpus and the engine-agnostic System One probe belong to `llm-datasets`; kev's
@@ -270,7 +276,7 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/product/systemone` owns the System One protocol values: request validation with kev's error
   shapes, state and question rendering, answers and confidences, and CPython `json.dumps`/`round`
   parity. It holds no model semantics; the Engine receives rendered texts.
-- `src/product/openai_decisions` owns OpenAI Decisions validation, text rendering, ordered typed
+- `src/product/openai_decisions` owns OpenAI Decisions validation, ordered text/image sources, ordered typed
   answers and usage; `src/product/decision` owns the shared probability calculations. Serving
   owns protocol-specific admission and errors; both decision surfaces use the same public Engine
   route, adapter pool, bounded FIFO, slots and continuation cache.

@@ -2,7 +2,14 @@ import { expect, test } from 'bun:test'
 
 import { compactJson } from './json'
 import { buildBody } from './request'
-import { b64urlDecode, b64urlEncode, readShareHash, shareUrl } from './share'
+import {
+  b64urlDecode,
+  b64urlEncode,
+  MAX_SHARE_LENGTH,
+  readRequest,
+  readShareHash,
+  shareUrl,
+} from './share'
 
 const BODY =
   '{"state":{"id":9007199254740993,"note":"caf\u00e9 \u{1F600}"},"questions":{"q":{"type":"noul"},"q":{"type":"noul","instructions":"i"}},"model":"m"}'
@@ -43,4 +50,20 @@ test('native OpenAI share links preserve ordered typed values and select their p
   expect(shared.protocol).toBe('openai')
   expect(buildBody(shared.state, shared.questions, shared.model, shared.protocol).text).toBe(body)
   expect(readShareHash('#r=' + b64urlEncode('{"state":"s","input":"i","questions":[]}'))).toBeNull()
+})
+
+test('oversized links fail explicitly without omitting image bytes; JSON transfer remains exact', () => {
+  const body =
+    '{\n"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,' +
+    'AAAA'.repeat(9000) +
+    '"}]}],"questions":[{"type":"predicate","instructions":"?"}]}\n'
+  expect(() => shareUrl('http://h/playground', body)).toThrow(
+    'Export JSON instead; no images were omitted',
+  )
+  expect(readShareHash('#r=' + 'a'.repeat(MAX_SHARE_LENGTH))).toBeNull()
+  const request = readRequest(body)!
+  expect(
+    buildBody(request.state, request.questions, request.model, request.protocol, request.text).text,
+  ).toBe(body)
+  expect(readRequest('{"input":"s","questions":[],"model":"m","unknown":true}')).toBeNull()
 })

@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "ninfer/engine.h"
+#include "product/openai_decisions/request.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 #include "serve/tool_call_parser.h"
@@ -110,8 +111,6 @@ struct PreparedDecisionRequest {
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
-enum class DecisionOverflowPolicy { TruncateState, Reject };
-
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
@@ -160,8 +159,10 @@ public:
                           std::function<bool()> is_cancelled = {});
 
     [[nodiscard]] PreparedDecisionRequest prepare_decision(ninfer::DecisionInput input,
-                                                           std::string adapter,
-                                                           DecisionOverflowPolicy overflow) const;
+                                                           std::string adapter) const;
+    [[nodiscard]] PreparedDecisionRequest
+    prepare_decision(product::openai_decisions::Input input, std::string adapter,
+                     std::function<bool()> is_cancelled) const;
     // Consumes prepared.decision.
     ninfer::DecisionResult decide(PreparedDecisionRequest& prepared,
                                   std::function<bool()> is_cancelled = {});
@@ -174,6 +175,11 @@ public:
     void warmup();
 
 private:
+    [[nodiscard]] PreparedDecisionRequest
+    submit_decision(PreparedDecisionRequest prepared, ninfer::DecisionInput input,
+                    std::string adapter, HostInputLease host_input,
+                    const std::function<bool()>& is_cancelled) const;
+
     // One place of the bounded ingress (lanes plus pending queue) that generation and decisions
     // share. Throws ninfer::RequestError(Overloaded) when every place is taken.
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
@@ -184,6 +190,7 @@ private:
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
+    bool decision_images_supported_ = false;
     std::shared_ptr<RequestCapacity> request_capacity_;
     std::shared_ptr<MediaInputCapacity> media_input_capacity_;
 };

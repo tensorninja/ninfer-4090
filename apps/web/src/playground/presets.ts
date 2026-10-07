@@ -7,6 +7,7 @@
 // description, score criteria are lists lowest first, and noul criteria describe true and false.
 
 import type { Protocol } from './request'
+import presetImages from './preset-images.json'
 
 export interface Preset {
   name: string
@@ -818,6 +819,49 @@ export const PRESETS: readonly Preset[] = [
 
 export const presetNamed = (name: string) => PRESETS.find((p) => p.name === name)
 
+const PRODUCT_CONDITION_QUESTIONS = [
+  {
+    type: 'predicate',
+    name: 'visible_damage',
+    instructions:
+      'Does the product have visible damage, such as a crack, chip, tear, or dent? Ignore shadows and damage to the packaging.',
+  },
+  {
+    type: 'predicate',
+    name: 'packaging_damage',
+    instructions:
+      'Is the shipping box visibly crushed or torn? Evaluate the packaging separately from the product.',
+  },
+  {
+    type: 'choice',
+    name: 'product_category',
+    instructions: 'Which category best describes the product, excluding its packaging?',
+    choices: [
+      { value: 'drinkware', description: 'Mugs, cups, glasses, or drinking bottles.' },
+      { value: 'electronics', description: 'Electronic devices or accessories.' },
+      { value: 'clothing', description: 'Garments or wearable accessories.' },
+      { value: 'other', description: 'Another category or an unclear product.' },
+    ],
+  },
+  {
+    type: 'score',
+    name: 'damage_severity',
+    instructions:
+      'Rate only the visible damage to the product. Do not infer hidden damage or include damage to the box.',
+    levels: [
+      { label: 'None', description: 'No visible damage to the product.' },
+      {
+        label: 'Surface mark',
+        description: 'A superficial scratch or scuff, without a crack or break.',
+      },
+      {
+        label: 'Structural damage',
+        description: 'A visible crack, chip, tear, dent, or broken part.',
+      },
+    ],
+  },
+]
+
 export const OPENAI_PRESETS: readonly Preset[] = [
   {
     name: 'example',
@@ -891,6 +935,168 @@ export const OPENAI_PRESETS: readonly Preset[] = [
         type: 'predicate',
         name: 'replacement',
         instructions: 'Does the customer request a replacement?',
+      },
+    ],
+  },
+  {
+    name: 'image-shapes',
+    label: 'Image: colors and shapes',
+    state: [
+      {
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Inspect the image and answer using only visible evidence.' },
+          {
+            type: 'input_image',
+            image_url:
+              'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAUAAAADgCAIAAAD9mSinAAADNklEQVR42u3bwVFiURCGUbEeQbA2DhdkQgZkwIIMyMAgyMA4jISNa6zCugu033/7nLUzvL41n30RZ7PbX1+ATK+OAAQMCBgQMAgYEDAgYEDAIGBAwICAQcCAgAEBAwIGAQMCBgQMCBgEDAgYEDAIGBAwIGBAwCBgQMCAgAEBg4ABAQMCBgEDAgYEDAgYBAwIGBAwCBgQMCBgQMAgYEDAgICBn5a/foHPr4NTfq73tw+HgA0MAgYEDAgYBAwIGBAwIGAQMCBgQMAgYEcAAgYEDAgYmlgcAbm2l9PIl92OZwFDTLG//6mZehYwc0Y7+BemxyxgGqX76CVyMxYwHbt99IpxJQuY1ummL2QBI93gjH0OjHqTnsoGRiTzrGIbGPUGP6eAUUXw07pCI4bg67QNjHqDn1/AqDd4CgGj3uBZBIx6gycSMOoNnkvAqDd4OgFDMAFj/QbPKGDUGzypgFFv8LwCBu+BofH6LZxawKg3eHYBgys0tF+/JScgYLCBwfqtOAcBgw0MCBj3RqchYLCBwfpd/ZkIGGxgQMCAgPEGuMvJCBhsYEDAgIBBwDDAT7Bqz0fAYAMDAgYEDAIGBAwIGBAwCBgQMCBgEDAgYNq5Hc8OofB8BAw2MCBgQMAgYBjj51iFJyNgsIEBAQMCxtvgLmciYLCBsXAs4YrTEDDYwICAcW90DgIGGxgs4dWfgIDBBgZLuGJ2AaPh4KkFDK7Q0HsJV80rYDQcPKmA0XDwjAIG74Gh5RIun07AaDh4LgGj4eCJBIyGg2cRMBoOnkLAaDj4+Rf/pChpYHs5SdcGxipr/bQCRhXBz+kKjet08LcYGxidBF8QbGCs4uD35wJGxpHpCpi136j/reTcT6cFTOuFnP6LJQImZiE/K+aZfitbwKTGPN7zxP8nWcDM03NDPgcGAQMCBgQMAgYEDAgYEDAIGBAwIGAQMCBgQMCAgGF6m93+6hTABgYEDAgYBAwIGBAwIGAQMCBgQMAgYEDAgIABAYOAAQEDAgYEDAIGBAwIGAQMCBgQMCBgEDAgYEDAgIBBwICAAQGDgAEBAwIGBAwCBgQMCBgEDAgYEDAgYBAwIGBAwMCdbz4py+3Wwd0QAAAAAElFTkSuQmCC',
+            detail: 'low',
+          },
+        ],
+      },
+    ],
+    questions: [
+      {
+        type: 'predicate',
+        name: 'red_rectangle',
+        instructions: 'Does the image contain a red rectangle?',
+      },
+      {
+        type: 'choice',
+        name: 'background',
+        instructions: 'What is the background color?',
+        choices: [{ value: 'blue' }, { value: 'white' }, { value: 'red' }],
+      },
+      {
+        type: 'score',
+        name: 'shapes',
+        instructions: 'How many foreground shapes are visible? Do not count the background.',
+        levels: [{ label: 'No shapes' }, { label: 'One shape' }, { label: 'Two shapes' }],
+      },
+    ],
+  },
+  {
+    name: 'image-product-damage',
+    label: 'Image: product damage',
+    state: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Inspect the product and its packaging in this sample image.',
+          },
+          { type: 'input_image', image_url: presetImages.productDamage, detail: 'high' },
+        ],
+      },
+    ],
+    questions: PRODUCT_CONDITION_QUESTIONS,
+  },
+  {
+    name: 'image-packaging-only',
+    label: 'Image: packaging-only damage',
+    state: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Inspect the product and its packaging in this sample image.',
+          },
+          { type: 'input_image', image_url: presetImages.packagingOnly, detail: 'high' },
+        ],
+      },
+    ],
+    questions: PRODUCT_CONDITION_QUESTIONS,
+  },
+  {
+    name: 'image-before-after',
+    label: 'Images: before and after',
+    state: [
+      {
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Before: reference condition of the product.' },
+          { type: 'input_image', image_url: presetImages.packagingOnly, detail: 'high' },
+          {
+            type: 'input_text',
+            text: 'After: reported condition. Compare the product, not the box.',
+          },
+          { type: 'input_image', image_url: presetImages.productDamage, detail: 'high' },
+        ],
+      },
+    ],
+    questions: [
+      {
+        type: 'predicate',
+        name: 'same_product_type',
+        instructions:
+          'Do both images show the same type and color of product? Do not require proof that it is the same physical item.',
+      },
+      {
+        type: 'predicate',
+        name: 'new_damage',
+        instructions:
+          'Does the after image show a crack, chip, or break in the product that is not visible in the before image? Ignore the box and shadows.',
+      },
+      {
+        type: 'choice',
+        name: 'condition_change',
+        instructions: 'How has the visible condition of the product changed from before to after?',
+        choices: [
+          {
+            value: 'worse',
+            description: 'The after image shows additional visible product damage.',
+          },
+          { value: 'unchanged', description: 'No visible change in product damage.' },
+          { value: 'improved', description: 'The after image shows less visible product damage.' },
+          { value: 'unclear', description: 'The images do not support a reliable comparison.' },
+        ],
+      },
+    ],
+  },
+  {
+    name: 'image-support-screenshot',
+    label: 'Image: support screenshot triage',
+    state: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'A customer attached this sample screenshot. Triage the issue using only the visible interface and messages.',
+          },
+          { type: 'input_image', image_url: presetImages.supportScreenshot, detail: 'original' },
+        ],
+      },
+    ],
+    questions: [
+      {
+        type: 'predicate',
+        name: 'visible_error',
+        instructions: 'Does the screenshot show an operation failing, rather than succeeding?',
+      },
+      {
+        type: 'choice',
+        name: 'department',
+        instructions: 'Which department should handle the issue shown in the screenshot?',
+        choices: [
+          { value: 'billing', description: 'Payments, invoices, and refunds.' },
+          { value: 'technical', description: 'Problems using the product.' },
+          { value: 'shipping', description: 'Delivery and tracking.' },
+          { value: 'other', description: 'Requests outside these categories or unclear evidence.' },
+        ],
+      },
+      {
+        type: 'score',
+        name: 'severity',
+        instructions:
+          'How severe is the issue according to the screenshot? Use any workaround explicitly shown; do not invent one.',
+        levels: [
+          { label: 'Cosmetic', description: 'Appearance only; no lost functionality.' },
+          { label: 'Workaround available', description: 'A task fails, but another way works.' },
+          { label: 'Fully blocked', description: 'A task fails with no workaround shown.' },
+        ],
       },
     ],
   },

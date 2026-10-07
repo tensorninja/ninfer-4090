@@ -101,11 +101,15 @@ test.each([
   [null, 'input[0].content[0]', 'Expected an object.'],
   [{ text: 'text' }, 'input[0].content[0].type', 'Missing required parameter.'],
   [
-    { type: 'input_image', image_url: 'data:image/png;base64,AA==' },
-    'input[0].content[0].type',
-    'Decisions supports text input only.',
+    { type: 'input_image', image_url: 'https://example.test/image.png' },
+    'input[0].content[0].image_url',
+    'Expected an inline base64 image data URI.',
   ],
-  [{ type: 'output_text', text: 'text' }, 'input[0].content[0].type', 'Expected input_text.'],
+  [
+    { type: 'output_text', text: 'text' },
+    'input[0].content[0].type',
+    'Expected input_text or input_image.',
+  ],
   [{ type: 'input_text' }, 'input[0].content[0].text', 'Missing required parameter.'],
   [{ type: 'input_text', text: false }, 'input[0].content[0].text', 'Expected a string.'],
   [
@@ -289,4 +293,61 @@ test('string limits count Unicode characters, with a separate larger input limit
   expect(errorAt(analyze('x'.repeat(10485761)), 'input').msg).toBe(
     'String exceeds the maximum of 10485760 Unicode characters.',
   )
+})
+
+test('inline image details accept the native enum, null and omission with a separate payload bound', () => {
+  for (const detail of ['auto', 'low', 'high', 'original', null, undefined]) {
+    const image = {
+      type: 'input_image',
+      image_url: 'data:image/png;base64,' + 'AAAA'.repeat(300000),
+      detail,
+    }
+    expect(analyze([{ role: 'user', content: [image] }]).errors).toBe(0)
+  }
+})
+
+test.each([
+  [{ type: 'input_image' }, 'image_url', 'Missing required parameter.'],
+  [{ type: 'input_image', image_url: null }, 'image_url', 'Expected a string.'],
+  [
+    { type: 'input_image', image_url: { url: 'data:image/png;base64,AA==' } },
+    'image_url',
+    'Expected a string.',
+  ],
+  [{ type: 'input_image', file_id: 'file-123' }, 'file_id', 'Unknown parameter.'],
+  [
+    { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: true },
+    'detail',
+    'Expected a string.',
+  ],
+  [
+    { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'full' },
+    'detail',
+    'Expected auto, low, high, or original.',
+  ],
+  [{ type: 'input_video' }, 'type', 'Expected input_text or input_image.'],
+] as const)(
+  'rejects unsupported image fields and types at their native path: %j',
+  (part, suffix, message) => {
+    expect(
+      errorAt(analyze([{ role: 'user', content: [part] }]), `input[0].content[0].${suffix}`).msg,
+    ).toBe(message)
+  },
+)
+
+test('image count spans messages, duplicate fields use their last value, and discovered vision false blocks images', () => {
+  const image = { type: 'input_image', image_url: 'data:image/png;base64,AA==' }
+  const input = [
+    { role: 'user', content: Array(64).fill(image) },
+    { role: 'user', content: Array(64).fill(image) },
+  ]
+  expect(analyze(input).errors).toBe(0)
+  input[1]!.content.push(image)
+  expect(errorAt(analyze(input), 'input[1].content[64]').msg).toContain('128')
+  const e = editor(
+    '[{"role":"user","content":[{"type":"input_image","image_url":"remote","image_url":"data:image/png;base64,AA==","detail":false,"detail":null}]}]',
+  )
+  expect(analyzeOpenAI(e, null).errors).toBe(0)
+  expect(analyzeOpenAI(e, ['decision-adapter'], true).errors).toBe(0)
+  expect(errorAt(analyzeOpenAI(e, ['decision-adapter'], false), 'input').msg).toContain('--vision')
 })

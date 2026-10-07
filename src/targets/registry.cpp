@@ -135,6 +135,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.resource_count       = stats.resource_count;
     summary.lora_adapters        = std::move(lora.adapters);
     summary.decisions_supported  = Target::supports_decisions;
+    summary.decision_images_supported = Target::supports_decisions && options.enable_vision;
     summary.decision_limits      = Target::decision_limits;
     summary.lora_rank            = lora.rank;
     summary.lora_slots           = lora.slots;

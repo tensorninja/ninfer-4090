@@ -1168,9 +1168,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
             throw std::invalid_argument("multimodal positions must have shape [3,T]");
         }
-        if (multimodal->vision == nullptr) {
-            throw std::invalid_argument("multimodal prefill requires a Vision session");
-        }
         rope_delta_ = multimodal->rope_delta;
     } else if (text_kv_base_ == 0) {
         rope_delta_ = 0;
@@ -1207,10 +1204,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
-        if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
+        if (multimodal != nullptr && multimodal->vision != nullptr) {
             vision_chunk =
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
@@ -1449,13 +1443,18 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_8::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
+                                              VisionPrefillSession* vision, bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
     const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    if (vision == nullptr && std::any_of(input.token_types.begin() + begin,
+                                         input.token_types.begin() + begin + nominal_length,
+                                         [](std::uint8_t type) { return type != 0; })) {
+        throw std::logic_error("visual token prefill requires a Vision session");
+    }
+    const MultimodalPrefill multimodal{tokens, input.positions, vision, begin, input.rope_delta};
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
@@ -1498,16 +1497,23 @@ void TextContext::decision_pass(std::span<const int> ids, std::span<const Decisi
     nvtx::ScopedRange pass_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                  static_cast<std::uint64_t>(T));
     {
-        const auto roots  = workspace_recipe::text_prefill_roots<TextConfig>(work_, T, 0, 0);
+        const auto roots =
+            workspace_recipe::text_prefill_roots<TextConfig>(work_, T, rope_delta_ != 0 ? 1 : 0, 0);
         Tensor ids_device = roots.ids;
         copy_i32(ids.data(), ids_device, s);
         Tensor positions = roots.positions;
         copy_i32(positions_host.data(), positions, s);
+        Tensor rope_positions = positions;
+        if (rope_delta_ != 0) {
+            rope_positions = roots.rope_positions;
+            ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
+            ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
+        }
         Tensor segment_table = workspace_recipe::decision_segment_table(
             work_, static_cast<std::int32_t>(segments.size()));
         copy_i32(table_host.data(), segment_table, s);
         ScopedPositions scoped_cache(active_cache_positions_, positions);
-        ScopedPositions scoped_rope(active_rope_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
         ScopedValue<const Tensor*> scoped_segments(active_segment_table_, &segment_table);
         ScopedValue<std::uint32_t> scoped_prefix(segment_prefix_, prefix);
 

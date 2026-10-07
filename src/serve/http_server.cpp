@@ -1187,7 +1187,8 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response& res) {
-    PreparedOpenAIDecision prepared = decisions_->prepare(req.body);
+    PreparedOpenAIDecision prepared = decisions_->prepare(
+        req.body, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     DecisionLogContext context;
     context.id                 = ++request_seq_;
     context.x_request_id       = res.get_header_value("x-request-id");
@@ -1659,7 +1660,8 @@ void HttpServer::attach(GenerationService& service) {
         }
         openai_models_.push_back(
             {adapter.name, std::min(options_.max_context, load.decision_limits.max_row_tokens),
-             false, true, std::min(options_.max_context, load.decision_limits.max_state_tokens)});
+             load.decision_images_supported, true,
+             std::min(options_.max_context, load.decision_limits.max_state_tokens)});
     }
     systemone_.emplace(service, options_, public_model_id_, *decision_models_);
     decisions_.emplace(service, *decision_models_);

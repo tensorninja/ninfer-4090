@@ -20,7 +20,7 @@ test('OpenAI curl sends the native input, ordered questions and actual model to 
   expect(endpointFor('typesafe')).toBe('/typesafe/v1/systemone')
   expect(endpointFor('openai')).toBe('/v1/decisions')
   expect(curl.split('\n')[0]).toBe('curl -s http://h:8080/v1/decisions \\')
-  const payload = curl.split("  -d '")[1]!.slice(0, -1).replace(/'\\''/g, "'")
+  const payload = curl.split("<<'NINFER_REQUEST'\n")[1]!.slice(0, -'\nNINFER_REQUEST'.length)
   expect(JSON.parse(payload)).toEqual({
     input: "it's urgent",
     questions: [
