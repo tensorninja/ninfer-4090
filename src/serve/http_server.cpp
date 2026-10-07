@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <exception>
@@ -241,7 +242,10 @@ CompletionUsage usage_with_timings(const GenerationOutcome& outcome) {
 void write_error(httplib::Response& res, const ApiError& error) {
     const ApiError rendered = public_error(error);
     res.status              = rendered.status;
-    if (rendered.status == 429 || rendered.status == 503) { res.set_header("Retry-After", "1"); }
+    if (rendered.status == 429 || rendered.status == 503) {
+        res.set_header("Retry-After", "1");
+        res.set_header("retry-after-ms", "1000");
+    }
     res.set_content(make_error_body(rendered), "application/json");
 }
 
@@ -852,6 +856,9 @@ void HttpServer::register_routes() {
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
+    server_.Post("/v1/decisions", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_decisions(req, res);
+    });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
@@ -924,6 +931,17 @@ std::string HttpServer::require_model(const std::string& model) const {
     error.code    = "model_not_found";
     error.message = "model '" + model + "' not found";
     throw ApiException(std::move(error));
+}
+
+std::string HttpServer::resolve_messages_model(const std::string& model) const {
+    if (decision_models_ && decision_models_->find(model) != nullptr) {
+        throw ApiException({.status  = 404,
+                            .type    = "invalid_request_error",
+                            .message = "model '" + model + "' supports decisions, not generation",
+                            .param   = "model",
+                            .code    = "model_not_found"});
+    }
+    return resolve_model(model).value_or(std::string());
 }
 
 void HttpServer::handle_telemetry(const httplib::Request&, httplib::Response& res) const {
@@ -1110,14 +1128,15 @@ void HttpServer::handle_events(const httplib::Request&, httplib::Response& res) 
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, adapter_model_ids_, unix_time_now(),
-                                     options_.max_context, options_.enable_vision),
-                    "application/json");
+    res.set_content(make_models_list(openai_models_, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (!resolve_model(id).has_value()) {
+    const auto model =
+        std::find_if(openai_models_.begin(), openai_models_.end(),
+                     [&](const OpenAIModel& candidate) { return candidate.id == id; });
+    if (model == openai_models_.end()) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -1126,9 +1145,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(
-        make_model_object(id, unix_time_now(), options_.max_context, options_.enable_vision),
-        "application/json");
+    res.set_content(make_model_object(*model, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_systemone_models(const httplib::Request&, httplib::Response& res) const {
@@ -1147,6 +1164,7 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
     DecisionLogContext log_context;
     log_context.id                 = ++request_seq_;
     log_context.x_request_id       = res.get_header_value("x-typesafe-request-id");
+    log_context.protocol           = "systemone";
     log_context.model              = prepared->model;
     log_context.adapter            = prepared->adapter;
     log_context.summary            = prepared->decision.summary;
@@ -1164,6 +1182,32 @@ void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response
         write_systemone_error(res, error.status(), error.detail());
     } catch (const std::exception& error) {
         log_decision_error(log_context, 500, error.what());
+        throw;
+    }
+}
+
+void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response& res) {
+    PreparedOpenAIDecision prepared = decisions_->prepare(req.body);
+    DecisionLogContext context;
+    context.id                 = ++request_seq_;
+    context.x_request_id       = res.get_header_value("x-request-id");
+    context.protocol           = "openai_decisions";
+    context.model              = prepared.model;
+    context.adapter            = prepared.model;
+    context.summary            = prepared.decision.summary;
+    context.allow_prefix_reuse = options_.allow_prefix_reuse;
+    context.prepare_seconds    = prepared.decision.prepare_seconds;
+    log_decision_start(context);
+    try {
+        OpenAIDecisionOutcome outcome = decisions_->run(
+            prepared, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+        log_decision_done(context, outcome.result, 0);
+        set_owned_content(res, std::move(outcome.body), prepared.decision.lifetime);
+    } catch (const ApiException& error) {
+        log_decision_error(context, error.error().status, error.what());
+        write_error(res, error.error());
+    } catch (const std::exception& error) {
+        log_decision_error(context, 500, error.what());
         throw;
     }
 }
@@ -1441,7 +1485,8 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     try {
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
-        const GenerationRequest request = parse_messages_request(body, limits);
+        GenerationRequest request       = parse_messages_request(body, limits);
+        request.adapter                 = resolve_messages_model(request.model);
         const int input_tokens          = service_->count_prompt_tokens(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
@@ -1471,11 +1516,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        // The Anthropic endpoint accepts any `model` string (Claude Code sends real
-        // Claude model names) and echoes it back; it never 404s on model id. A string that
-        // does name a served model still selects it, so adapters are reachable here too.
         request         = parse_messages_request(body, limits);
-        request.adapter = resolve_model(request.model).value_or(std::string());
+        request.adapter           = resolve_messages_model(request.model);
         prepared        = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
@@ -1599,16 +1641,28 @@ void HttpServer::attach(GenerationService& service) {
     }
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
-    // Only generative adapters are OpenAI/Anthropic models; decision adapters are System One
-    // models and are served under the `/typesafe` prefix.
     adapter_names_.clear();
     adapter_model_ids_.clear();
+    openai_models_ = {{public_model_id_, options_.max_context, options_.enable_vision}};
     for (const ninfer::LoraAdapterInfo& adapter : load.lora_adapters) {
         if (adapter.kind != ninfer::LoraAdapterKind::Generative) { continue; }
         adapter_names_.push_back(adapter.name);
         adapter_model_ids_.push_back(public_model_id_ + "-" + adapter.name);
+        openai_models_.push_back(
+            {adapter_model_ids_.back(), options_.max_context, options_.enable_vision});
     }
-    systemone_.emplace(service, options_, public_model_id_);
+    decision_models_.emplace(load.lora_adapters);
+    for (const auto& adapter : decision_models_->adapters()) {
+        if (resolve_model(adapter.name).has_value()) {
+            throw std::invalid_argument("decision model '" + adapter.name +
+                                        "' conflicts with a generative model id");
+        }
+        openai_models_.push_back(
+            {adapter.name, std::min(options_.max_context, load.decision_limits.max_row_tokens),
+             false, true, std::min(options_.max_context, load.decision_limits.max_state_tokens)});
+    }
+    systemone_.emplace(service, options_, public_model_id_, *decision_models_);
+    decisions_.emplace(service, *decision_models_);
     service_                       = &service;
     events_.emit_server_start(options_, service.sampling_defaults(), public_model_id_,
                               systemone_->alias_binding(), load, service.memory_summary());

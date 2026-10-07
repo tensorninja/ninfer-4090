@@ -1,7 +1,13 @@
 import { expect, test } from 'bun:test'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 
+import { AnswerList, PreviewList } from './AnswerList'
 import { answerViews, codeSpans, pct, previewOf } from './answers'
 import { parseJson } from './json'
+import { buildBody } from './request'
+import { ResponsePane } from './ResponsePane'
+import { PlaygroundStore } from './store'
 
 // The billing-email example and ninfer-serve's answer to it on 2026-09-30 (systemone-decision-v7,
 // rk4v4 KV). refund_requested gained descriptions here, and its answer is the false-leaning 0.2835
@@ -107,4 +113,187 @@ test('backtick spans become code', () => {
     { code: false, text: ' say?' },
   ])
   expect(codeSpans('an `odd one')).toEqual([{ code: false, text: 'an `odd one' }])
+})
+
+const OPENAI_QUESTIONS = parseJson(`[
+  {"type":"predicate","name":"same","instructions":"Is a refund requested?"},
+  {"type":"choice","name":"same","instructions":"Which value?","choices":[
+    {"value":true,"description":"first boolean"},
+    {"value":"true","description":"a string"},
+    {"value":true,"description":"second boolean"}
+  ]},
+  {"type":"score","instructions":"How urgent?","levels":[
+    {"label":"today","description":"first level"},
+    {"label":"today","description":"second level"},
+    {"label":"tomorrow"}
+  ]}
+]`)
+const OPENAI_ANSWERS = [
+  { type: 'predicate', name: 'same', probability: 0.23456789 },
+  {
+    type: 'choice',
+    name: 'same',
+    choice: true,
+    probabilities: [
+      { value: true, probability: 0.15 },
+      { value: 'true', probability: 0.2 },
+      { value: true, probability: 0.65 },
+    ],
+    confidence: 0.475,
+  },
+  {
+    type: 'score',
+    name: null,
+    score: 0.5,
+    probabilities: [
+      { value: 0, label: 'today', probability: 0.5 },
+      { value: 1, label: 'today', probability: 0.5 },
+      { value: 2, label: 'tomorrow', probability: 0 },
+    ],
+    confidence: 0.25,
+  },
+]
+
+test('OpenAI answers join by position, not name, and preserve native predicate probabilities', () => {
+  const views = answerViews(OPENAI_ANSWERS, OPENAI_QUESTIONS, 'openai')
+  expect(views.map((v) => v.key)).toEqual(['0', '1', '2'])
+  expect(views.map((v) => v.label)).toEqual(['#1 same', '#2 same', '#3 (unnamed)'])
+  expect(views.map((v) => v.instructions)).toEqual([
+    'Is a refund requested?',
+    'Which value?',
+    'How urgent?',
+  ])
+  const v = views[0]!
+  expect(v.rows.map((row) => row.label)).toEqual(['no', 'yes'])
+  expect(v.rows[1]!.p).toBe(0.23456789)
+  expect(v.headline).toBe(1 - 0.23456789)
+  expect(v.win).toBe(0)
+  expect(v.confidence).toBeNull()
+})
+
+test('OpenAI keeps ordered duplicate typed choices and identifies the winning occurrence', () => {
+  const v = answerViews(OPENAI_ANSWERS, OPENAI_QUESTIONS, 'openai')[1]!
+  expect(v.rows.map((row) => [row.label, row.desc, row.p])).toEqual([
+    ['true', 'first boolean', 0.15],
+    ['"true"', 'a string', 0.2],
+    ['true', 'second boolean', 0.65],
+  ])
+  expect(v.win).toBe(2)
+  expect(v.headline).toBe(0.65)
+  expect(v.confidence).toBe(0.475)
+  const [tied] = answerViews(
+    [
+      {
+        ...OPENAI_ANSWERS[1],
+        probabilities: [
+          { value: false, probability: 0.5 },
+          { value: 'false', probability: 0.5 },
+        ],
+      },
+    ],
+    null,
+    'openai',
+  )
+  expect(tied!.win).toBe(0)
+  expect(tied!.runnerUp?.label).toBe('"false"')
+})
+
+test('OpenAI score levels retain indices, labels and descriptions, with first-mode ties', () => {
+  const v = answerViews(OPENAI_ANSWERS, OPENAI_QUESTIONS, 'openai')[2]!
+  expect(v.rows.map((row) => [row.level, row.label, row.desc])).toEqual([
+    ['0', 'today', 'first level'],
+    ['1', 'today', 'second level'],
+    ['2', 'tomorrow', ''],
+  ])
+  expect(v.win).toBe(0)
+  expect(v.score).toBe(0.5)
+  expect(v.maxLevel).toBe(2)
+  expect(v.confidence).toBe(0.25)
+  expect(v.unsure).toBe(true)
+})
+
+test('OpenAI preview and answer lists show every duplicate and distinguish typed choices', () => {
+  const preview = renderToStaticMarkup(
+    createElement(PreviewList, {
+      questions: OPENAI_QUESTIONS,
+      protocol: 'openai',
+    }),
+  )
+  expect(preview).toContain('#1 same')
+  expect(preview).toContain('#2 same')
+  expect(preview).toContain('#3 (unnamed)')
+  expect(preview).toContain('no / yes')
+  expect(preview).toContain('3 options')
+  expect(preview).toContain('3 levels')
+  const html = renderToStaticMarkup(
+    createElement(AnswerList, {
+      views: answerViews(OPENAI_ANSWERS, OPENAI_QUESTIONS, 'openai'),
+      collapsed: new Set(['1']),
+      onToggle: () => {},
+    }),
+  )
+  expect(html.match(/<details/g)).toHaveLength(3)
+  expect(html.match(/<details[^>]+open=""/g)).toHaveLength(2)
+  expect(html).toContain('&quot;true&quot;')
+  expect(html).toContain('first boolean')
+  expect(html).toContain('second boolean')
+})
+
+test('the prior OpenAI response retains its protocol, token/cache usage and answers after a switch', () => {
+  const store = new PlaygroundStore()
+  const initial = store.getSnapshot()
+  const body = buildBody(parseJson('"state"'), OPENAI_QUESTIONS, 'systemone-decision-v7', 'openai')
+  const data = {
+    model: 'systemone-decision-v7',
+    answers: OPENAI_ANSWERS,
+    usage: {
+      input_tokens: 123,
+      input_tokens_details: { cached_tokens: 37, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 123,
+    },
+  }
+  const html = renderToStaticMarkup(
+    createElement(ResponsePane, {
+      s: {
+        ...initial,
+        editor: { ...initial.editor, protocol: 'typesafe' },
+        ui: { ...initial.ui, view: 'answers' },
+        last: {
+          id: 'openai-run',
+          body,
+          data,
+          status: 200,
+          ok: true,
+          odd: false,
+          text: JSON.stringify(data),
+          ms: 19,
+          doneAt: 0,
+        },
+      },
+      store,
+      engine: {
+        connection: 'offline',
+        source: 'live',
+        decisions: [],
+        activeDecisions: [],
+        decisionErrors: [],
+      },
+      onGoLive: () => {},
+      onJump: () => {},
+      paneRef: null,
+    }),
+  )
+  expect(html).toContain('The request changed since this run')
+  expect(html).toContain('#2 same')
+  expect(html).toContain('second boolean')
+  expect(html).toContain('<dt>input tokens</dt><dd title="123">123</dd>')
+  expect(html).toContain('<dt>output tokens</dt><dd title="0">0</dd>')
+  expect(html).toContain('<dt>total tokens</dt><dd title="123">123</dd>')
+  expect(html).toContain('<dt>cached tokens</dt><dd title="37">37</dd>')
+  expect(html).toContain('<dt>cache write tokens</dt><dd title="0">0</dd>')
+  expect(html).toContain('x-request-id,')
+  expect(html).not.toContain('x-typesafe-request-id')
+  expect(html).not.toContain('<dt>latency</dt>')
 })

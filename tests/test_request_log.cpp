@@ -423,11 +423,12 @@ int main() {
                           std::string::npos,
                       "human request log must report a completed call turn as tool_calls");
 
-    // System One decisions: the request names a model and is answered by a decision adapter; the
+    // Decisions: the request names a model and is answered by a decision adapter; the
     // engine's phases decompose execution, and the wall time adds the HTTP-side preparation.
     DecisionLogContext decision;
     decision.id                     = 9;
     decision.x_request_id           = "6f1c0e2a9b7d4c3e8f5a1b2c3d4e5f60";
+    decision.protocol               = "systemone";
     decision.model                  = "jev-latest";
     decision.adapter                = "decider";
     decision.summary.state_tokens   = 1200;
@@ -448,33 +449,58 @@ int main() {
     decided.timings.branch_seconds    = 0.030;
     decided.timings.execution_seconds = 0.055;
     decided.timings.total_seconds     = 0.066;
-    const Json decision_start =
-        Json::parse(format_decision_start_json("serve-test", 4000, decision));
-    const Json decision_done =
-        Json::parse(format_decision_done_json("serve-test", 4100, decision, decided, 25));
-    const Json decision_error = Json::parse(
-        format_decision_error_json("serve-test", 4200, decision, 499, "client disconnected"));
-    const Json& decision_request = decision_done.at("request");
-    failures += check(decision_start.at("event") == "decision_start" &&
-                          decision_start.at("schema_version") == kRequestLogSchemaVersion &&
-                          decision_request.at("protocol") == "systemone" &&
-                          decision_request.at("model") == "jev-latest" &&
-                          decision_request.at("adapter") == "decider" &&
-                          decision_request.at("x_request_id") == decision.x_request_id &&
-                          decision_request.at("input_tokens") == 1290,
-                      "decision records must name the model, its adapter and the token layout");
-    failures += check(decision_done.at("event") == "decision_done" &&
-                          decision_done.at("result").at("output_tokens") == 25 &&
-                          decision_done.at("result").at("computed_state_tokens") == 200 &&
-                          decision_done.at("result").at("state_source") == "l1" &&
-                          std::abs(decision_done.at("timings_seconds").at("total").get<double>() -
-                                   0.069) < 1e-12 &&
-                          std::abs(decision_done.at("rates").at("state_tok_s").get<double>() -
-                                   10000.0) < 1e-6,
-                      "decision_done must decompose the decision's work and time");
-    failures += check(decision_error.at("event") == "decision_error" &&
-                          decision_error.at("error").at("status") == 499,
-                      "decision_error must carry the client-visible status");
+    DecisionLogContext openai_decision = decision;
+    openai_decision.id                 = 10;
+    openai_decision.x_request_id       = "req_openai_decision";
+    openai_decision.protocol           = "openai_decisions";
+    openai_decision.model              = "decider";
+    for (const DecisionLogContext& logged : {decision, openai_decision}) {
+        const Json decision_start =
+            Json::parse(format_decision_start_json("serve-test", 4000, logged));
+        const Json decision_done =
+            Json::parse(format_decision_done_json("serve-test", 4100, logged, decided, 25));
+        const Json decision_error = Json::parse(
+            format_decision_error_json("serve-test", 4200, logged, 499, "client disconnected"));
+        const Json& decision_request = decision_done.at("request");
+        failures +=
+            check(decision_start.at("event") == "decision_start" &&
+                      decision_start.at("schema_version") == 23 &&
+                      decision_done.at("schema_version") == 23 &&
+                      decision_error.at("schema_version") == 23 &&
+                      decision_start.at("request") == decision_request &&
+                      decision_error.at("request") == decision_request &&
+                      decision_request.at("request_id") == logged.id &&
+                      decision_request.at("protocol") == logged.protocol &&
+                      decision_request.at("model") == logged.model &&
+                      decision_request.at("adapter") == "decider" &&
+                      decision_request.at("x_request_id") == logged.x_request_id &&
+                      decision_request.at("input_tokens") == 1290,
+                  "decision records must preserve each protocol's request and token layout");
+        failures += check(
+            decision_done.at("event") == "decision_done" &&
+                decision_done.at("result").at("output_tokens") == 25 &&
+                decision_done.at("result").at("computed_state_tokens") == 200 &&
+                decision_done.at("result").at("state_source") == "l1" &&
+                decision_done.at("result").at("slot") == 2 &&
+                std::abs(decision_done.at("timings_seconds").at("total").get<double>() - 0.069) <
+                    1e-12 &&
+                std::abs(decision_done.at("rates").at("state_tok_s").get<double>() - 10000.0) <
+                    1e-6,
+            "decision_done must decompose the decision's work and time");
+        failures += check(decision_error.at("event") == "decision_error" &&
+                              decision_error.at("error").at("status") == 499 &&
+                              decision_error.at("error").at("message") == "client disconnected",
+                          "decision_error must carry the client-visible status and message");
+        failures += check(
+            format_decision_start(logged).find("] " + logged.protocol + " model=" + logged.model) !=
+                    std::string::npos &&
+                format_decision_done(logged, decided, 25)
+                        .find("done decision protocol=" + logged.protocol) != std::string::npos &&
+                format_decision_error(logged, 499, "client disconnected")
+                        .find("error 499 protocol=" + logged.protocol + " client disconnected") !=
+                    std::string::npos,
+            "human decision records must identify the submitted protocol");
+    }
 
     ThroughputReport throughput;
     throughput.interval_seconds                            = 2.0;

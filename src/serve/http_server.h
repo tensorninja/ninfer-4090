@@ -3,6 +3,8 @@
 #include "serve/event_stream.h"
 #include "serve/generation_service.h"
 #include "serve/gpu_telemetry.h"
+#include "serve/openai_decisions_service.h"
+#include "serve/openai_schema.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
@@ -51,6 +53,7 @@ public:
     [[nodiscard]] std::string require_model(const std::string& model) const;
 
 private:
+    [[nodiscard]] std::string resolve_messages_model(const std::string& model) const;
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
@@ -70,6 +73,7 @@ private:
     // System One (TypeSafe) routes under the /typesafe base path.
     void handle_systemone(const httplib::Request& req, httplib::Response& res);
     void handle_systemone_models(const httplib::Request& req, httplib::Response& res) const;
+    void handle_decisions(const httplib::Request& req, httplib::Response& res);
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
@@ -99,8 +103,11 @@ private:
     // Served model id per registered adapter, in bank order: `<public model id>-<adapter name>`.
     std::vector<std::string> adapter_model_ids_;
     std::vector<std::string> adapter_names_;
+    std::vector<OpenAIModel> openai_models_;
+    std::optional<DecisionModels> decision_models_;
     // Present once a service is attached.
     std::optional<SystemOneService> systemone_;
+    std::optional<OpenAIDecisionsService> decisions_;
     ResponseStore response_store_;
     ServeMetrics metrics_;
     EventStream events_;

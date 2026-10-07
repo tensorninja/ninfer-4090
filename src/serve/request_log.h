@@ -19,10 +19,9 @@
 
 namespace ninfer::serve {
 
-// Schema 22 reports chat and System One side by side: server_start lists the adapter pool with each
-// adapter's kind and served model id plus the System One surface, and the throughput record splits
-// out decision prefill and counts LoRA bank swaps and slot waits.
-inline constexpr int kRequestLogSchemaVersion        = 22;
+// Schema 23 distinguishes TypeSafe and OpenAI decisions by protocol within the shared decision
+// events, adapter inventory, decision prefill counters and LoRA bank metrics.
+inline constexpr int kRequestLogSchemaVersion        = 23;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 // The --kv-dtype spelling of a KV storage.
@@ -35,8 +34,8 @@ inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log
 // The LoRA pool as server_start and /telemetry both report it, so the two cannot drift: the bank
 // (`count`, `rank`, `slots`, `device_bytes`, `file_bytes`) and `pool`, every discovered adapter in
 // pool order with its kind and the model id that selects it. A generative adapter is the chat
-// model `<public model id>-<name>` on /v1; a decision adapter is the System One model `<name>` on
-// /typesafe and carries its calibration and model-card fields.
+// model `<public model id>-<name>` on /v1; a decision adapter is the model `<name>` on
+// /typesafe and /v1/decisions and carries its calibration and model-card fields.
 [[nodiscard]] nlohmann::json adapter_inventory_json(const ninfer::LoadSummary& load,
                                                     const std::string& public_model_id);
 // The System One surface: whether the target serves decisions, and the decision adapter the
@@ -70,12 +69,13 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
 };
 
-// A System One decision as submitted: the model it names, the decision adapter that answers it,
+// A decision as submitted: the protocol and model it names, the decision adapter that answers it,
 // and its token layout.
 struct DecisionLogContext {
     std::uint64_t id = 0;
-    // The x-typesafe-request-id the response carries.
+    // The request id the response carries.
     std::string x_request_id;
+    std::string protocol;
     std::string model;
     std::string adapter;
     ninfer::DecisionSummary summary;
@@ -125,7 +125,7 @@ struct BoardEnergySample {
 struct ThroughputReport {
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
-    // The part of computed_prefill_tokens System One decisions evaluated.
+    // The part of computed_prefill_tokens decisions evaluated.
     std::uint64_t decision_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;

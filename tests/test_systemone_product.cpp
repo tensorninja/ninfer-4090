@@ -1,3 +1,4 @@
+#include "product/decision/probability.h"
 #include "product/systemone/answers.h"
 #include "product/systemone/render.h"
 #include "product/systemone/request.h"
@@ -135,15 +136,17 @@ void test_numerics(const Json& golden) {
     }
 
     for (const Json& item : golden["sum"]) {
-        const std::string actual = python_float_repr(python_sum(numbers(item["values"])));
+        const std::string actual =
+            python_float_repr(ninfer::product::decision::sum(numbers(item["values"])));
         check(actual == item["expected"].get<std::string>(),
               "sum = " + actual + ", Python " + item["expected"].get<std::string>());
     }
 
     for (const Json& item : golden["confidence"]) {
         const std::vector<double> p = numbers(item["p"]);
-        const std::string choice    = python_float_repr(choice_confidence(p));
-        const std::string score     = python_float_repr(score_confidence(p));
+        const std::string choice =
+            python_float_repr(ninfer::product::decision::choice_confidence(p));
+        const std::string score = python_float_repr(ninfer::product::decision::score_confidence(p));
         check(choice == item["choice"].get<std::string>(),
               "choice_confidence = " + choice + ", Python " + item["choice"].get<std::string>());
         check(score == item["score"].get<std::string>(),

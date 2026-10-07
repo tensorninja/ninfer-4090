@@ -1,6 +1,6 @@
-// System One answers as distributions to draw.
+// Decision answers as distributions to draw.
 //
-// The server rounds every probability to four decimals (kev's round_prob). A noul answer is
+// TypeSafe rounds probabilities to four decimals; OpenAI preserves them. A noul answer is
 // p(true); a choice answer names the most likely option and carries every option's probability; a
 // score answer carries the expected level, the legend and the probability of each level. The
 // headline of each is the probability of the answer shown, and an answer whose headline is below
@@ -9,6 +9,7 @@
 // shown beside it as a secondary figure; noul has none and none is made up.
 
 import { compactJson, lastEntry, type JsonNode } from './json'
+import type { Protocol } from './request'
 
 export const UNSURE = 0.6
 
@@ -29,7 +30,9 @@ export interface DistRow {
 }
 
 export interface AnswerView {
+  /** Stable identity within a response: the TypeSafe key or OpenAI array position. */
   key: string
+  label: string
   type: string
   instructions: string
   /** Empty when the answer has a shape this page does not know; `raw` then holds it. */
@@ -111,18 +114,72 @@ function distribution(
   return { rows: [] as DistRow[], win: 0 }
 }
 
+function openaiDistribution(
+  type: string,
+  answer: Record<string, unknown>,
+  question: JsonNode | undefined,
+) {
+  if (type === 'predicate' && typeof answer.probability === 'number') {
+    const p = answer.probability
+    return {
+      rows: [
+        { label: 'no', p: 1 - p, desc: '' },
+        { label: 'yes', p, desc: '' },
+      ],
+      win: p > 0.5 ? 1 : 0,
+    }
+  }
+  if ((type === 'choice' || type === 'score') && Array.isArray(answer.probabilities)) {
+    const probs = answer.probabilities
+    if (!probs.length || !probs.every(isRecord)) return { rows: [], win: 0 }
+    const options = lastEntry(question, type === 'choice' ? 'choices' : 'levels')?.v
+    const typed = type === 'choice' && probs.some((option) => typeof option.value === 'boolean')
+    const rows: DistRow[] = probs.map((option, index) => ({
+      label:
+        type === 'score'
+          ? describeValue(option.label)
+          : typed
+            ? (JSON.stringify(option.value) ?? '')
+            : describeValue(option.value),
+      p: probability(option.probability),
+      desc: describeNode(
+        lastEntry(options?.t === 'arr' ? options.items[index] : undefined, 'description')?.v,
+      ),
+      ...(type === 'score' ? { level: String(option.value) } : {}),
+    }))
+    return { rows, win: rows.reduce((w, row, j) => (row.p > rows[w]!.p ? j : w), 0) }
+  }
+  return { rows: [] as DistRow[], win: 0 }
+}
+
+export const positionalLabel = (name: unknown, index: number): string =>
+  `#${index + 1} ${typeof name === 'string' ? name || '\u2205' : '(unnamed)'}`
+
 /**
  * One view per answer, in the server's order.
  *
  * @param questions The questions as sent, for their instructions and option descriptions.
  */
 export function answerViews(
-  answers: Record<string, unknown>,
+  answers: unknown,
   questions: JsonNode | null,
+  protocol: Protocol = 'typesafe',
 ): AnswerView[] {
-  return Object.keys(answers).map((key) => {
-    const answer = answers[key]
-    const question = lastEntry(questions, key)?.v
+  const entries: Array<[string, unknown]> =
+    protocol === 'openai'
+      ? Array.isArray(answers)
+        ? answers.map((answer, index) => [String(index), answer])
+        : []
+      : isRecord(answers)
+        ? Object.entries(answers)
+        : []
+  return entries.map(([key, answer], index) => {
+    const question =
+      protocol === 'openai'
+        ? questions?.t === 'arr'
+          ? questions.items[index]
+          : undefined
+        : lastEntry(questions, key)?.v
     const sentType = lastEntry(question, 'type')?.v
     const type =
       isRecord(answer) && typeof answer.type === 'string'
@@ -131,7 +188,7 @@ export function answerViews(
           ? sentType.v
           : ''
     const { rows, win } = isRecord(answer)
-      ? distribution(type, answer, question)
+      ? (protocol === 'openai' ? openaiDistribution : distribution)(type, answer, question)
       : { rows: [], win: 0 }
     const top = rows[win]
     const headline = top?.p ?? 0
@@ -142,6 +199,7 @@ export function answerViews(
     const record = isRecord(answer) ? answer : {}
     return {
       key,
+      label: protocol === 'openai' ? positionalLabel(record.name, index) : key,
       type,
       instructions: describeNode(lastEntry(question, 'instructions')?.v),
       rows,
@@ -150,7 +208,9 @@ export function answerViews(
       unsure,
       runnerUp,
       confidence:
-        type !== 'noul' && typeof record.confidence === 'number' ? record.confidence : null,
+        (type === 'choice' || type === 'score') && typeof record.confidence === 'number'
+          ? record.confidence
+          : null,
       score: type === 'score' && typeof record.score === 'number' ? record.score : null,
       maxLevel: Math.max(0, rows.length - 1),
       raw: answer,
@@ -159,11 +219,22 @@ export function answerViews(
 }
 
 /** What each question can answer, shown before the first run. */
-export function previewOf(question: JsonNode): string {
+export function previewOf(question: JsonNode, protocol: Protocol = 'typesafe'): string {
   const type = lastEntry(question, 'type')?.v
   const criteria = lastEntry(question, 'criteria')?.v
   const kind = type?.t === 'str' ? type.v : ''
   const count = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+  if (protocol === 'openai') {
+    if (kind === 'predicate') return 'no / yes'
+    const options = lastEntry(question, kind === 'choice' ? 'choices' : 'levels')?.v
+    if (kind === 'choice' || kind === 'score') {
+      const word = kind === 'choice' ? 'option' : 'level'
+      return options?.t === 'arr' && options.items.length
+        ? count(options.items.length, word)
+        : `no ${word}s yet`
+    }
+    return '\u2014'
+  }
   if (kind === 'noul') return 'true / false'
   if (kind === 'choice') {
     return criteria?.t === 'obj' && criteria.entries.length

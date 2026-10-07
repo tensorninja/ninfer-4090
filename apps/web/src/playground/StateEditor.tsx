@@ -60,9 +60,9 @@ export function StateEditor({
   return (
     <EditorSection
       id="pg-state"
-      title="State"
+      title={editor.protocol === 'openai' ? 'Input' : 'State'}
       sub={sub}
-      modes={MODES}
+      modes={editor.protocol === 'openai' ? [{ value: 'json', label: 'json' }] : MODES}
       mode={editor.stateMode}
       onMode={(mode) => {
         if (store.setMode('state', mode) && mode === 'json')
@@ -81,10 +81,14 @@ export function StateEditor({
           <CodeEditor
             ref={editorRef}
             id="pg-state-json"
-            label="State as JSON"
+            label={editor.protocol === 'openai' ? 'Input as JSON' : 'State as JSON'}
             value={editor.stateText}
             onChange={(text) => store.setStateText(text)}
-            placeholder={'{"field": "value"} or "plain text"'}
+            placeholder={
+              editor.protocol === 'openai'
+                ? '"Text to classify" or [{"role":"user","content":"Text"}]'
+                : '{"field": "value"} or "plain text"'
+            }
             marks={marksFor(result.problems, editor.stateText)}
             error={parse}
             invalid={Boolean(parse)}

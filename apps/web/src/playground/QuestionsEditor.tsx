@@ -62,8 +62,17 @@ export function QuestionsEditor({
       ? editor.questions.length
       : node?.t === 'obj'
         ? new Set(node.entries.map((e) => e.k)).size
-        : null
-  const sub = count !== null ? plural(count, 'question') : node ? 'not an object' : 'invalid JSON'
+        : node?.t === 'arr' && editor.protocol === 'openai'
+          ? node.items.length
+          : null
+  const sub =
+    count !== null
+      ? plural(count, 'question')
+      : node
+        ? editor.protocol === 'openai'
+          ? 'not an array'
+          : 'not an object'
+        : 'invalid JSON'
   const sev = severities(result.problems)
   const parse = result.problems.find((p) => p.parse)?.parse
 
@@ -72,7 +81,7 @@ export function QuestionsEditor({
       id="pg-questions"
       title="Questions"
       sub={sub}
-      modes={MODES}
+      modes={editor.protocol === 'openai' ? [{ value: 'json', label: 'json' }] : MODES}
       mode={editor.qMode}
       onMode={(mode) => {
         if (store.setMode('questions', mode) && mode === 'json')
@@ -94,7 +103,11 @@ export function QuestionsEditor({
             label="Questions as JSON"
             value={editor.qText}
             onChange={(text) => store.setQText(text)}
-            placeholder={'{"key": {"type": "noul", "instructions": "..."}}'}
+            placeholder={
+              editor.protocol === 'openai'
+                ? '[{"type":"predicate","instructions":"..."}]'
+                : '{"key": {"type": "noul", "instructions": "..."}}'
+            }
             marks={marksFor(result.problems, editor.qText)}
             error={parse}
             invalid={Boolean(parse)}

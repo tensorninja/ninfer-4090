@@ -232,6 +232,9 @@ ninfer_add_test(ninfer_systemone_product_test
   SOURCES test_systemone_product.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_product_systemone)
+ninfer_add_test(ninfer_openai_decisions_product_test
+  SOURCES test_openai_decisions_product.cpp
+  LIBRARIES ninfer_product_openai_decisions ninfer_product_systemone)
 if(NINFER_BUILD_QWEN3_8_27B)
   ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp

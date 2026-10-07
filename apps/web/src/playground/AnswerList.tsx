@@ -4,8 +4,17 @@
 import type { ReactNode } from 'react'
 
 import { cx } from '../components/ui'
-import { codeSpans, describeNode, pct, previewOf, UNSURE, type AnswerView } from './answers'
+import {
+  codeSpans,
+  describeNode,
+  pct,
+  positionalLabel,
+  previewOf,
+  UNSURE,
+  type AnswerView,
+} from './answers'
 import { dedupe, lastEntry, type JsonNode } from './json'
+import type { Protocol } from './request'
 
 /** Instructions with `backtick` spans as code. */
 export function Instructions({ text }: { text: string }) {
@@ -41,7 +50,7 @@ function IdCell({
 function ListHead({ right }: { right: string }) {
   return (
     <div className="pg-alist__head" aria-hidden="true">
-      <span>key & instructions</span>
+      <span>question & instructions</span>
       <span>{right}</span>
     </div>
   )
@@ -80,7 +89,7 @@ function AnswerRow({
   open: boolean
   onToggle: (open: boolean) => void
 }) {
-  const head = <IdCell answerKey={view.key} type={view.type} instructions={view.instructions} />
+  const head = <IdCell answerKey={view.label} type={view.type} instructions={view.instructions} />
   if (!view.rows.length) {
     return (
       <details
@@ -162,10 +171,7 @@ function AnswerRow({
         ) : null}
         <ol className="pg-dist">
           {view.rows.map((row, j) => (
-            <li
-              key={row.level ?? row.label}
-              className={cx('pg-dist__row', j === view.win && 'pg-dist__row--win')}
-            >
+            <li key={j} className={cx('pg-dist__row', j === view.win && 'pg-dist__row--win')}>
               <span
                 className={cx('pg-dist__label', view.type === 'score' && 'pg-dist__label--prose')}
               >
@@ -220,10 +226,33 @@ export function AnswerList({
 }
 
 /** The questions as they would be asked, before the first run and under an error. */
-export function PreviewList({ questions }: { questions: JsonNode | null }) {
-  if (questions?.t !== 'obj' || !questions.entries.length) return null
+export function PreviewList({
+  questions,
+  protocol = 'typesafe',
+}: {
+  questions: JsonNode | null
+  protocol?: Protocol
+}) {
   // As the server reads them: a repeated key keeps its first position and its last value.
-  const entries = (dedupe(questions) as typeof questions).entries
+  const entries =
+    protocol === 'openai'
+      ? questions?.t === 'arr'
+        ? questions.items.map((v, index) => {
+            const name = lastEntry(v, 'name')?.v
+            return {
+              k: String(index),
+              label: positionalLabel(name?.t === 'str' ? name.v : null, index),
+              v,
+            }
+          })
+        : []
+      : questions?.t === 'obj'
+        ? (dedupe(questions) as typeof questions).entries.map((entry) => ({
+            ...entry,
+            label: entry.k,
+          }))
+        : []
+  if (!entries.length) return null
   return (
     <div className="pg-alist">
       <ListHead right="possible answers" />
@@ -233,11 +262,11 @@ export function PreviewList({ questions }: { questions: JsonNode | null }) {
           <div key={entry.k} className="pg-pv">
             <span className="pg-pv__dot" aria-hidden="true" />
             <IdCell
-              answerKey={entry.k}
+              answerKey={entry.label}
               type={type?.t === 'str' ? type.v : ''}
               instructions={describeNode(lastEntry(entry.v, 'instructions')?.v)}
             />
-            <span className="pg-ans__verdict pg-pv__what">{previewOf(entry.v)}</span>
+            <span className="pg-ans__verdict pg-pv__what">{previewOf(entry.v, protocol)}</span>
           </div>
         )
       })}

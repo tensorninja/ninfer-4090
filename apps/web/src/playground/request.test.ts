@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { compactJson, formatJson, parseJson, type ObjectNode } from './json'
-import { PRESETS } from './presets'
+import { OPENAI_PRESETS, PRESETS } from './presets'
 import {
   buildBody,
   editorFromSnap,
@@ -19,6 +19,7 @@ import { curlSnippet, pythonSnippet } from './snippets'
 import { analyze, locate } from './validate'
 
 const snap = (state: string, questions: string, over: Partial<Snap> = {}): Snap => ({
+  protocol: 'typesafe',
   stateMode: 'json',
   qMode: 'json',
   stateText: state,
@@ -31,6 +32,30 @@ const editor = (state: string, questions: string, over: Partial<Snap> = {}): Edi
   editorFromSnap(snap(state, questions, over))
 
 const problems = (e: EditorState) => analyze(e, null).problems.map((p) => [p.severity, p.msg])
+
+test.each([...OPENAI_PRESETS])(
+  '$name loads as native OpenAI JSON without lossy forms',
+  (preset) => {
+    const initial = editorFromSnap(
+      snapFromValue(
+        { ...preset, model: 'decision-v7' },
+        { stateMode: 'fields', qMode: 'form' },
+        'openai',
+      ),
+    )
+    for (const e of [initial, editorFromSnap(snapOf(initial))]) {
+      expect(e.stateMode).toBe('json')
+      expect(e.qMode).toBe('json')
+      const analysis = analyze(e, ['decision-v7'])
+      expect(analysis.errors).toBe(0)
+      expect(analysis.body?.value).toEqual({
+        input: preset.state,
+        questions: preset.questions,
+        model: 'decision-v7',
+      })
+    }
+  },
+)
 
 test.each([...PRESETS])(
   '$name loads and restores without changing the request structure',

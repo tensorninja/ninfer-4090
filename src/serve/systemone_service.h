@@ -6,6 +6,7 @@
 
 #include "ninfer/types.h"
 #include "product/systemone/request.h"
+#include "serve/decision_models.h"
 #include "serve/generation_service.h"
 #include "serve/serve_options.h"
 
@@ -63,7 +64,7 @@ public:
     // decision adapter. Throws std::invalid_argument when options.systemone_default names no
     // decision adapter of the pool.
     SystemOneService(GenerationService& generation, const ServeOptions& options,
-                     std::string public_model_id);
+                     std::string public_model_id, const DecisionModels& models);
 
     // The decision adapter the SDK-default model name answers with; empty when unbound.
     [[nodiscard]] const std::string& alias_binding() const noexcept { return binding_; }
@@ -84,7 +85,7 @@ private:
                                               const ninfer::LoraAdapterInfo& adapter) const;
 
     GenerationService& generation_;
-    std::vector<ninfer::LoraAdapterInfo> adapters_;
+    const DecisionModels& models_;
     std::string public_model_id_;
     std::string binding_;
     KvCacheStorage kv_cache_   = KvCacheStorage::BFloat16;

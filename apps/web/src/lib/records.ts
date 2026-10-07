@@ -1,4 +1,4 @@
-// Record shapes, as emitted by src/serve/request_log.cpp (schema 22).
+// Record shapes, as emitted by src/serve/request_log.cpp (schema 23).
 //
 // GET /events streams these live and `--request-log-jsonl` appends the identical lines, so one
 // set of types serves both the live dashboard and file replay. Only the fields the dashboard
@@ -8,8 +8,8 @@
 // Records are discriminated on `event`, never on `schema_version`, so an older log still
 // replays: fields added by a later schema are declared optional and read as absent.
 //
-// One process serves two systems. Chat (OpenAI/Anthropic, `request_*`) generates text; System
-// One (`/typesafe`, `decision_*`, schema 21 on) answers multiple-choice questions over a state
+// One process serves two systems. Chat (OpenAI/Anthropic, `request_*`) generates text; decisions
+// (`/typesafe` and `/v1/decisions`, `decision_*`) answer multiple-choice questions over a state
 // with a prefill-only pass. Both run on the same weights, lanes, KV pool and adapter bank.
 
 export interface RequestContext {
@@ -260,12 +260,12 @@ export interface RequestErrorRecord extends RecordEnvelope {
   error: { message: string }
 }
 
-/** A System One decision as submitted: its layout, before anything ran. */
+/** A decision as submitted: its layout, before anything ran. */
 export interface DecisionContext {
   request_id: number
-  /** The `x-typesafe-request-id` the response carries. */
+  /** The request id the response carries. */
   x_request_id: string
-  protocol: 'systemone'
+  protocol: 'systemone' | 'openai_decisions'
   /** The requested model name, which may be the SDK alias. */
   model: string
   /** The decision adapter it resolved to. */
@@ -328,7 +328,7 @@ export interface DecisionDoneRecord extends RecordEnvelope {
 export interface DecisionErrorRecord extends RecordEnvelope {
   event: 'decision_error'
   request: DecisionContext
-  /** `status` is the HTTP status System One answered with. */
+  /** `status` is the HTTP status the decision answered with. */
   error: { status: number; message: string }
 }
 
@@ -366,9 +366,9 @@ export interface ThroughputRecord extends RecordEnvelope {
     }
   } | null
   tokens: {
-    /** Every prefilled token, chat and System One together. */
+    /** Every prefilled token, chat and decisions together. */
     computed_prefill: number
-    /** Present from schema 22: the System One part of `computed_prefill`. */
+    /** Present from schema 22: the decision part of `computed_prefill`. */
     decision_prefill?: number
     committed_decode: number
   }

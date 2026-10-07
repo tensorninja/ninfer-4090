@@ -4,6 +4,8 @@
 // alias bound to one of them. The pool is fixed when the server starts, so the catalog is read
 // once per page load.
 
+import type { Protocol } from './request'
+
 export interface ModelCard {
   name: string
   description: string
@@ -15,7 +17,8 @@ export interface ModelCard {
   temperature: number
   kv_cache: string
   max_context: number
-  prefix_reuse: boolean
+  prefix_reuse?: boolean
+  max_state_tokens?: number
 }
 
 export type Catalog =
@@ -23,12 +26,37 @@ export type Catalog =
   | { state: 'ready'; cards: ModelCard[] }
   | { state: 'error'; message: string }
 
-export const MODELS_PATH = '/typesafe/v1/models'
+export const modelsPath = (protocol: Protocol) =>
+  protocol === 'openai' ? '/v1/models' : '/typesafe/v1/models'
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-export function parseCatalog(data: unknown): ModelCard[] {
+export function parseCatalog(data: unknown, protocol: Protocol = 'typesafe'): ModelCard[] {
+  if (protocol === 'openai') {
+    const models = isRecord(data) && Array.isArray(data.data) ? data.data : []
+    return models.filter(isRecord).flatMap((m) =>
+      typeof m.id === 'string' &&
+      Array.isArray(m.supported_endpoints) &&
+      m.supported_endpoints.includes('/v1/decisions')
+        ? [
+            {
+              name: m.id,
+              description: 'Text-only OpenAI Decisions. Uses a local decision adapter, not Luna.',
+              release_date: '',
+              adapter: m.id,
+              base: '',
+              rank: 0,
+              temperature: 0,
+              kv_cache: '',
+              max_context: typeof m.context_window === 'number' ? m.context_window : 0,
+              max_state_tokens:
+                typeof m.max_state_tokens === 'number' ? m.max_state_tokens : undefined,
+            },
+          ]
+        : [],
+    )
+  }
   const models = isRecord(data) && Array.isArray(data.models) ? data.models : []
   return models.filter(isRecord).flatMap((m) =>
     typeof m.name === 'string'
@@ -50,10 +78,13 @@ export function parseCatalog(data: unknown): ModelCard[] {
   )
 }
 
-export async function fetchCatalog(signal?: AbortSignal): Promise<ModelCard[]> {
-  const response = await fetch(MODELS_PATH, { headers: { accept: 'application/json' }, signal })
+export async function fetchCatalog(protocol: Protocol, signal?: AbortSignal): Promise<ModelCard[]> {
+  const response = await fetch(modelsPath(protocol), {
+    headers: { accept: 'application/json' },
+    signal,
+  })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  return parseCatalog(await response.json())
+  return parseCatalog(await response.json(), protocol)
 }
 
 /** The SDK alias's card: the one served under a name that is not its adapter's. */
@@ -76,7 +107,11 @@ export interface ModelOption {
 }
 
 /** The picker's options: the alias first as "omit the model", then each adapter by name. */
-export function modelOptions(cards: readonly ModelCard[], current: string): ModelOption[] {
+export function modelOptions(
+  cards: readonly ModelCard[],
+  current: string,
+  protocol: Protocol = 'typesafe',
+): ModelOption[] {
   const alias = aliasCard(cards)
   const options: ModelOption[] = []
   if (alias)
@@ -98,7 +133,11 @@ export function modelOptions(cards: readonly ModelCard[], current: string): Mode
   if (!options.some((o) => o.value === current)) {
     options.push({
       value: current,
-      label: current ? `${current} (unknown)` : '(server default)',
+      label: current
+        ? `${current} (unknown)`
+        : protocol === 'openai'
+          ? '(select a decision model)'
+          : '(server default)',
       unknown: true,
     })
   }

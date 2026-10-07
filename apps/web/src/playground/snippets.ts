@@ -1,4 +1,4 @@
-// The current request as code: curl against this server, and Python on the TypeSafe SDK.
+// The current request as code: curl against this server, and Python on the selected SDK.
 //
 // Both are generated from the request tree, so they send what the playground sends: numbers keep
 // their spelling, and a Python int has no 2^53 limit. The SDK's question classes forbid keys
@@ -6,14 +6,17 @@
 // the classes cannot express is passed as the plain dict the SDK also accepts.
 
 import { dedupe, formatJson, lastEntry, type JsonNode, type ObjectNode } from './json'
-import { bodyNode, isQuestionType, type RequestBody } from './request'
+import { bodyNode, isQuestionType, type Protocol, type RequestBody } from './request'
 
-export const ENDPOINT = '/typesafe/v1/systemone'
+const ENDPOINT = '/typesafe/v1/systemone'
+
+export const endpointFor = (protocol: Protocol): string =>
+  protocol === 'openai' ? '/v1/decisions' : ENDPOINT
 
 export function curlSnippet(origin: string, body: RequestBody): string {
-  const json = formatJson(bodyNode(body.state, body.questions, body.model))
+  const json = formatJson(bodyNode(body.state, body.questions, body.model, body.protocol))
   return (
-    `curl -s ${origin}${ENDPOINT} \\\n` +
+    `curl -s ${origin}${endpointFor(body.protocol)} \\\n` +
     `  -H 'content-type: application/json' \\\n` +
     `  -d '${json.replace(/'/g, "'\\''")}'`
   )
@@ -83,6 +86,19 @@ function sdkQuestion(question: JsonNode, indent: number): { code: string; cls: s
 
 export function pythonSnippet(origin: string, body: RequestBody): string {
   const questions = dedupe(body.questions)
+  if (body.protocol === 'openai') {
+    return (
+      `from openai import OpenAI\n\n` +
+      `client = OpenAI(api_key="local", base_url=${JSON.stringify(origin + '/v1')})\n\n` +
+      `response = client.decisions.create(\n` +
+      `${PAD}model=${JSON.stringify(body.model)},\n` +
+      `${PAD}input=${toPy(dedupe(body.state), 1)},\n` +
+      `${PAD}questions=${toPy(questions, 1)},\n` +
+      `)\n` +
+      `for index, answer in enumerate(response.answers):\n` +
+      `${PAD}print(index, answer)\n`
+    )
+  }
   const used = new Set<string>()
   let questionsCode: string
   if (questions.t === 'obj' && questions.entries.length) {

@@ -124,10 +124,17 @@ target profiles, corpora and training reports belong to the separate `llm-datase
 Merging into base weights, rescanning the directory after startup, and adapters for
 `qwen3.6-35b-a3b` are outside the current product.
 
-The 27B target also answers System One decisions, TypeSafe's classification API, with kev's
-semantics. A decision adapter is a LoRA adapter plus a pointer head (converted with
-`--decision-head`); it lives in the same pool and slots as generative adapters and is selected per
-request by model name on the `/typesafe/v1/*` surface, in the same process and weights as chat.
+The 27B target also answers text-only decisions through OpenAI's `POST /v1/decisions` wire
+contract and TypeSafe's System One API with kev's semantics. A decision adapter is a LoRA adapter
+plus a pointer head (converted with `--decision-head`); it lives in the same pool and slots as
+generative adapters and is selected per request by its actual pool name on both surfaces, in the
+same process and weights as chat.
+OpenAI model discovery advertises decision-only endpoints and text-only modalities; generation
+still rejects decision adapters. `jev-latest` is a TypeSafe-only alias, and there is no
+`gpt-6-luna` alias. OpenAI compatibility does not promise Luna outputs, images, confidence
+calibration, or refusal policy: there is no trained refusal detector or fabricated refusal.
+OpenAI rejects state truncation and reports prefill-only usage; TypeSafe retains its existing
+truncation, rounding, usage and errors. `docs/serving.md` owns the exact wire contracts.
 A decision is a prefill-only request (the state, then one branch per question, each continuing the
 state alone) whose readouts feed the pointer head; it never samples, decodes or drafts. Decisions
 are qualified to kev's per-question serving tolerance on BF16 KV; the other codecs serve them with
@@ -184,8 +191,8 @@ routing map, not a mandatory reading list:
 - `README.md`, `Makefile`, and executable `--help`: delivered capabilities and exact commands;
 - `docs/README.md`: public documentation map;
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic/System One HTTP behavior, prefix-reuse paths, and slot
-  endpoints;
+- `docs/serving.md`: OpenAI generation/Decisions, Anthropic and TypeSafe HTTP behavior,
+  prefix-reuse paths, and slot endpoints;
 - `docs/continuation-cache.md`: L1/L2/L3 tier semantics, session routing, stable-prefix aliases,
   persistence formats, identity gating, sizing, and metrics;
 - `docs/performance.md`: published performance methodology and results, including the `sm_89`
@@ -263,6 +270,10 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/product/systemone` owns the System One protocol values: request validation with kev's error
   shapes, state and question rendering, answers and confidences, and CPython `json.dumps`/`round`
   parity. It holds no model semantics; the Engine receives rendered texts.
+- `src/product/openai_decisions` owns OpenAI Decisions validation, text rendering, ordered typed
+  answers and usage; `src/product/decision` owns the shared probability calculations. Serving
+  owns protocol-specific admission and errors; both decision surfaces use the same public Engine
+  route, adapter pool, bounded FIFO, slots and continuation cache.
 - `tools/convert/qwen3_8_27b` owns LoRA adapter conversion, including a decision adapter's pointer
   head; `src/ops/lora` owns the low-rank correction Op and `src/ops/pointer_head` the decision
   readout Op; the adapter pool and its device slots are package-owned persistent state, and serving
@@ -280,7 +291,8 @@ not preserve backward compatibility. When a task replaces project-owned behavior
 obsolete aliases, fallbacks, transition branches, and tests in the affected contract instead of
 maintaining two paths. Do not turn that rule into unrelated repository-wide cleanup.
 
-The advertised OpenAI, Anthropic and System One (TypeSafe SDK 0.6 and 0.7) protocol surfaces are
+The advertised OpenAI (including Decisions with Python SDK 3.26.0 or newer), Anthropic and
+System One (TypeSafe SDK 0.6 and 0.7) protocol surfaces are
 real external contracts. A change to their behavior must update the affected schema tests and
 serving documentation together.
 

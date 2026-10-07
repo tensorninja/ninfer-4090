@@ -164,8 +164,9 @@ std::string serve_usage_text(const char* argv0) {
            "         id <model>-<name>, where name strips .ninfer and a trailing .lora from the\n"
            "         filename. --lora-slots sets how many stay device-resident\n"
            "         (default 2); the engine swaps the rest in on demand. A decision adapter is\n"
-           "         instead a System One model under /typesafe (POST /typesafe/v1/systemone,\n"
-           "         GET /typesafe/v1/models), named by its filename\n"
+           "         named by its filename on POST /v1/decisions (OpenAI, text only) and\n"
+           "         POST /typesafe/v1/systemone (TypeSafe). Models are listed at\n"
+           "         GET /v1/models and GET /typesafe/v1/models in each protocol's format\n"
            "       --systemone-default binds the System One SDK default model jev-latest to a\n"
            "         decision adapter; without it jev-latest answers with the only one\n"
            "       --kv-capacity auto leaves " +

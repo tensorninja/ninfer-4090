@@ -18,7 +18,7 @@ import { QuestionsEditor } from './QuestionsEditor'
 import { plural, quote } from './request'
 import { ResponsePane } from './ResponsePane'
 import { ProblemList } from './Section'
-import { ENDPOINT } from './snippets'
+import { endpointFor } from './snippets'
 import { Splitter } from './Splitter'
 import { StateEditor } from './StateEditor'
 import {
@@ -65,7 +65,8 @@ function CardTip({ card }: { card: ModelCard }) {
     ['released', card.release_date],
     ['kv cache', card.kv_cache],
     ['max context', card.max_context ? `${count(card.max_context)} tokens` : ''],
-    ['prefix reuse', card.prefix_reuse ? 'on' : 'off'],
+    ['max state', card.max_state_tokens ? `${count(card.max_state_tokens)} tokens` : ''],
+    ['prefix reuse', card.prefix_reuse === undefined ? '' : card.prefix_reuse ? 'on' : 'off'],
   ]
   return (
     <Tooltip
@@ -97,17 +98,44 @@ function ModelPicker({ s, store }: { s: PlaygroundSnapshot; store: PlaygroundSto
   const cards = catalog.state === 'ready' ? catalog.cards : []
   const options =
     catalog.state === 'ready'
-      ? modelOptions(cards, editor.model)
-      : [{ value: editor.model, label: editor.model || 'server default', unknown: false }]
+      ? modelOptions(cards, editor.model, editor.protocol)
+      : [
+          {
+            value: editor.model,
+            label:
+              editor.model ||
+              (editor.protocol === 'openai' ? 'select a decision model' : 'server default'),
+            unknown: false,
+          },
+        ]
   const card = cardFor(cards, editor.model)
   const warned = s.analysis.problems.some((p) => p.sec === 'model')
   return (
     <span className="pg-model">
+      <input
+        type="text"
+        hidden={catalog.state !== 'error'}
+        data-loc={catalog.state === 'error' ? LOC.model : undefined}
+        className="pg-input"
+        aria-label="Model name"
+        value={editor.model}
+        placeholder={
+          editor.protocol === 'openai'
+            ? 'Decision adapter name (required)'
+            : 'Model name (optional)'
+        }
+        onChange={(event) => store.setModel(event.target.value)}
+      />
       <select
-        data-loc={LOC.model}
+        hidden={catalog.state === 'error'}
+        data-loc={catalog.state !== 'error' ? LOC.model : undefined}
         className={cx('pg-select', warned && 'is-warn')}
         aria-label="Model"
-        title="The decision adapter that answers; left out, the server's SDK default does"
+        title={
+          editor.protocol === 'openai'
+            ? 'The actual decision adapter name; OpenAI has no SDK alias'
+            : "The decision adapter that answers; left out, the server's SDK default does"
+        }
         value={editor.model}
         onChange={(event) => store.setModel(event.target.value)}
       >
@@ -282,8 +310,24 @@ export function Playground({
 
   return (
     <main ref={root} className="playground" data-layout={layout}>
-      <h1 className="sr-only">System One playground</h1>
+      <h1 className="sr-only">Decision playground</h1>
       <div className="pg-bar">
+        <label className="pg-bar__label" htmlFor="pg-protocol">
+          protocol
+        </label>
+        <select
+          id="pg-protocol"
+          className="pg-select"
+          value={editor.protocol}
+          disabled={Boolean(s.pending)}
+          title="Each protocol keeps its own draft; switching does not convert requests"
+          onChange={(event) =>
+            store.setProtocol(event.target.value === 'openai' ? 'openai' : 'typesafe')
+          }
+        >
+          <option value="typesafe">TypeSafe System One</option>
+          <option value="openai">OpenAI Decisions</option>
+        </select>
         <label className="pg-bar__label" htmlFor="pg-preset">
           request
         </label>
@@ -331,7 +375,7 @@ export function Playground({
             />
           </Popover>
         ) : null}
-        <span className="pg-bar__endpoint">POST {ENDPOINT}</span>
+        <span className="pg-bar__endpoint">POST {endpointFor(editor.protocol)}</span>
         <button
           type="button"
           className="button pg-layout"
@@ -393,7 +437,7 @@ export function Playground({
             <ModelPicker s={s} store={store} />
             {noModels ? (
               <span className="pg-runmsg pg-runmsg--bad">
-                This server lists no System One model: start ninfer-serve with a decision adapter in
+                This server lists no decision model: start ninfer-serve with a decision adapter in
                 --lora-dir.
               </span>
             ) : s.blocked && analysis.errors ? (

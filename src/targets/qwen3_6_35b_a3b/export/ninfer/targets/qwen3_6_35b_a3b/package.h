@@ -83,6 +83,7 @@ struct Package {
     static constexpr std::string_view target_key = "qwen3_6_35b_a3b";
     // Mirrors the package's `DecisionConfig::supported`.
     static constexpr bool supports_decisions = false;
+    static constexpr DecisionLimits decision_limits{};
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

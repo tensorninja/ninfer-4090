@@ -36,6 +36,7 @@ import {
   type RequestBody,
   type Section,
 } from './request'
+import { analyzeOpenAI } from './openai-validate'
 
 export type Severity = 'error' | 'warning'
 
@@ -484,6 +485,7 @@ export function analyzeQuestions(editor: EditorState): SectionResult {
  * does not list is only a warning, since running it is how the 404 is seen.
  */
 export function analyze(editor: EditorState, models: readonly string[] | null): Analysis {
+  if (editor.protocol === 'openai') return analyzeOpenAI(editor, models)
   const state = analyzeState(editor)
   const questions = analyzeQuestions(editor)
   const problems = [...state.problems, ...questions.problems]
@@ -515,7 +517,7 @@ export function analyze(editor: EditorState, models: readonly string[] | null): 
  */
 export function locate(editor: EditorState, path: readonly string[]): Loc | null {
   if (path[0] === 'model') return { el: LOC.model }
-  if (path[0] === 'state') {
+  if (path[0] === 'state' || path[0] === 'input') {
     if (editor.stateMode === 'fields') {
       const first = editor.fields[0]
       return { el: first ? LOC.field(first.id, 'name') : LOC.addField }

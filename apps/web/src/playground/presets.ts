@@ -6,11 +6,13 @@
 // (2026-09-25). Every question is valid System One: choice criteria are objects of label to
 // description, score criteria are lists lowest first, and noul criteria describe true and false.
 
+import type { Protocol } from './request'
+
 export interface Preset {
   name: string
   label: string
   state: unknown
-  questions: Record<string, unknown>
+  questions: unknown
 }
 
 export const PRESETS: readonly Preset[] = [
@@ -815,3 +817,83 @@ export const PRESETS: readonly Preset[] = [
 ]
 
 export const presetNamed = (name: string) => PRESETS.find((p) => p.name === name)
+
+export const OPENAI_PRESETS: readonly Preset[] = [
+  {
+    name: 'example',
+    label: 'Billing email (example)',
+    state:
+      'From: user@acme.com\nSubject: Duplicate charge on invoice #4411\n\nHi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan.',
+    questions: [
+      {
+        type: 'choice',
+        name: 'department',
+        instructions: 'Which department should handle this request?',
+        choices: [
+          { value: 'billing', description: 'invoices, payments, refunds' },
+          { value: 'technical', description: 'bugs, outages, system errors' },
+          { value: 'sales', description: 'pricing, new contracts' },
+          { value: 'other', description: 'everything else' },
+        ],
+      },
+      {
+        type: 'score',
+        name: 'urgency',
+        instructions: 'How urgent is this request?',
+        levels: [
+          { label: 'not urgent' },
+          { label: 'soon' },
+          { label: 'critical deadline or blocking issue' },
+        ],
+      },
+      {
+        type: 'predicate',
+        name: 'churn_risk',
+        instructions: 'Does the user threaten to cancel or leave?',
+      },
+      {
+        type: 'predicate',
+        name: 'refund_requested',
+        instructions: 'Does the user explicitly request a refund?',
+      },
+    ],
+  },
+  {
+    name: 'typed-choice',
+    label: 'Boolean and string choices',
+    state: 'The form contains the literal text "true", not a boolean value.',
+    questions: [
+      {
+        type: 'choice',
+        instructions: 'Which value matches the form entry, including its data type?',
+        choices: [
+          { value: true, description: 'the boolean true' },
+          { value: 'true', description: 'the string true' },
+        ],
+      },
+    ],
+  },
+  {
+    name: 'text-messages',
+    label: 'Text message input',
+    state: [
+      {
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Order 4411 arrived damaged. ' },
+          { type: 'input_text', text: 'Please send a replacement.' },
+        ],
+      },
+      { role: 'user', content: 'I can provide photos if needed.' },
+    ],
+    questions: [
+      {
+        type: 'predicate',
+        name: 'replacement',
+        instructions: 'Does the customer request a replacement?',
+      },
+    ],
+  },
+]
+
+export const presetsFor = (protocol: Protocol) => (protocol === 'openai' ? OPENAI_PRESETS : PRESETS)

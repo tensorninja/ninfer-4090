@@ -23,19 +23,6 @@ namespace ninfer::product::systemone {
 // kev round_prob: round(x, 4).
 [[nodiscard]] double round_prob(double value);
 
-// Python sum() of floats: the int 0 plus the first value, then CPython 3.12+'s Neumaier
-// compensated summation of the rest, the compensation added only when nonzero and finite. An
-// empty span is 0.
-[[nodiscard]] double python_sum(std::span<const double> values);
-
-// kev choice_confidence: (p_max - 1/K) / (1 - 1/K) over p normalized to sum 1 (all zeros ->
-// uniform); 1 for a single option.
-[[nodiscard]] double choice_confidence(std::span<const double> probabilities);
-
-// kev score_confidence: max(0, 1 - E|level - mode| / D) over normalized p, with mode the first most
-// likely level and D the mean absolute deviation of the uniform distribution; 1 for one level.
-[[nodiscard]] double score_confidence(std::span<const double> probabilities);
-
 // kev to_answers: per question, in request order, its answer object keyed by question id. Each
 // probability row has one entry per key of its question. Throws std::invalid_argument otherwise.
 [[nodiscard]] nlohmann::ordered_json to_answers(std::span<const std::vector<float>> probabilities,

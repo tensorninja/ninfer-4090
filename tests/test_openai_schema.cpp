@@ -860,7 +860,8 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.8-27b", {}, 1, 65536, true));
+    const std::array<OpenAIModel, 1> base{{{"qwen3.8-27b", 65536, true}}};
+    const Json list = Json::parse(make_models_list(base, 1));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").size() == 1, "models list holds only the base model");
     failures += check(list.at("data").at(0).at("id") == "qwen3.8-27b", "models list id");
@@ -871,19 +872,39 @@ int test_models_and_error() {
                       "models list vision modality");
 
     // A registered adapter is served as an additional model id beside the base.
-    const Json with_adapters = Json::parse(make_models_list(
-        "qwen3.8-27b", {"qwen3.8-27b-qlora-math", "qwen3.8-27b-qlora-sql"}, 1, 65536, true));
-    failures += check(with_adapters.at("data").size() == 3, "adapter models list size");
+    const std::array<OpenAIModel, 4> models{{
+        {"qwen3.8-27b", 262144, true},
+        {"qwen3.8-27b-qlora-math", 262144, true},
+        {"qwen3.8-27b-qlora-sql", 262144, true},
+        {"decider", 73728, false, true, 65536},
+    }};
+    const Json with_adapters = Json::parse(make_models_list(models, 1));
+    failures += check(with_adapters.at("data").size() == 4, "adapter models list size");
     failures += check(with_adapters.at("data").at(0).at("id") == "qwen3.8-27b",
                       "adapter models list keeps the base first");
     failures += check(with_adapters.at("data").at(1).at("id") == "qwen3.8-27b-qlora-math",
                       "adapter models list first adapter id");
     failures += check(with_adapters.at("data").at(2).at("id") == "qwen3.8-27b-qlora-sql",
                       "adapter models list second adapter id");
-    failures += check(with_adapters.at("data").at(1).at("context_window") == 65536,
+    failures += check(with_adapters.at("data").at(1).at("context_window") == 262144,
                       "adapter models list context");
+    const Json& decision = with_adapters.at("data").at(3);
+    failures += check(decision.at("id") == "decider" &&
+                          decision.at("supported_endpoints") == Json::array({"/v1/decisions"}),
+                      "decision adapters advertise their endpoint and pool name");
+    failures +=
+        check(decision.at("context_window") == 73728 && decision.at("max_state_tokens") == 65536 &&
+                  decision.at("modalities").at("vision") == false,
+              "decision adapters advertise their own text context limits");
+    failures += check(Json::parse(make_model_object(models.back(), 1)) == decision,
+                      "decision model detail agrees with discovery");
+    failures +=
+        check(!with_adapters.at("data").at(0).contains("max_state_tokens") &&
+                  with_adapters.at("data").at(0).at("supported_endpoints") ==
+                      Json::array({"/v1/chat/completions", "/v1/responses", "/v1/messages"}),
+              "generation models retain their own capabilities");
 
-    const Json one = Json::parse(make_model_object("qwen3.8-27b", 1, 65536, false));
+    const Json one = Json::parse(make_model_object({"qwen3.8-27b", 65536, false}, 1));
     failures += check(one.at("id") == "qwen3.8-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");

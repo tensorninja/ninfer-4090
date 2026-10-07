@@ -903,32 +903,28 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-std::string make_models_list(const std::string& model_id,
-                             const std::vector<std::string>& adapter_model_ids,
-                             std::int64_t created, std::uint32_t context_window, bool vision) {
-    const auto entry = [&](const std::string& id) {
-        return Json{{"id", id},
+static Json model_object(const OpenAIModel& model, std::int64_t created) {
+    Json payload = {{"id", model.id},
                     {"object", "model"},
                     {"created", created},
                     {"owned_by", "ninfer"},
-                    {"context_window", context_window},
-                    {"modalities", Json{{"vision", vision}}}};
-    };
-    Json data = Json::array({entry(model_id)});
-    for (const std::string& id : adapter_model_ids) { data.push_back(entry(id)); }
-    const Json payload = {{"object", "list"}, {"data", std::move(data)}};
-    return payload.dump();
+                    {"context_window", model.context_window},
+                    {"modalities", Json{{"vision", model.vision}}}};
+    payload["supported_endpoints"] =
+        model.decisions ? Json::array({"/v1/decisions"})
+                        : Json::array({"/v1/chat/completions", "/v1/responses", "/v1/messages"});
+    if (model.decisions) { payload["max_state_tokens"] = model.max_state_tokens; }
+    return payload;
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t context_window, bool vision) {
-    const Json payload = {{"id", model_id},
-                          {"object", "model"},
-                          {"created", created},
-                          {"owned_by", "ninfer"},
-                          {"context_window", context_window},
-                          {"modalities", Json{{"vision", vision}}}};
-    return payload.dump();
+std::string make_models_list(std::span<const OpenAIModel> models, std::int64_t created) {
+    Json data = Json::array();
+    for (const auto& model : models) { data.push_back(model_object(model, created)); }
+    return Json{{"object", "list"}, {"data", std::move(data)}}.dump();
+}
+
+std::string make_model_object(const OpenAIModel& model, std::int64_t created) {
+    return model_object(model, created).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

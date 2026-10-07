@@ -305,7 +305,7 @@ Json decision_request_json(const DecisionLogContext& context) {
     const ninfer::DecisionSummary& summary = context.summary;
     return Json{{"request_id", context.id},
                 {"x_request_id", context.x_request_id},
-                {"protocol", "systemone"},
+                {"protocol", context.protocol},
                 {"model", context.model},
                 {"adapter", context.adapter},
                 {"allow_prefix_reuse", context.allow_prefix_reuse},
@@ -565,8 +565,8 @@ std::string format_request_error(const RequestLogContext& context, const std::st
 std::string format_decision_start(const DecisionLogContext& context) {
     const ninfer::DecisionSummary& summary = context.summary;
     std::ostringstream out;
-    out << "[req " << context.id << " x_request_id=" << context.x_request_id
-        << "] systemone model=" << context.model << " adapter=" << context.adapter
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] "
+        << context.protocol << " model=" << context.model << " adapter=" << context.adapter
         << " questions=" << summary.questions << " options=" << summary.options
         << " state=" << summary.state_tokens << (summary.state_truncated ? " (truncated)" : "")
         << " branches=" << summary.branch_tokens << " longest_branch=" << summary.longest_branch
@@ -582,8 +582,9 @@ std::string format_decision_done(const DecisionLogContext& context,
         result.summary.state_tokens - result.reused_state_tokens;
     std::ostringstream out;
     out << "[req " << context.id << " x_request_id=" << context.x_request_id
-        << "] done decision questions=" << result.summary.questions
-        << " state=" << result.summary.state_tokens << " reused=" << result.reused_state_tokens
+        << "] done decision protocol=" << context.protocol
+        << " questions=" << result.summary.questions << " state=" << result.summary.state_tokens
+        << " reused=" << result.reused_state_tokens
         << " source=" << continuation_source_name(result.state_source)
         << " branches=" << result.summary.branch_tokens << " passes=" << result.branch_passes
         << " long_chunks=" << result.long_branch_chunks << " slot=" << result.slot
@@ -591,8 +592,7 @@ std::string format_decision_done(const DecisionLogContext& context,
         << " queue=" << timings.queue_seconds * 1000.0 << "ms"
         << " state_prefill=" << rate(computed_state, timings.state_seconds)
         << " branch_prefill=" << rate(result.summary.branch_tokens, timings.branch_seconds)
-        << " execution=" << timings.execution_seconds * 1000.0 << "ms"
-        << " wall="
+        << " execution=" << timings.execution_seconds * 1000.0 << "ms" << " wall="
         << seconds_str(context.prepare_seconds + timings.total_seconds - timings.prepare_seconds);
     return out.str();
 }
@@ -600,8 +600,8 @@ std::string format_decision_done(const DecisionLogContext& context,
 std::string format_decision_error(const DecisionLogContext& context, int status,
                                   const std::string& message) {
     std::ostringstream out;
-    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] error "
-        << status << ' ' << message;
+    out << "[req " << context.id << " x_request_id=" << context.x_request_id << "] error " << status
+        << " protocol=" << context.protocol << ' ' << message;
     return out.str();
 }
 

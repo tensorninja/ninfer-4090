@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
+#include <ninfer/targets/qwen3_8/decision.h>
 #include <ninfer/targets/qwen3_8/frontend.h>
 #include <ninfer/targets/qwen3_8/runtime.h>
 
@@ -86,6 +87,8 @@ struct Package {
     // Serves System One decisions through decision adapters of its LoRA pool. Mirrors the
     // package's `DecisionConfig::supported`, which the family schedule reads.
     static constexpr bool supports_decisions = true;
+    static constexpr DecisionLimits decision_limits{qwen3_8::kDecisionMaxStateTokens,
+                                                    qwen3_8::kDecisionMaxRowTokens};
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

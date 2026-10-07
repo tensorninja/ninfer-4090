@@ -538,11 +538,16 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 PreparedDecisionRequest GenerationService::prepare_decision(ninfer::DecisionInput input,
-                                                           std::string adapter) const {
+                                                            std::string adapter,
+                                                            DecisionOverflowPolicy overflow) const {
     PreparedDecisionRequest prepared;
     prepared.lifetime                  = acquire_request_lifetime();
     ninfer::PreparedDecision decision = engine_->prepare_decision(std::move(input));
     prepared.summary                   = decision.summary();
+    if (overflow == DecisionOverflowPolicy::Reject && prepared.summary.state_truncated) {
+        throw ninfer::DecisionInputError(
+            "input exceeds the decision state token limit; truncation is not supported");
+    }
     prepared.prepare_seconds =
         std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
     prepared.decision = engine_->submit_decision(

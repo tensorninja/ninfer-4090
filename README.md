@@ -4,10 +4,10 @@
 > Also screenshots need to be updated as they are outdated.
 
 NInfer-4090 serves **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090 as two systems in one
-process. **System One** answers TypeSafe's classification API: a decision reads a state and its
-questions by prefill alone and returns calibrated probabilities, in about 100 ms once the state is
-cached, without generating a token. **System Two** is chat: OpenAI- and Anthropic-compatible
-generation with MTP speculative decoding. Both run on one resident copy of the weights, one
+process. **System One** answers OpenAI Decisions and TypeSafe's classification API: a decision
+reads a state and its questions by prefill alone and returns calibrated probabilities, in about
+100 ms once the state is cached, without generating a token. **System Two** is chat: OpenAI- and
+Anthropic-compatible generation with MTP speculative decoding. Both run on one resident copy of the weights, one
 scheduler and one paged KV pool, and requests select LoRA adapters by model name — generative
 adapters for chat, decision adapters for System One — from a pool that costs no VRAM and swaps into
 a small device bank per request. [One model, two systems](#one-model-two-systems)
@@ -33,7 +33,7 @@ kept and restored the way a conversation's prefix is.
 ```mermaid
 flowchart LR
     chat["System Two: chat<br/>/v1/chat/completions, /v1/responses, /v1/messages"] --> fifo
-    decide["System One: decisions<br/>/typesafe/v1/systemone"] --> fifo
+    decide["System One: decisions<br/>/v1/decisions, /typesafe/v1/systemone"] --> fifo
     fifo["one bounded FIFO<br/>one scheduler"] --> lanes["1-8 lanes<br/>one paged KV pool"]
     weights["Qwen3.8-27B weights<br/>16.67 GiB, resident once"] --- lanes
     bank["LoRA bank<br/>--lora-slots device slabs"] --- lanes
@@ -44,8 +44,8 @@ flowchart LR
 
 | | System One: decisions | System Two: chat |
 |---|---|---|
-| API | `POST /typesafe/v1/systemone`; the TypeSafe SDK 0.6 and 0.7 work unchanged | OpenAI Chat Completions and Responses, Anthropic Messages |
-| `model` selects | a decision adapter; `jev-latest` answers with the default one | the base weights or a generative adapter |
+| API | `POST /v1/decisions` (OpenAI Python SDK ≥3.26.0) or `POST /typesafe/v1/systemone` (TypeSafe SDK 0.6 and 0.7 unchanged) | OpenAI Chat Completions and Responses, Anthropic Messages |
+| `model` selects | a decision adapter by pool name; TypeSafe alone also accepts `jev-latest` | the base weights or a generative adapter |
 | GPU work | prefill only: the state once, then one branch per question continuing it | prefill, then decode rounds that draft and verify with MTP |
 | Returns | an answer and calibrated option probabilities per question | streamed text, reasoning, and tool calls |
 | Sampling | none: the same state and questions return the same probabilities | greedy or sampled |
@@ -66,7 +66,8 @@ What the two systems share:
   closed loop of decisions, each chat stream's decode rounds kept their speed and MTP acceptance,
   and all 42 chat responses matched the same stream served alone byte for byte.
 
-Run together on one card, the two systems share time, not speed. Measured with decisions submitted
+Run together on one card, the two systems share time, not speed. These existing measurements use
+the TypeSafe surface, not a new OpenAI Decisions benchmark. Measured with decisions submitted
 back to back (six questions on a retained 8,162-token state) beside two greedy chat streams, one on
 the base weights and one on a chat adapter, with BF16 KV, MTP and two adapter slots:
 
@@ -111,7 +112,30 @@ run, so write to same logical name no longer wait on read. That clear away false
 let machine run more instructions at once, matey.
 ```
 
-System One, from the same process and weights, through the pool's decision adapter:
+System One, from the same process and weights, through the pool's decision adapter
+`lora/systemone-decision-v7.lora.ninfer`, using OpenAI Decisions:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
+result = client.decisions.create(
+    model="systemone-decision-v7",
+    input="I was charged twice this month. Please refund one charge before Friday.",
+    questions=[{
+        "type": "predicate", "name": "billing",
+        "instructions": "Is this message about billing?",
+    }],
+)
+print(result.answers[0].probability)
+```
+
+Use OpenAI Python SDK **3.26.0 or newer**. `/v1/models` lists decision adapters by their actual
+pool names with `supported_endpoints: ["/v1/decisions"]`, `modalities.vision: false`, and their
+decision context limit. They cannot generate chat. There is no `gpt-6-luna` alias: this is
+text-only wire compatibility, not Luna output, image, or refusal-policy parity.
+
+Or use the unchanged TypeSafe surface:
 
 ```bash
 curl -s http://127.0.0.1:8080/typesafe/v1/systemone -H 'content-type: application/json' -d '{
@@ -134,9 +158,11 @@ curl -s http://127.0.0.1:8080/typesafe/v1/systemone -H 'content-type: applicatio
  "usage": {"input_tokens": 58, "output_tokens": 150}, "latency_ms": 105.9}
 ```
 
-The TypeSafe SDK needs only `base_url="http://127.0.0.1:8080/typesafe"`; see
-[System One decisions](docs/serving.md#system-one-decisions) for the SDK example, the routes and the
-error contract. In the Docker image, mount the adapter directory and pass the same flags after the
+The TypeSafe SDK needs only `base_url="http://127.0.0.1:8080/typesafe"`; `jev-latest` remains
+exclusive to that surface. See [OpenAI Decisions](docs/serving.md#openai-decisions) and
+[System One decisions](docs/serving.md#system-one-decisions) for schemas, SDK examples, usage,
+strict OpenAI overflow rejection versus TypeSafe truncation, and errors. In the Docker image,
+mount the adapter directory and pass the same flags after the
 image name, as in the [quick start](#quick-start-linux) profiles.
 
 ### Limits
@@ -208,8 +234,9 @@ being waited on.
 
 The work specific to this branch, each with the measurement that established it:
 
-- **One model, two systems.** One process answers TypeSafe's System One protocol (`noul`, `choice`
-  and `score` questions over one state) under `/typesafe` beside OpenAI- and Anthropic-compatible
+- **One model, two systems.** One process answers text-only OpenAI Decisions under `/v1/decisions`
+  and TypeSafe's System One protocol (`noul`, `choice` and `score` questions over one state) under
+  `/typesafe` beside OpenAI- and Anthropic-compatible
   chat, on one resident copy of the weights, one KV pool and one LoRA bank. A decision adapter — a
   LoRA adapter plus a calibrated pointer head — answers six questions on a retained 8K-token state
   in 101 ms by prefill alone. It never samples or decodes, and reproduces kev's request rendering,
@@ -737,7 +764,7 @@ The default build registers only Qwen3.8-27B. Enable the optional Qwen3.6-35B-A3
   its admission decomposition, the `MemorySummary` VRAM budget including the resident LoRA bank,
   cache occupancy paired with the configured tier capacities and per-tier capacity evictions, each
   lane's work (chat or System One) and adapter, the adapter pool with the bank's live residency and
-  swap counts, and the System One binding — plus an SSE stream of the same schema-22 records
+  swap counts, and the System One binding — plus an SSE stream of the same schema-23 records
   `--request-log-jsonl` appends. Records are formatted once and fanned out to both sinks, so a
   live reader and a file reader see identical lines. The engine readings come from the snapshot
   the execution thread publishes at every unit boundary, so the endpoint answers in milliseconds
@@ -793,8 +820,8 @@ same pool options are available in the CLI, where `--adapter NAME` selects one a
 - **Decision adapters in the same bank.** A System One decision adapter is a LoRA adapter plus a
   pointer head, converted with `convert_lora.py --decision-head`. It is pooled, staged and evicted
   like a generative adapter; when the pool holds one, every slot reserves a 5 MiB region for a head.
-  Its name answers only under `/typesafe`, and generative adapters and the base model answer only
-  through the chat APIs. See [One model, two systems](#one-model-two-systems).
+  Its pool name answers under `/v1/decisions` and `/typesafe`; generative adapters and the base
+  model answer only through the generation APIs. See [One model, two systems](#one-model-two-systems).
 - **Measured cost.** With one adapter selected, prefill runs at 3,307 tok/s on a 9,411-token prompt
   and 3,017 tok/s on 37,798, against 3,601 and 3,247 for a base request in the same process — about
   8.2% and 7.1%. A resident bank costs base requests nothing measurable. The cost is activation
@@ -915,8 +942,10 @@ switch with the thinking mode.
 
 OpenAI Chat Completions, OpenAI Responses with streaming and local continuation state, Anthropic
 Messages, prompt-rendered function tools with parsed tool calls, compatible-prefix reuse, and
-JSONL request logs — and, from the same process, TypeSafe's System One decisions under
-`/typesafe` for the TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
+JSONL request logs — and, from the same process, text-only OpenAI Decisions under `/v1/decisions`
+(OpenAI Python SDK ≥3.26.0) and TypeSafe's System One decisions under `/typesafe` for the
+TypeSafe SDK 0.6 and 0.7. See [HTTP serving](docs/serving.md),
+[OpenAI Decisions](docs/serving.md#openai-decisions),
 [System One decisions](docs/serving.md#system-one-decisions) and [CLI usage](docs/cli.md).
 
 ## Upstream and credits

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { parseJson } from './json'
-import { describeFailure, detailLines } from './errors'
+import { describeFailure, detailLines, type Failure } from './errors'
 
 // Bodies ninfer-serve answered on 2026-09-30 for the requests beside them (x-typesafe-request-id
 // fixture*). They follow pydantic's union reporting: one error per branch, tagged in `loc`.
@@ -230,4 +230,80 @@ test('each status gets its own explanation', () => {
     'http://h/x',
   )
   expect(net.help).toContain('Could not reach http://h/x (Failed to fetch)')
+})
+
+const openaiFailure = (
+  status: number,
+  code: string | null,
+  param: string | null,
+  message: string,
+  extra: Partial<Failure> = {},
+) => {
+  const data = { error: { message, type: 'invalid_request_error', param, code } }
+  return describeFailure(
+    { status, text: JSON.stringify(data), data, odd: false, ...extra },
+    parseJson('[{"type":"predicate","instructions":"i"}]'),
+    '/v1/decisions',
+    'openai',
+  )
+}
+
+test('OpenAI errors retain the message, code, type and positional parameter path', () => {
+  const error = openaiFailure(
+    400,
+    'invalid_type',
+    'questions[0].choices[1].value',
+    'Expected a string or boolean.',
+  )
+  expect(error.title).toBe('The server rejected the request (HTTP 400)')
+  expect(error.lines).toEqual([
+    {
+      loc: ['questions', '0', 'choices', '1', 'value'],
+      msg: 'Expected a string or boolean.',
+      code: 'invalid_type',
+      type: 'invalid_request_error',
+    },
+  ])
+  expect(error.help).not.toContain('4,300')
+  expect(openaiFailure(401, null, null, 'Invalid API key.').lines).toEqual([
+    {
+      loc: [],
+      msg: 'Invalid API key.',
+      type: 'invalid_request_error',
+    },
+  ])
+})
+
+test('OpenAI model, modality, overflow and retry errors explain their native contracts', () => {
+  const model = openaiFailure(404, 'model_not_found', 'model', "decision model 'nope' not found")
+  expect(model.title).toBe('Unknown model (HTTP 404)')
+  expect(model.lines[0]!.loc).toEqual(['model'])
+  expect(model.help).toContain('GET /v1/models')
+  expect(model.help).toContain('jev-latest is TypeSafe-only')
+  expect(
+    openaiFailure(400, 'unsupported_modality', 'input[0].content[0]', 'Images unsupported.').title,
+  ).toBe('Unsupported input modality (HTTP 400)')
+  const overflow = openaiFailure(400, 'context_length_exceeded', 'input', 'Too many tokens.')
+  expect(overflow.title).toBe('The decision does not fit (HTTP 400)')
+  expect(overflow.help).toContain('rejects overflow instead of truncating')
+  for (const [status, code] of [
+    [429, 'server_overloaded'],
+    [503, 'request_queue_timeout'],
+  ] as const) {
+    const busy = openaiFailure(status, code, null, 'Try later.', { retryAfter: '1' })
+    expect(busy.lines[0]!.code).toBe(code)
+    expect(busy.help).toContain('retrying after 1 s')
+  }
+  expect(openaiFailure(401, null, null, 'Invalid API key.').help).toContain('--api-key')
+})
+
+test('an unexpected OpenAI success explains the expected answers array', () => {
+  const odd = openaiFailure(200, null, null, '', {
+    odd: true,
+    data: { answers: {} },
+    text: '{"answers":{}}',
+  })
+  expect(odd.title).toBe('Unexpected response (HTTP 200)')
+  expect(odd.help).toContain("OpenAI Decisions' answers array")
+  expect(odd.lines).toEqual([{ loc: [], msg: '{"answers":{}}' }])
 })

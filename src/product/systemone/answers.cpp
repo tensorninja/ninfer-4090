@@ -1,4 +1,5 @@
 #include "product/systemone/answers.h"
+#include "product/decision/probability.h"
 
 #include <array>
 #include <charconv>
@@ -13,32 +14,6 @@ namespace ninfer::product::systemone {
 namespace {
 
 using Json = nlohmann::ordered_json;
-
-// Python max(range(n), key=p.__getitem__) and max(p): the first index whose value no later value
-// exceeds.
-std::size_t first_argmax(std::span<const double> values) {
-    std::size_t best = 0;
-    for (std::size_t i = 1; i < values.size(); ++i) {
-        if (values[i] > values[best]) { best = i; }
-    }
-    return best;
-}
-
-// kev _normalize: p / sum(p), uniform when the sum is zero.
-std::vector<double> normalize(std::span<const double> values) {
-    const double total = python_sum(values);
-    std::vector<double> normalized(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        normalized[i] = total == 0.0 ? 1.0 / static_cast<double>(values.size()) : values[i] / total;
-    }
-    return normalized;
-}
-
-void require_options(std::span<const double> probabilities) {
-    if (probabilities.empty()) {
-        throw std::invalid_argument("a System One confidence needs at least one option");
-    }
-}
 
 void append_hex4(std::string& out, unsigned value) {
     constexpr std::string_view digits = "0123456789abcdef";
@@ -156,52 +131,6 @@ double python_round(double value, int ndigits) {
 
 double round_prob(double value) { return python_round(value, 4); }
 
-double python_sum(std::span<const double> values) {
-    if (values.empty()) { return 0.0; }
-    // builtin_sum_impl: the int start plus the first item leaves the float loop's first sum.
-    double sum          = 0.0 + values.front();
-    double compensation = 0.0;
-    for (const double value : values.subspan(1)) {
-        const double total = sum + value;
-        if (std::fabs(sum) >= std::fabs(value)) {
-            compensation += (sum - total) + value;
-        } else {
-            compensation += (value - total) + sum;
-        }
-        sum = total;
-    }
-    if (compensation != 0.0 && std::isfinite(compensation)) { sum += compensation; }
-    return sum;
-}
-
-double choice_confidence(std::span<const double> probabilities) {
-    require_options(probabilities);
-    const std::size_t options = probabilities.size();
-    if (options == 1) { return 1.0; }
-    const std::vector<double> normalized = normalize(probabilities);
-    const double uniform                 = 1.0 / static_cast<double>(options);
-    return (normalized[first_argmax(normalized)] - uniform) / (1.0 - uniform);
-}
-
-double score_confidence(std::span<const double> probabilities) {
-    require_options(probabilities);
-    const std::size_t levels = probabilities.size();
-    if (levels == 1) { return 1.0; }
-    const std::vector<double> normalized = normalize(probabilities);
-    const std::size_t mode               = first_argmax(normalized);
-    const double center                  = static_cast<double>(levels - 1) / 2.0;
-    std::vector<double> terms(levels);
-    for (std::size_t i = 0; i < levels; ++i) {
-        terms[i] = std::fabs(static_cast<double>(i) - center);
-    }
-    const double spread = python_sum(terms) / static_cast<double>(levels);
-    for (std::size_t i = 0; i < levels; ++i) {
-        terms[i] = normalized[i] * static_cast<double>(i > mode ? i - mode : mode - i);
-    }
-    const double confidence = 1.0 - python_sum(terms) / spread;
-    return confidence > 0.0 ? confidence : 0.0;
-}
-
 nlohmann::ordered_json to_answers(std::span<const std::vector<float>> probabilities,
                                   std::span<const QuestionMeta> questions) {
     if (probabilities.size() != questions.size()) {
@@ -225,26 +154,22 @@ nlohmann::ordered_json to_answers(std::span<const std::vector<float>> probabilit
             for (std::size_t i = 0; i < p.size(); ++i) {
                 distribution[meta.keys[i]] = round_prob(p[i]);
             }
-            answer["choice"]        = meta.keys[first_argmax(p)];
-            answer["confidence"]    = round_prob(choice_confidence(p));
+            answer["choice"]        = meta.keys[decision::first_argmax(p)];
+            answer["confidence"]    = round_prob(decision::choice_confidence(p));
             answer["probabilities"] = std::move(distribution);
             break;
         }
         case QuestionType::Score: {
-            std::vector<double> weighted(p.size());
-            for (std::size_t i = 0; i < p.size(); ++i) {
-                weighted[i] = static_cast<double>(i) * p[i];
-            }
             Json legend       = Json::object();
             Json distribution = Json::object();
             for (std::size_t i = 0; i < p.size(); ++i) {
                 legend[meta.keys[i]]       = meta.legend[i];
                 distribution[meta.keys[i]] = round_prob(p[i]);
             }
-            answer["score"]         = round_prob(python_sum(weighted));
+            answer["score"]         = round_prob(decision::weighted_score(p));
             answer["legend"]        = std::move(legend);
             answer["probabilities"] = std::move(distribution);
-            answer["confidence"]    = round_prob(score_confidence(p));
+            answer["confidence"]    = round_prob(decision::score_confidence(p));
             break;
         }
         }

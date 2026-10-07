@@ -26,6 +26,7 @@ import {
   type ObjectNode,
 } from './json'
 
+export type Protocol = 'typesafe' | 'openai'
 export type QuestionType = 'noul' | 'choice' | 'score'
 export const QUESTION_TYPES: readonly QuestionType[] = ['noul', 'choice', 'score']
 /** kev's MAX_OPTIONS: a choice or score question takes 1 to 255 options. */
@@ -78,6 +79,7 @@ export interface QuestionDraft {
 }
 
 export interface EditorState {
+  protocol: Protocol
   stateMode: StateMode
   qMode: QuestionsMode
   fields: Field[]
@@ -293,6 +295,7 @@ export function withType(q: QuestionDraft, type: QuestionType): QuestionDraft {
 // --- the request body ------------------------------------------------------------------------
 
 export interface RequestBody {
+  protocol: Protocol
   state: JsonNode
   questions: JsonNode
   model: string
@@ -303,15 +306,20 @@ export interface RequestBody {
    * a question and `"criteria": null` do not matter but question and option order do.
    */
   canon: string
-  value: { state: unknown; questions: unknown; model?: string }
+  value: { state?: unknown; input?: unknown; questions: unknown; model?: string }
 }
 
-export function bodyNode(state: JsonNode, questions: JsonNode, model: string): ObjectNode {
+export function bodyNode(
+  state: JsonNode,
+  questions: JsonNode,
+  model: string,
+  protocol: Protocol = 'typesafe',
+): ObjectNode {
   const entries: Array<[string, JsonNode]> = [
-    ['state', state],
+    [protocol === 'openai' ? 'input' : 'state', state],
     ['questions', questions],
   ]
-  if (model) entries.push(['model', stringNode(model)])
+  if (model || protocol === 'openai') entries.push(['model', stringNode(model)])
   return objectNode(entries)
 }
 
@@ -332,23 +340,31 @@ function canonOf(state: JsonNode, questions: JsonNode, model: string): string {
   return [compactJson(dedupe(state)), compactJson(qs), model].join('\u0000')
 }
 
-export function buildBody(state: JsonNode, questions: JsonNode, model: string): RequestBody {
-  const root = bodyNode(state, questions, model)
-  const value: RequestBody['value'] = { state: toValue(state), questions: toValue(questions) }
-  if (model) value.model = model
+export function buildBody(
+  state: JsonNode,
+  questions: JsonNode,
+  model: string,
+  protocol: Protocol = 'typesafe',
+): RequestBody {
+  const root = bodyNode(state, questions, model, protocol)
   return {
+    protocol,
     state,
     questions,
     model,
     text: compactJson(root),
-    canon: canonOf(state, questions, model),
-    value,
+    canon:
+      protocol +
+      '\u0000' +
+      (protocol === 'openai' ? compactJson(dedupe(root)) : canonOf(state, questions, model)),
+    value: toValue(root) as RequestBody['value'],
   }
 }
 
 // --- snapshots: an editor's text, for drafts, presets, undo and share links ------------------
 
 export interface Snap {
+  protocol: Protocol
   stateMode: StateMode
   qMode: QuestionsMode
   stateText: string
@@ -358,6 +374,7 @@ export interface Snap {
 
 export function snapOf(editor: EditorState): Snap {
   return {
+    protocol: editor.protocol,
     stateMode: editor.stateMode,
     qMode: editor.qMode,
     stateText:
@@ -376,14 +393,18 @@ export function editorFromSnap(snap: Snap): EditorState {
   const state = tryParse(snap.stateText)
   const qs = tryParse(snap.qText)
   const fields =
-    snap.stateMode !== 'json' && state.ast && !fieldsBlocker(state.ast)
+    snap.protocol === 'typesafe' &&
+    snap.stateMode !== 'json' &&
+    state.ast &&
+    !fieldsBlocker(state.ast)
       ? fieldsFromAst(state.ast as ObjectNode)
       : null
   const questions =
-    snap.qMode !== 'json' && qs.ast && !formBlocker(qs.ast)
+    snap.protocol === 'typesafe' && snap.qMode !== 'json' && qs.ast && !formBlocker(qs.ast)
       ? (qs.ast as ObjectNode).entries.map(questionFromEntry)
       : null
   return {
+    protocol: snap.protocol,
     stateMode: fields ? 'fields' : 'json',
     qMode: questions ? 'form' : 'json',
     fields: fields ?? [],
@@ -400,8 +421,10 @@ export function snapFromNodes(
   questions: JsonNode | undefined,
   model: string,
   modes: { stateMode: StateMode; qMode: QuestionsMode },
+  protocol: Protocol = 'typesafe',
 ): Snap {
   return {
+    protocol,
     ...modes,
     stateText: formatJson(state ?? objectNode([])) + '\n',
     qText: formatJson(questions ?? objectNode([])) + '\n',
@@ -412,11 +435,13 @@ export function snapFromNodes(
 export function snapFromValue(
   request: { state: unknown; questions: unknown; model?: unknown },
   modes: { stateMode: StateMode; qMode: QuestionsMode },
+  protocol: Protocol = 'typesafe',
 ): Snap {
   return snapFromNodes(
     fromValue(request.state),
     fromValue(request.questions),
     typeof request.model === 'string' ? request.model : '',
     modes,
+    protocol,
   )
 }

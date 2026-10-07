@@ -5,6 +5,7 @@
 // never sent to the server, so a link works against any server that serves the playground.
 
 import { lastEntry, tryParse, type JsonNode } from './json'
+import type { Protocol } from './request'
 
 export function b64urlEncode(text: string): string {
   const bytes = new TextEncoder().encode(text)
@@ -29,6 +30,7 @@ export function shareUrl(base: string, bodyText: string): string {
 }
 
 export interface SharedRequest {
+  protocol: Protocol
   state: JsonNode
   questions: JsonNode
   model: string
@@ -49,9 +51,15 @@ export function readShareHash(hash: string): SharedRequest | null | undefined {
   }
   const parsed = tryParse(text)
   if (!parsed.ast || parsed.ast.t !== 'obj') return null
+  const input = lastEntry(parsed.ast, 'input')?.v
   const state = lastEntry(parsed.ast, 'state')?.v
   const questions = lastEntry(parsed.ast, 'questions')?.v
-  if (!state || !questions) return null
+  if ((!state && !input) || (state && input) || !questions) return null
   const model = lastEntry(parsed.ast, 'model')?.v
-  return { state, questions, model: model?.t === 'str' ? model.v : '' }
+  return {
+    protocol: input ? 'openai' : 'typesafe',
+    state: (input ?? state)!,
+    questions,
+    model: model?.t === 'str' ? model.v : '',
+  }
 }

@@ -209,11 +209,11 @@ export const GLOSSARY = {
   // --- System One --------------------------------------------------------------------------
   systemOne: {
     title: 'System One',
-    body: 'TypeSafe’s classification API, served under /typesafe with kev’s semantics. A decision is one state and a set of typed questions: the engine prefills the state once, then one branch per question that sees the state and itself, and a pointer head turns the readouts at each option into calibrated probabilities. It is prefill-only — it never samples, decodes or drafts — and runs on the same weights, lanes, KV pool and adapter bank as chat.',
+    body: 'Prefill-only decisions, served through text-only OpenAI Decisions at /v1/decisions and TypeSafe under /typesafe with kev’s semantics. A decision is one state and a set of typed questions: the engine prefills the state once, then one branch per question that sees the state and itself, and a pointer head turns the readouts at each option into calibrated probabilities. It never samples, decodes or drafts, and runs on the same weights, lanes, KV pool and adapter bank as chat.',
   },
   decisionLatency: {
     title: 'Decision latency',
-    body: 'What System One reports as latency_ms: the restore of a cached state plus execution, from admission to the probabilities. The wait for a lane is excluded, as it is in kev. Total is receipt to response as the client saw it, including that wait and request preparation.',
+    body: 'The restore of a cached state plus execution, from admission to the probabilities, for either decision API. TypeSafe also reports it as latency_ms; OpenAI Decisions has no wire latency field. The wait for a lane is excluded, as it is in kev. Total is receipt to response as the client saw it, including that wait and request preparation.',
   },
   decisionPhases: {
     title: 'Decision phases',
@@ -229,7 +229,7 @@ export const GLOSSARY = {
   },
   decisionAdapter: {
     title: 'Decision adapter',
-    body: 'A LoRA adapter plus a pointer head, converted with --decision-head. It is a System One model named by its file stem, selected on /typesafe and refused on the chat routes, just as a chat adapter is refused on /typesafe.',
+    body: 'A LoRA adapter plus a pointer head, converted with --decision-head. It is named by its file stem on /v1/decisions and /typesafe, and refused on the generation routes, just as a generative adapter is refused on both decision APIs.',
   },
   chatAdapter: {
     title: 'Chat adapter',

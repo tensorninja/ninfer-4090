@@ -16,6 +16,8 @@ import {
   type AdapterInventory,
   type ContinuationSource,
   type DecisionDoneRecord,
+  type DecisionErrorRecord,
+  type DecisionStartRecord,
   type RequestDoneRecord,
   type ThroughputRecord,
 } from './records'
@@ -622,11 +624,12 @@ test('energy per million tokens reports absence rather than a zero cost', () => 
 
 // --- System One ------------------------------------------------------------------------------
 
-// A decision shaped like a real schema-22 `decision_done` record. Only the layout, reuse and
+// A decision shaped like a real schema-23 `decision_done` record. Only the protocol, layout, reuse and
 // timing inputs vary.
 function decided(
   id: number,
   values: {
+    protocol: DecisionDoneRecord['request']['protocol']
     adapter: string
     model?: string
     questions: number
@@ -648,14 +651,14 @@ function decided(
 ): DecisionDoneRecord {
   return {
     event: 'decision_done',
-    schema_version: 22,
+    schema_version: 23,
     server_instance_id: 'serve-test-1',
     timestamp_unix_ms: 1_700_000_000_000 + id * 1000,
     artifact_type: 'ninfer_serve_request_log',
     request: {
       request_id: id,
       x_request_id: `ts_${id}`,
-      protocol: 'systemone',
+      protocol: values.protocol,
       model: values.model ?? values.adapter,
       adapter: values.adapter,
       allow_prefix_reuse: true,
@@ -693,6 +696,7 @@ function decided(
 // lane, and a smaller state restored from host memory. The restore sits inside `queue`.
 const DECISIONS: DecisionDoneRecord[] = [
   decided(1, {
+    protocol: 'openai_decisions',
     adapter: 'decision-v7',
     questions: 6,
     options: 18,
@@ -711,6 +715,7 @@ const DECISIONS: DecisionDoneRecord[] = [
     total: 16.85,
   }),
   decided(2, {
+    protocol: 'systemone',
     adapter: 'decision-v7',
     model: 'jev-latest',
     questions: 6,
@@ -729,6 +734,7 @@ const DECISIONS: DecisionDoneRecord[] = [
     total: 0.39,
   }),
   decided(3, {
+    protocol: 'openai_decisions',
     adapter: 'pilot',
     questions: 2,
     options: 4,
@@ -747,7 +753,7 @@ const DECISIONS: DecisionDoneRecord[] = [
   }),
 ]
 
-test('decision summary reports System One latency, phase shares and state reuse', () => {
+test('decision summary combines TypeSafe and OpenAI latency, phase shares and state reuse', () => {
   const summary = summarizeDecisions(DECISIONS)
   expect(summary.count).toBe(3)
   expect(summary.questions).toBe(14)
@@ -791,7 +797,7 @@ test('an empty decision window has no rates rather than zero ones', () => {
   expect(summary.branchTokensPerSecond).toBeNull()
 })
 
-test('decisions group by the resolved adapter, not the requested model', () => {
+test('decisions group by the resolved adapter, not the requested model or protocol', () => {
   // Decision 2 asked for the SDK alias; it ran on the adapter the alias is bound to.
   const usage = summarizeDecisionsByAdapter(DECISIONS)
   expect(usage.map((entry) => entry.name)).toEqual(['decision-v7', 'pilot'])
@@ -842,7 +848,7 @@ test('the adapter pool reads schema-22 kinds and older name lists alike', () => 
   expect(adapterPool(undefined)).toEqual([])
 })
 
-test('decision records pass through the line reader as the server writes them', () => {
+test('schema-23 OpenAI and older TypeSafe records share the line reader and decision summaries', () => {
   const done = parseRecordLine(
     '{"artifact_type":"ninfer_serve_request_log","event":"decision_done","rates":' +
       '{"branch_tok_s":1234.5,"state_tok_s":null},"request":{"adapter":"decision-v7",' +
@@ -859,6 +865,56 @@ test('decision records pass through the line reader as the server writes them', 
   const summary = summarizeDecisions([done as DecisionDoneRecord])
   expect(summary.stateReuse).toBe(1)
   expect(summary.latency.p50).toBeCloseTo(0.26, 12)
+
+  const openai = parseRecordLine(
+    '{"artifact_type":"ninfer_serve_request_log","event":"decision_done","rates":' +
+      '{"branch_tok_s":4000.0,"state_tok_s":4000.0},"request":{"adapter":"decision-v7",' +
+      '"allow_prefix_reuse":true,"branch_tokens":200,"input_tokens":2200,"longest_branch":110,' +
+      '"model":"decision-v7","options":4,"protocol":"openai_decisions","questions":2,"request_id":43,' +
+      '"state_tokens":2000,"state_truncated":false,"x_request_id":"req_openai_43"},"result":' +
+      '{"branch_passes":1,"computed_state_tokens":2000,"long_branch_chunks":0,"output_tokens":20,' +
+      '"reused_state_tokens":0,"slot":1,"state_source":"none"},"schema_version":23,' +
+      '"server_instance_id":"serve-1-2","timestamp_unix_ms":1700000001000,"timings_seconds":' +
+      '{"branch":0.05,"execution":0.56,"prepare":0.004,"queue":0.01,"restore":0.0,"state":0.5,' +
+      '"total":0.574}}',
+  )
+  expect(openai?.event).toBe('decision_done')
+  if (openai?.event !== 'decision_done' || done?.event !== 'decision_done') {
+    throw new Error('decision records were not parsed')
+  }
+  expect(openai.request.protocol).toBe('openai_decisions')
+  expect(openai.request.x_request_id).toBe('req_openai_43')
+  expect(openai.result.slot).toBe(1)
+  const combined = summarizeDecisions([done, openai])
+  expect(combined.count).toBe(2)
+  expect(combined.questions).toBe(8)
+  expect(combined.options).toBe(21)
+  expect(combined.stateReuse).toBeCloseTo(0.8, 12)
+  expect(combined.bySource).toEqual({ l1: 1, none: 1 })
+  expect(combined.stateTokensPerSecond).toBeCloseTo(4000, 9)
+  expect(combined.branchTokensPerSecond).toBeCloseTo(1700, 9)
+  const grouped = summarizeDecisionsByAdapter([done, openai])
+  expect(grouped).toHaveLength(1)
+  expect(grouped[0]!.name).toBe('decision-v7')
+  expect(grouped[0]!.summary).toEqual(combined)
+
+  const { artifact_type, schema_version, server_instance_id, request } = openai
+  const started: DecisionStartRecord = {
+    artifact_type,
+    schema_version,
+    server_instance_id,
+    timestamp_unix_ms: 1_700_000_000_426,
+    event: 'decision_start',
+    request,
+  }
+  expect(parseRecordLine(JSON.stringify(started))).toEqual(started)
+  const failed: DecisionErrorRecord = {
+    ...started,
+    timestamp_unix_ms: 1_700_000_000_500,
+    event: 'decision_error',
+    error: { status: 499, message: 'client disconnected' },
+  }
+  expect(parseRecordLine(JSON.stringify(failed))).toEqual(failed)
 
   expect(parseRecordLine('{"event":"decision_start","request":{}}')?.event).toBe('decision_start')
   expect(parseRecordLine('{"event":"decision_error","error":{"status":503}}')?.event).toBe(

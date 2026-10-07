@@ -284,12 +284,15 @@ replayed log predates reads as zero rather than as `NaN` in a total.
 
 ## Playground
 
-`/playground` is a console for [System One](serving.md#system-one-decisions): it builds a request,
-sends it to this server's `POST /typesafe/v1/systemone`, and reads every answer back as a
-distribution. Switching to the dashboard and back keeps the request and any run in flight. A run is
-never cancelled, because the server would log an abandoned decision as a 499.
+`/playground` is a decision console with a **protocol** selector for
+[TypeSafe System One](serving.md#system-one-decisions) (`POST /typesafe/v1/systemone`) and
+[OpenAI Decisions](serving.md#openai-decisions) (`POST /v1/decisions`). Request previews, submission,
+answer distributions, errors, and code snippets follow the selected protocol. Each protocol keeps
+its own draft and presets; switching does not translate or discard the other draft. The selector
+is disabled during a run. Switching to the dashboard and back keeps the request and any run in
+flight. A run is never cancelled, because the server would log an abandoned decision as a 499.
 
-**Request.** The state is edited as name/value fields or as any JSON value, and the questions as
+**TypeSafe request.** The state is edited as name/value fields or as any JSON value, and the questions as
 cards or as JSON. The body is serialized from the parsed JSON, never from JavaScript numbers, so
 number spellings, key order, and integers beyond 2^53 reach the server as typed. The checks follow
 kev's schema. What it rejects is an error that blocks Run: JSON that does not parse, no questions, a
@@ -299,31 +302,50 @@ warning, such as a repeated key (the last one counts), an empty key or label, a 
 instructions, an empty state, or a model the server does not list. F8 steps through both, and `?`
 lists the keyboard shortcuts. Token budgets are left to the server.
 
-**Models.** The picker lists `GET /typesafe/v1/models`, read once per page load. A new request
-leaves `model` out, so the server's `jev-latest` alias answers. On a rotated KV codec (`rk*`) the
-picker adds a caution: decisions there keep task-level quality but are not qualified to kev's 0.03
-bar, which `bf16` is ([System One fidelity](serving.md#system-one-fidelity)).
+**OpenAI request.** Input and questions use native JSON editors, not the TypeSafe forms. Input is
+a quoted text string or an array of user messages with text content. Questions are an ordered array
+of `predicate`, `choice`, and `score` objects with required string instructions. The checks enforce
+1–200 questions, 2–255 string/boolean choices, and 2–10 score levels; unsupported fields and images
+are errors. Duplicate names and choice values are valid and retain their positions and types.
+Native presets cover the billing example, mixed boolean/string choices, and text-message input.
+The server checks token budgets and rejects overflow rather than truncating input. These are local
+text-only decision adapters, not a promise of Luna predictions, calibration, or refusal policy.
+
+**Models.** Each protocol reads its catalog once per page load. TypeSafe uses
+`GET /typesafe/v1/models`; a new request leaves `model` out, so the server's `jev-latest` alias
+answers. OpenAI uses `GET /v1/models`, filtered to models advertising `/v1/decisions`, and selects
+an actual decision adapter name; it requires `model` and cannot use `jev-latest`. Its card shows
+the state and context limits. If discovery fails, a model name can be entered manually.
+The TypeSafe card also reports the KV codec. On a rotated codec (`rk*`) it adds a caution: decisions
+there keep task-level quality but are not qualified to kev's 0.03 bar, which `bf16` is
+([System One fidelity](serving.md#system-one-fidelity)).
 
 **Answers.** The headline is the probability of the answer shown: p(true) or p(false) for `noul`,
 the chosen option for `choice`, the most likely level for `score`. Below 0.60 the answer is flagged
-uncertain and names its runner-up. kev's `confidence` is shown under the distribution for `choice`
-and `score`; `noul` carries none. A failed run says what its status means. kev's question union
+uncertain and names its runner-up. OpenAI `predicate` shows p(yes) or p(no); its answers are numbered
+by position so unnamed or repeated names remain distinct, and mixed boolean/string choices use
+JSON scalar spelling. The returned `confidence` is shown under the distribution for `choice`
+and `score`; `noul` and `predicate` carry none. OpenAI also shows total, cached, and cache-write
+token usage without inventing a response latency field. A failed run says what its status means.
+OpenAI errors preserve their message, type, code, and parameter path. kev's question union
 reports a 422 once per question type, so the list is folded to the type that was sent, and each
 location jumps to the text it names. The JSON view shows the raw body; the Code view gives the
-current request as curl and as TypeSafe SDK Python.
+current request as curl and as Python for the selected SDK (TypeSafe or OpenAI 3.26.0+).
 
-**Engine facts.** Every run sends its own `x-typesafe-request-id`, and the decision's records on
-`/events` carry it, so each run shows what the engine did for that exact decision: state tokens
+**Engine facts.** TypeSafe runs send their own `x-typesafe-request-id`; OpenAI runs obtain the
+server-issued `x-request-id` from the response. The decision's records on `/events` carry that ID,
+so each run shows what the engine did for that exact decision: state tokens
 reused and where from (a lane, L2, or L3) against those computed, branch passes, the lane, and the
 wait/restore/state/branch split. When no record arrives the run says why: the server refused the
 request while preparing it, which logs nothing; the stream dropped the record; or the dashboard is
-replaying a file instead of following the live stream. Playground runs appear in the System One
-panel like any other decision.
+replaying a file instead of following the live stream. OpenAI cannot join its in-flight records
+until its response ID arrives. Playground runs appear in the System One panel like any other decision.
 
 **Sharing and drafts.** Copy link puts the whole request in the URL fragment (`#r=`, base64url of
-the body text), which is never sent to a server. The editors' text is kept in the browser as a
-draft, invalid or not, and restored on the next visit; a link takes precedence over `?preset=`,
-which takes precedence over the draft, and `?model=` picks the model on top of either.
+the body text), which is never sent to a server. The native `state` or `input` field selects the
+protocol when opening the link. Both drafts and the selected protocol are kept in the browser,
+invalid text included, and restored on the next visit; a link takes precedence over `?preset=`,
+which takes precedence over that protocol's draft, and `?model=` picks the model on top of either.
 
 The original six presets come from [laya](https://github.com/NandhaKishorM/laya)'s playground
 (Apache-2.0), rewritten as System One requests, and the editor and answer views follow its design.

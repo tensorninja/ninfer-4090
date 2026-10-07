@@ -110,6 +110,8 @@ struct PreparedDecisionRequest {
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
+enum class DecisionOverflowPolicy { TruncateState, Reject };
+
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
@@ -157,12 +159,9 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
-    // System One decisions of the decision adapter `adapter`. They share generation's bounded
-    // ingress and pending deadline. The Engine's errors (ninfer::RequestError,
-    // ninfer::DecisionInputError) propagate unchanged, because the System One protocol renders
-    // them in its own shape.
     [[nodiscard]] PreparedDecisionRequest prepare_decision(ninfer::DecisionInput input,
-                                                           std::string adapter) const;
+                                                           std::string adapter,
+                                                           DecisionOverflowPolicy overflow) const;
     // Consumes prepared.decision.
     ninfer::DecisionResult decide(PreparedDecisionRequest& prepared,
                                   std::function<bool()> is_cancelled = {});

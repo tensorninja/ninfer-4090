@@ -709,6 +709,11 @@ struct GenerationResult {
 // never interprets question types.
 inline constexpr std::uint32_t kMaximumDecisionOptions = 255;
 
+struct DecisionLimits {
+    std::uint32_t max_state_tokens = 0;
+    std::uint32_t max_row_tokens   = 0;
+};
+
 struct DecisionQuestion {
     std::string instructions;
     std::vector<std::string> options;
@@ -1101,6 +1106,7 @@ struct LoadSummary {
     std::vector<LoraAdapterInfo> lora_adapters;
     // The loaded target serves System One decisions (a compile-time trait of its package).
     bool decisions_supported = false;
+    DecisionLimits decision_limits;
     // Bank rank, resident slot count, the device bytes the bank cost, and the disk bytes the
     // whole pool occupies. A lower-rank pool adapter is zero-padded into the bank rank.
     std::int32_t lora_rank             = 0;

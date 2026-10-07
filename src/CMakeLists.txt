@@ -359,6 +359,14 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
 
+  add_library(ninfer_product_decision STATIC product/decision/probability.cpp)
+  ninfer_internal_includes(ninfer_product_decision)
+  add_library(ninfer_product_openai_decisions STATIC
+    product/openai_decisions/request.cpp
+    product/openai_decisions/answers.cpp)
+  ninfer_internal_includes(ninfer_product_openai_decisions)
+  target_link_libraries(ninfer_product_openai_decisions PUBLIC ninfer_product_decision)
+
   # Host-only System One (TypeSafe) request/answer translation, bit-exact with kev's Python.
   add_library(ninfer_product_systemone STATIC
     product/systemone/render.cpp
@@ -366,9 +374,12 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
     product/systemone/answers.cpp
     product/systemone/models.cpp)
   ninfer_internal_includes(ninfer_product_systemone)
+  target_link_libraries(ninfer_product_systemone PUBLIC ninfer_product_decision)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # Python rounds every float operation separately; contracting them into FMAs breaks parity.
     target_compile_options(ninfer_product_systemone PRIVATE -ffp-contract=off)
+    target_compile_options(ninfer_product_decision PRIVATE -ffp-contract=off)
+    target_compile_options(ninfer_product_openai_decisions PRIVATE -ffp-contract=off)
   endif()
 endif()
 
@@ -419,6 +430,8 @@ if(NINFER_BUILD_SERVE)
     serve/responses_http.cpp
     serve/serve_metrics.cpp
     serve/serve_options.cpp
+    serve/decision_models.cpp
+    serve/openai_decisions_service.cpp
     serve/systemone_service.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
@@ -426,6 +439,6 @@ if(NINFER_BUILD_SERVE)
   # NVML is part of the driver this engine already requires; GET /telemetry reads board
   # utilization, temperature, power and clocks from it.
   target_link_libraries(ninfer_serve
-    PUBLIC ninfer_engine ninfer_product_systemone Threads::Threads
+    PUBLIC ninfer_engine ninfer_product_systemone ninfer_product_openai_decisions Threads::Threads
     PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET} CUDA::nvml)
 endif()

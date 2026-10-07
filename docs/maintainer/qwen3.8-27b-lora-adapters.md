@@ -325,8 +325,9 @@ Writes a `<out>.conversion.json` report mirroring `tools/convert/qwen3_8/common/
 
 An adapter has one of two kinds under the same `qwen3.8-27b/lora-bf16` identity. A **generative**
 adapter carries only the factors above and serves chat. A **decision** adapter additionally carries
-the System One pointer head and serves only `/typesafe` decisions; each kind is rejected on the
-other's route. The kind is the presence of the head: all five objects below are present together or
+the System One pointer head and serves text-only OpenAI Decisions at `/v1/decisions` and TypeSafe
+decisions under `/typesafe`; each kind is rejected on the other's route. The kind is the presence
+of the head: all five objects below are present together or
 not at all, and the binder rejects a partial set.
 
 ```

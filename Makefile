@@ -57,10 +57,12 @@ serving-tests: configure
 		ninfer_responses_transport_test \
 		ninfer_responses_schema_test \
 		ninfer_openai_schema_test \
+		ninfer_openai_decisions_product_test \
+		ninfer_systemone_product_test \
 		ninfer_request_log_test \
 		ninfer_serve_options_test
 	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure -R \
-		'ninfer_(response_store|responses_state|responses_transport|responses_schema|openai_schema|request_log|serve_options)_test'
+		'ninfer_(response_store|responses_state|responses_transport|responses_schema|openai_schema|openai_decisions_product|systemone_product|request_log|serve_options)_test'
 
 # Compile the token-specialized decode objects under their four-slot Ninja pool.
 decode-verbose: configure

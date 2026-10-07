@@ -13,12 +13,14 @@
 // type is missing or unknown folds into one line saying which types exist.
 
 import { lastEntry, type JsonNode } from './json'
-import { isQuestionType, orList, QUESTION_TYPES, type QuestionType } from './request'
+import { isQuestionType, orList, QUESTION_TYPES, type Protocol, type QuestionType } from './request'
 
 export interface DetailLine {
   /** The location without its leading "body", as strings. */
   loc: string[]
   msg: string
+  code?: string
+  type?: string
 }
 
 /** The fields of a completed run that explain its failure. */
@@ -26,7 +28,7 @@ export interface Failure {
   status?: number
   text: string
   data: unknown
-  /** A 2xx whose body is not a System One response. */
+  /** A 2xx whose body is not a response for the sent protocol. */
   odd: boolean
   /** Set when there was no response at all. */
   net?: string
@@ -111,6 +113,7 @@ export function describeFailure(
   run: Failure,
   questions: JsonNode | null,
   endpoint: string,
+  protocol: Protocol = 'typesafe',
 ): ErrorView {
   if (run.net !== undefined) {
     return {
@@ -122,15 +125,38 @@ export function describeFailure(
   const status = run.status ?? 0
   const detail =
     !run.odd && isRecord(run.data) && 'detail' in run.data ? run.data.detail : undefined
-  let lines = run.odd ? [] : detailLines(detail ?? null, questions)
-  const unknownModel = status === 404 && typeof detail === 'string' && detail.startsWith('model ')
-  if (unknownModel) lines = [{ loc: ['model'], msg: detail }]
+  const error =
+    !run.odd && protocol === 'openai' && isRecord(run.data) && isRecord(run.data.error)
+      ? run.data.error
+      : null
+  let lines: DetailLine[] =
+    error && typeof error.message === 'string'
+      ? [
+          {
+            loc:
+              typeof error.param === 'string' && error.param
+                ? error.param.replace(/\[(\d+)\]/g, '.$1').split('.')
+                : [],
+            msg: error.message,
+            ...(typeof error.code === 'string' ? { code: error.code } : {}),
+            ...(typeof error.type === 'string' ? { type: error.type } : {}),
+          },
+        ]
+      : run.odd
+        ? []
+        : detailLines(detail ?? null, questions)
+  const unknownModel =
+    status === 404 &&
+    (protocol === 'openai'
+      ? error?.code === 'model_not_found' || error?.param === 'model'
+      : typeof detail === 'string' && detail.startsWith('model '))
+  if (unknownModel && protocol === 'typesafe') lines = [{ loc: ['model'], msg: String(detail) }]
   if (!lines.length) lines = [{ loc: [], msg: run.text.slice(0, 600) || 'No details.' }]
 
   if (run.odd) {
     return {
       title: `Unexpected response (HTTP ${status})`,
-      help: "The server answered, but not with System One's answers object. The JSON view shows the whole body.",
+      help: `The server answered, but not with ${protocol === 'openai' ? "OpenAI Decisions' answers array" : "System One's answers object"}. The JSON view shows the whole body.`,
       lines,
     }
   }
@@ -151,7 +177,31 @@ export function describeFailure(
   if (unknownModel) {
     return {
       title: 'Unknown model (HTTP 404)',
-      help: 'Pick one of the models this server lists; they come from GET /typesafe/v1/models.',
+      help:
+        protocol === 'openai'
+          ? 'Pick a decision adapter from GET /v1/models. jev-latest is TypeSafe-only; there is no gpt-6-luna alias.'
+          : 'Pick one of the models this server lists; they come from GET /typesafe/v1/models.',
+      lines,
+    }
+  }
+  if (status === 400 && protocol === 'openai') {
+    if (error?.code === 'context_length_exceeded') {
+      return {
+        title: 'The decision does not fit (HTTP 400)',
+        help: "OpenAI Decisions rejects overflow instead of truncating input. Shorten the input or the longest question so the state and each question's branch fit the token budgets and lane context.",
+        lines,
+      }
+    }
+    if (error?.code === 'unsupported_modality') {
+      return {
+        title: 'Unsupported input modality (HTTP 400)',
+        help: 'This decision adapter accepts text-only user input, not images or other modalities.',
+        lines,
+      }
+    }
+    return {
+      title: 'The server rejected the request (HTTP 400)',
+      help: 'Fix the input or question parameter above and run again. The JSON view shows the full OpenAI error.',
       lines,
     }
   }
@@ -165,7 +215,7 @@ export function describeFailure(
   if (status === 413) {
     return {
       title: 'The request is too large (HTTP 413)',
-      help: "The body is over the server's --max-request-mib limit. Shorten the state or split the questions.",
+      help: `The body is over the server's --max-request-mib limit. Shorten the ${protocol === 'openai' ? 'input' : 'state'} or split the questions.`,
       lines,
     }
   }

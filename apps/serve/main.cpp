@@ -98,13 +98,16 @@ int main(int argc, char** argv) {
                 decision_adapters   = decision_adapters || decision;
                 ninfer::serve::write_console_log(
                     ninfer::serve::ConsoleLogLevel::Info,
-                    decision ? "LoRA adapter: " + adapter.name + " (System One model: " +
-                                   adapter.name + ')'
+                    decision ? "LoRA adapter: " + adapter.name +
+                                   " (decision model: " + adapter.name + ')'
                              : "LoRA adapter: " + adapter.name + " (model id: " +
                                    server.public_model_id() + '-' + adapter.name + ')');
             }
             if (decision_adapters) {
                 const std::string binding = server.systemone_alias_binding();
+                ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                                 "OpenAI Decisions: POST /v1/decisions (text "
+                                                 "only), model names from /v1/models");
                 ninfer::serve::write_console_log(
                     ninfer::serve::ConsoleLogLevel::Info,
                     "System One: POST /typesafe/v1/systemone, default model " +

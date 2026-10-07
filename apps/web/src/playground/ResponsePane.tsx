@@ -23,7 +23,7 @@ import { describeFailure, type ErrorView } from './errors'
 import { formatJson, tryParse, type JsonNode } from './json'
 import { cardFor, type ModelCard } from './models'
 import { plural, type EditorState, type RequestBody } from './request'
-import { curlSnippet, ENDPOINT, pythonSnippet } from './snippets'
+import { curlSnippet, endpointFor, pythonSnippet } from './snippets'
 import type { CompletedRun, PlaygroundSnapshot, PlaygroundStore, View } from './store'
 import { locate, type Loc } from './validate'
 
@@ -51,14 +51,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 export const fmtMs = (ms: number) =>
   ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`
 
-/** Distinct keys, as the server reads a question object: a repeated key is one question. */
 const questionCount = (node: JsonNode | null) =>
-  node?.t === 'obj' ? new Set(node.entries.map((e) => e.k)).size : 0
+  node?.t === 'arr'
+    ? node.items.length
+    : node?.t === 'obj'
+      ? new Set(node.entries.map((e) => e.k)).size
+      : 0
 
 function statusOf(s: PlaygroundSnapshot): { status: Status; hint: string } {
   const last = s.last
   if (s.pending) return { status: 'running', hint: 'Waiting for the server\u2026' }
-  if (last && s.analysis.body?.canon !== last.body.canon) {
+  if (
+    last &&
+    (s.analysis.body?.canon !== last.body.canon || s.editor.protocol !== last.body.protocol)
+  ) {
     return { status: 'stale', hint: 'The request changed since this run' }
   }
   if (last?.ok) {
@@ -99,8 +105,9 @@ function CopyButton({ text }: { text: string }) {
 /** What answered and what it cost, from the response and the model catalog. */
 function Strip({ run, cards }: { run: CompletedRun; cards: readonly ModelCard[] }) {
   const data = isRecord(run.data) ? run.data : {}
+  const openai = run.body.protocol === 'openai'
   const answered = typeof data.model === 'string' ? data.model : ''
-  const card = cardFor(cards, run.body.model)
+  const card = openai ? undefined : cardFor(cards, run.body.model)
   // The SDK alias, whether named or left out, is shown with the adapter that answered for it.
   const asked = card && card.name !== card.adapter ? card.name : run.body.model
   const model =
@@ -108,16 +115,34 @@ function Strip({ run, cards }: { run: CompletedRun; cards: readonly ModelCard[] 
       ? `${asked} \u2192 ${answered}`
       : answered || asked || '\u2014'
   const usage = isRecord(data.usage) ? data.usage : {}
+  const inputDetails = isRecord(usage.input_tokens_details) ? usage.input_tokens_details : {}
   const tokens = (value: unknown) => (typeof value === 'number' ? count(value) : '\u2014')
   const cells: Array<{ label: string; value: string; hint?: string }> = [
     { label: 'model', value: model },
     { label: 'input tokens', value: tokens(usage.input_tokens) },
     { label: 'output tokens', value: tokens(usage.output_tokens) },
-    {
-      label: 'latency',
-      value: typeof data.latency_ms === 'number' ? `${data.latency_ms.toFixed(1)} ms` : '\u2014',
-      hint: "latency_ms: the server's time for the decision, from the request to its answers",
-    },
+    ...(openai
+      ? [
+          { label: 'total tokens', value: tokens(usage.total_tokens) },
+          {
+            label: 'cached tokens',
+            value: tokens(inputDetails.cached_tokens),
+            hint: 'Input state tokens reused from retained or restored state',
+          },
+          {
+            label: 'cache write tokens',
+            value: tokens(inputDetails.cache_write_tokens),
+            hint: 'No separate cache-write accounting; zero does not mean the cache is disabled',
+          },
+        ]
+      : [
+          {
+            label: 'latency',
+            value:
+              typeof data.latency_ms === 'number' ? `${data.latency_ms.toFixed(1)} ms` : '\u2014',
+            hint: "latency_ms: the server's time for the decision, from the request to its answers",
+          },
+        ]),
     {
       label: 'round trip',
       value: fmtMs(run.ms),
@@ -126,7 +151,7 @@ function Strip({ run, cards }: { run: CompletedRun; cards: readonly ModelCard[] 
     {
       label: 'request id',
       value: run.id,
-      hint: 'x-typesafe-request-id, the key the engine logs the decision under',
+      hint: `${openai ? 'x-request-id' : 'x-typesafe-request-id'}, the key the engine logs the decision under`,
     },
   ]
   return (
@@ -147,7 +172,7 @@ function ErrorBox({
   onJump,
 }: {
   view: ErrorView
-  editor: EditorState
+  editor: EditorState | null
   onJump: (loc: Loc) => void
 }) {
   return (
@@ -156,7 +181,7 @@ function ErrorBox({
       <ul>
         {view.lines.map((line, j) => {
           const label = line.loc.join(' \u2192 ')
-          const where = line.loc.length ? locate(editor, line.loc) : null
+          const where = editor && line.loc.length ? locate(editor, line.loc) : null
           return (
             <li key={j}>
               {line.loc.length ? (
@@ -172,6 +197,12 @@ function ErrorBox({
                 </>
               ) : null}
               {line.msg}
+              {line.code || line.type ? (
+                <span className="pg-ans__sub">
+                  {' '}
+                  <code>{[line.type, line.code].filter(Boolean).join(' / ')}</code>
+                </span>
+              ) : null}
             </li>
           )
         })}
@@ -227,7 +258,11 @@ function CodeView({ body }: { body: RequestBody | null }) {
       <CodeBlock title="curl" sub="the current request" text={curlSnippet(origin, body)} />
       <CodeBlock
         title="Python"
-        sub="the TypeSafe SDK (pip install typesafe-sdk)"
+        sub={
+          body.protocol === 'openai'
+            ? 'the OpenAI SDK (pip install "openai>=3.26.0")'
+            : 'the TypeSafe SDK (pip install typesafe-sdk)'
+        }
         text={pythonSnippet(origin, body)}
       />
     </div>
@@ -300,8 +335,9 @@ export function ResponsePane({
     () =>
       run?.ok
         ? answerViews(
-            (run.data as { answers: Record<string, unknown> }).answers,
+            (run.data as { answers: unknown }).answers,
             run.body.questions,
+            run.body.protocol,
           )
         : [],
     [run],
@@ -309,7 +345,12 @@ export function ResponsePane({
   const failure = useMemo(
     () =>
       run && !run.ok
-        ? describeFailure(run, run.body.questions, window.location.origin + ENDPOINT)
+        ? describeFailure(
+            run,
+            run.body.questions,
+            window.location.origin + endpointFor(run.body.protocol),
+            run.body.protocol,
+          )
         : null,
     [run],
   )
@@ -341,10 +382,11 @@ export function ResponsePane({
               <kbd>
                 {MOD}+{'\u21b5'}
               </kbd>{' '}
-              to answer these questions about the state.
+              to answer these questions about the{' '}
+              {s.editor.protocol === 'openai' ? 'input' : 'state'}.
             </p>
           )}
-          <PreviewList questions={s.preview} />
+          <PreviewList questions={s.preview} protocol={s.editor.protocol} />
           {engineView}
         </>
       ) : (
@@ -359,9 +401,13 @@ export function ResponsePane({
     // The questions stay listed under the error, so the pane never goes blank.
     answers = (
       <>
-        <ErrorBox view={failure} editor={s.editor} onJump={onJump} />
+        <ErrorBox
+          view={failure}
+          editor={s.editor.protocol === run.body.protocol ? s.editor : null}
+          onJump={onJump}
+        />
         {engineView}
-        <PreviewList questions={s.preview} />
+        <PreviewList questions={run.body.questions} protocol={run.body.protocol} />
       </>
     )
   } else {

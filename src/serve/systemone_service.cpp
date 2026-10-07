@@ -55,12 +55,9 @@ std::string new_typesafe_request_id() {
 }
 
 SystemOneService::SystemOneService(GenerationService& generation, const ServeOptions& options,
-                                   std::string public_model_id)
-    : generation_(generation), public_model_id_(std::move(public_model_id)) {
-    for (const ninfer::LoraAdapterInfo& adapter : generation.load_summary().lora_adapters) {
-        if (adapter.kind == ninfer::LoraAdapterKind::Decision) { adapters_.push_back(adapter); }
-    }
-    binding_                           = so::alias_binding(adapters_, options.systemone_default);
+                                   std::string public_model_id, const DecisionModels& models)
+    : generation_(generation), models_(models), public_model_id_(std::move(public_model_id)) {
+    binding_ = so::alias_binding(models_.adapters(), options.systemone_default);
     const ninfer::MemorySummary memory = generation.memory_summary();
     kv_cache_                          = memory.kv_cache;
     max_context_                       = memory.max_context;
@@ -93,10 +90,10 @@ nlohmann::ordered_json SystemOneService::card(std::string_view name,
 
 std::string SystemOneService::models_body() const {
     Json models = Json::array();
-    for (const ninfer::LoraAdapterInfo& adapter : adapters_) {
+    for (const ninfer::LoraAdapterInfo& adapter : models_.adapters()) {
         models.push_back(card(adapter.name, adapter));
     }
-    for (const ninfer::LoraAdapterInfo& adapter : adapters_) {
+    for (const ninfer::LoraAdapterInfo& adapter : models_.adapters()) {
         if (adapter.name == binding_) { models.push_back(card(so::kDefaultModel, adapter)); }
     }
     Json body      = Json::object();
@@ -112,18 +109,23 @@ PreparedSystemOne SystemOneService::prepare(std::string_view body) const {
     } catch (const so::RequestValidationError& error) {
         throw SystemOneError(error.status(), error.detail());
     }
-    const std::optional<std::string> adapter = so::resolve_model(request.model, adapters_, binding_);
-    if (!adapter) {
-        throw SystemOneError(404, so::unknown_model_detail(request.model, adapters_, binding_));
+    const LoraAdapterInfo* adapter = models_.find(request.model);
+    if (adapter == nullptr && request.model == so::kDefaultModel && !binding_.empty()) {
+        adapter = models_.find(binding_);
+    }
+    if (adapter == nullptr) {
+        throw SystemOneError(404,
+                             so::unknown_model_detail(request.model, models_.adapters(), binding_));
     }
 
     PreparedSystemOne prepared;
     prepared.model     = std::move(request.model);
-    prepared.adapter   = *adapter;
+    prepared.adapter           = adapter->name;
     prepared.questions = std::move(request.questions);
     const double parse_seconds = std::chrono::duration<double>(Clock::now() - received).count();
     try {
-        prepared.decision = generation_.prepare_decision(std::move(request.input), *adapter);
+        prepared.decision = generation_.prepare_decision(std::move(request.input), adapter->name,
+                                                         DecisionOverflowPolicy::TruncateState);
     } catch (const ninfer::DecisionInputError& error) {
         throw SystemOneError(422, error.what());
     } catch (const ninfer::RequestError& error) { throw_engine_error(error); }

@@ -13,7 +13,7 @@ import { useSyncExternalStore } from 'react'
 
 import { formatJson, lineCol, tryParse, type JsonNode, type ObjectNode } from './json'
 import { fetchCatalog, type Catalog } from './models'
-import { PRESETS } from './presets'
+import { PRESETS, presetsFor, type Preset } from './presets'
 import {
   editorFromSnap,
   fieldsBlocker,
@@ -33,12 +33,13 @@ import {
   type QuestionDraft,
   type QuestionsMode,
   type RequestBody,
+  type Protocol,
   type Section,
   type Snap,
   type StateMode,
 } from './request'
 import { readShareHash, shareUrl, type SharedRequest } from './share'
-import { ENDPOINT } from './snippets'
+import { endpointFor } from './snippets'
 import { analyze, type Analysis } from './validate'
 import { requestId } from './engine'
 import type { DecisionDoneRecord, DecisionErrorRecord } from '../lib/records'
@@ -179,6 +180,7 @@ function readUi(): UiPrefs {
 function isSnap(value: unknown): value is Snap {
   return (
     isRecord(value) &&
+    (value.protocol === 'typesafe' || value.protocol === 'openai') &&
     typeof value.stateText === 'string' &&
     typeof value.qText === 'string' &&
     (value.stateMode === 'fields' || value.stateMode === 'json') &&
@@ -190,10 +192,17 @@ const snapModel = (snap: Snap) => (typeof snap.model === 'string' ? snap.model :
 
 const canonOf = (snap: Snap) => analyze(editorFromSnap(snap), null).body?.canon ?? ''
 
+interface Draft {
+  snap: Snap
+  base: Base | null
+}
+
 export class PlaygroundStore {
   private state: PlaygroundSnapshot
   private readonly listeners = new Set<() => void>()
   private readonly shared = new Map<string, { label: string; snap: Snap }>()
+  private readonly drafts = new Map<Protocol, Draft>()
+  private readonly catalogs = new Map<Protocol, Promise<Catalog>>()
   private saveTimer: ReturnType<typeof setTimeout> | undefined
   private toastSeq = 0
   /** The body canon an Undo toast was offered for; an edit past it withdraws the offer. */
@@ -202,6 +211,7 @@ export class PlaygroundStore {
   constructor() {
     const ui = readUi()
     const editor = editorFromSnap({
+      protocol: 'typesafe',
       stateMode: ui.stateMode,
       qMode: ui.qMode,
       stateText: '{}\n',
@@ -250,31 +260,35 @@ export class PlaygroundStore {
   boot() {
     if (this.state.booted) return
     this.set({ booted: true })
-    void this.loadCatalog()
     const params = new URLSearchParams(window.location.search)
     const shared = readShareHash(window.location.hash)
     if (shared !== undefined) this.clearHash()
-    let fromDraft = false
+    const saved = storage.get(DRAFT_KEY)
+    if (isRecord(saved) && saved.v === 2 && isRecord(saved.drafts)) {
+      for (const protocol of ['typesafe', 'openai'] as const) {
+        const draft = saved.drafts[protocol]
+        if (!isRecord(draft) || !isSnap(draft.snap) || draft.snap.protocol !== protocol) continue
+        const base = draft.base
+        this.drafts.set(protocol, {
+          snap: draft.snap,
+          base:
+            isRecord(base) &&
+            typeof base.name === 'string' &&
+            typeof base.label === 'string' &&
+            isSnap(base.snap) &&
+            base.snap.protocol === protocol
+              ? { name: base.name, label: base.label, snap: base.snap, canon: canonOf(base.snap) }
+              : null,
+        })
+      }
+    }
+    const protocol =
+      shared?.protocol ?? (isRecord(saved) && saved.protocol === 'openai' ? 'openai' : 'typesafe')
+    const fromDraft = this.drafts.has(protocol)
+    this.openProtocol(protocol)
     const preset = params.get('preset')
     if (shared) this.loadShared(shared, false)
     else if (preset && this.sourceSnap(preset)) this.loadSource(preset, false)
-    else {
-      const draft = storage.get(DRAFT_KEY)
-      if (isRecord(draft) && draft.v === 1 && isSnap(draft.snap)) {
-        const base = isRecord(draft.base) && isSnap(draft.base.snap) ? draft.base : null
-        if (base && typeof base.name === 'string' && typeof base.label === 'string') {
-          if (!this.sourceSnap(base.name))
-            this.rememberShared(base.name, base.label, base.snap as Snap)
-          this.setBase(base.name, base.label, base.snap as Snap)
-        } else {
-          this.setBase('example', PRESETS[0]!.label, this.presetSnap(PRESETS[0]!))
-        }
-        this.restore(draft.snap)
-        fromDraft = true
-      } else {
-        this.loadSource('example', false)
-      }
-    }
     if (shared === null) {
       this.showToast(
         `The link does not hold a readable request; showing ${fromDraft ? 'your last draft' : quote(this.state.base?.label ?? 'the example')} instead.`,
@@ -307,6 +321,10 @@ export class PlaygroundStore {
     const shared = readShareHash(window.location.hash)
     if (shared === undefined) return
     this.clearHash()
+    if (this.state.pending) {
+      this.showToast('Wait for the current run, then open the share link again.')
+      return
+    }
     if (shared) this.loadShared(shared, true)
     else this.showToast('The link does not hold a readable request.')
   }
@@ -320,43 +338,114 @@ export class PlaygroundStore {
   }
 
   private async loadCatalog() {
-    try {
-      const cards = await fetchCatalog()
-      this.set({ catalog: { state: 'ready', cards } })
-    } catch (error) {
-      this.set({
-        catalog: {
+    const protocol = this.state.editor.protocol
+    let loading = this.catalogs.get(protocol)
+    if (!loading) {
+      loading = fetchCatalog(protocol).then<Catalog, Catalog>(
+        (cards) => ({ state: 'ready', cards }),
+        (error: unknown) => ({
           state: 'error',
           message: error instanceof Error ? error.message : String(error),
-        },
-      })
+        }),
+      )
+      this.catalogs.set(protocol, loading)
+    }
+    const catalog = await loading
+    if (this.state.editor.protocol !== protocol) return
+    this.set({ catalog })
+    if (
+      protocol === 'openai' &&
+      catalog.state === 'ready' &&
+      !this.state.editor.model &&
+      catalog.cards[0]
+    ) {
+      const model = catalog.cards[0].name
+      const base = this.state.base
+      if (base && !this.state.edited) this.setBase(base.name, base.label, { ...base.snap, model })
+      this.setModel(model)
     }
     this.commit(this.state.editor)
   }
 
+  private captureDraft() {
+    this.drafts.set(this.state.editor.protocol, {
+      snap: snapOf(this.state.editor),
+      base: this.state.base,
+    })
+  }
+
+  private openProtocol(protocol: Protocol) {
+    this.set({
+      editor: { ...this.state.editor, protocol, model: '' },
+      sources: presetsFor(protocol).map(({ name, label }) => ({ name, label })),
+      catalog: { state: 'loading' },
+      base: null,
+      last: null,
+      preview: null,
+      notes: {},
+    })
+    const draft = this.drafts.get(protocol)
+    if (draft) {
+      const base = draft.base
+      if (base) {
+        if (!presetsFor(protocol).some((p) => p.name === base.name))
+          this.rememberShared(base.name, base.label, base.snap)
+        this.setBase(base.name, base.label, base.snap)
+      }
+      this.restore(draft.snap)
+    } else {
+      this.loadSource('example', false)
+    }
+    void this.loadCatalog()
+  }
+
+  setProtocol(protocol: Protocol) {
+    if (protocol === this.state.editor.protocol || this.state.pending) return
+    this.captureDraft()
+    this.dismissToast()
+    this.openProtocol(protocol)
+    this.saveDraft()
+    this.announce(
+      `Switched to ${protocol === 'openai' ? 'OpenAI Decisions' : 'TypeSafe System One'}. Each protocol keeps its own draft.`,
+    )
+  }
+
   // --- sources: presets and shared requests ------------------------------------------------
 
-  private presetSnap(preset: (typeof PRESETS)[number]): Snap {
+  private presetSnap(preset: Preset): Snap {
     const { stateMode, qMode } = this.state.ui
-    return snapFromValue(preset, { stateMode, qMode })
+    const { protocol, model } = this.state.editor
+    return snapFromValue(
+      { ...preset, model: protocol === 'openai' ? model : '' },
+      { stateMode, qMode },
+      protocol,
+    )
   }
 
   private sourceSnap(name: string): { label: string; snap: Snap } | undefined {
-    const preset = PRESETS.find((p) => p.name === name)
+    const protocol = this.state.editor.protocol
+    const preset = presetsFor(protocol).find((p) => p.name === name)
     if (preset) return { label: preset.label, snap: this.presetSnap(preset) }
-    return this.shared.get(name)
+    return this.shared.get(`${protocol}:${name}`)
   }
 
   private rememberShared(name: string, label: string, snap: Snap) {
-    this.shared.set(name, { label, snap })
+    this.shared.set(`${snap.protocol}:${name}`, { label, snap })
     if (!this.state.sources.some((s) => s.name === name)) {
       this.set({ sources: [...this.state.sources, { name, label }] })
     }
   }
 
   private loadShared(shared: SharedRequest, withUndo: boolean) {
+    if (shared.protocol !== this.state.editor.protocol) this.setProtocol(shared.protocol)
     const { stateMode, qMode } = this.state.ui
-    const snap = snapFromNodes(shared.state, shared.questions, shared.model, { stateMode, qMode })
+    const snap = snapFromNodes(
+      shared.state,
+      shared.questions,
+      shared.model,
+      { stateMode, qMode },
+      shared.protocol,
+    )
     this.rememberShared('shared', 'Shared request', snap)
     this.load('shared', 'Shared request', snap, withUndo)
   }
@@ -507,6 +596,7 @@ export class PlaygroundStore {
    */
   setMode(sec: Section, mode: StateMode | QuestionsMode): boolean {
     const editor = this.state.editor
+    if (editor.protocol === 'openai' && mode !== 'json') return false
     const isState = sec === 'state'
     if ((isState ? editor.stateMode : editor.qMode) === mode) return true
     const notes = { ...this.state.notes }
@@ -575,15 +665,19 @@ export class PlaygroundStore {
       doneAt: 0,
     }
     try {
-      const response = await fetch(ENDPOINT, {
+      const response = await fetch(endpointFor(body.protocol), {
         method: 'POST',
         body: body.text,
         headers: {
           'content-type': 'application/json',
           accept: 'application/json',
-          'x-typesafe-request-id': id,
+          ...(body.protocol === 'typesafe' ? { 'x-typesafe-request-id': id } : {}),
         },
       })
+      if (body.protocol === 'openai') {
+        run.id = response.headers.get('x-request-id') ?? id
+        this.set({ pending: { id: run.id, body, startedAt } })
+      }
       run.status = response.status
       run.retryAfter = response.headers.get('retry-after') ?? undefined
       run.text = await response.text()
@@ -592,7 +686,10 @@ export class PlaygroundStore {
       } catch {
         run.data = null
       }
-      run.ok = response.ok && isRecord(run.data) && isRecord(run.data.answers)
+      run.ok =
+        response.ok &&
+        isRecord(run.data) &&
+        (body.protocol === 'openai' ? Array.isArray(run.data.answers) : isRecord(run.data.answers))
       run.odd = response.ok && !run.ok
     } catch (error) {
       run.net = error instanceof Error ? error.message : String(error)
@@ -628,11 +725,11 @@ export class PlaygroundStore {
   }
 
   private saveDraft() {
-    const base = this.state.base
+    this.captureDraft()
     storage.set(DRAFT_KEY, {
-      v: 1,
-      snap: snapOf(this.state.editor),
-      base: base && { name: base.name, label: base.label, snap: base.snap },
+      v: 2,
+      protocol: this.state.editor.protocol,
+      drafts: Object.fromEntries(this.drafts),
     })
   }
 

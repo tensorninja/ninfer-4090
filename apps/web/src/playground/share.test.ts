@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { compactJson } from './json'
+import { buildBody } from './request'
 import { b64urlDecode, b64urlEncode, readShareHash, shareUrl } from './share'
 
 const BODY =
@@ -32,4 +33,14 @@ test('a hash that is not a readable request is told apart from no link at all', 
   expect(readShareHash('#r=' + b64urlEncode('{"state": 1}'))).toBeNull()
   expect(readShareHash('#r=' + b64urlEncode('not json'))).toBeNull()
   expect(readShareHash('#r=/w')).toBeNull()
+})
+
+test('native OpenAI share links preserve ordered typed values and select their protocol', () => {
+  const body =
+    '{"input":[{"role":"user","content":"context"}],"questions":[{"type":"choice","name":"same","instructions":"Choose","choices":[{"value":true},{"value":"true"},{"value":true}]},{"type":"predicate","name":"same","instructions":"Relevant?"}],"model":"decision-v7"}'
+  const hash = shareUrl('http://h:8080/playground', body).split('#')[1]!
+  const shared = readShareHash('#' + hash)!
+  expect(shared.protocol).toBe('openai')
+  expect(buildBody(shared.state, shared.questions, shared.model, shared.protocol).text).toBe(body)
+  expect(readShareHash('#r=' + b64urlEncode('{"state":"s","input":"i","questions":[]}'))).toBeNull()
 })
