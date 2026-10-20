@@ -38,6 +38,7 @@ out/
 models/
 # Anchored: a bare `lora/` would also swallow source directories such as tests/ops/lora/.
 /lora/
+/lora-archive-*/
 vcpkg_installed/
 *.log
 
