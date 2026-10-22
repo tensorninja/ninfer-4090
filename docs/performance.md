@@ -720,7 +720,7 @@ than the batched-decode route above.
 ### System One decision latency
 
 Decisions were measured on the same card and toolchain with the decision adapter
-`systemone-decision-v7` (rank 16 on the six registered modules, plus its pointer head). The KV
+`decision-1` (rank 16 on the six registered modules, plus its pointer head). The KV
 cache was BF16, the configuration decisions are qualified on
 ([System One fidelity](serving.md#system-one-fidelity)), with one lane and a 73,728-token context.
 `scripts/decision_probe.py` drives `/typesafe/v1/systemone` and reads every decision's
@@ -785,7 +785,7 @@ stay within kev's per-question tolerance.
 One `ninfer-serve` process served chat and decisions at once on the same card and toolchain,
 2026-09-30: BF16 KV, MTP with three draft tokens, four lanes, a 32,768-token context, prefix reuse
 and the continuation cache at their defaults, and a two-slot adapter bank. The pool held
-`systemone-decision-v7` and one generative adapter, a rank-16 style adapter on the same seven sites,
+`decision-1` and one generative adapter, a rank-16 style adapter on the same seven sites,
 so both stayed resident and no measured phase swapped. `scripts/dual_load_probe.py` ran three 90 s
 phases. Decisions alone is a closed loop: each decision is submitted as soon as the previous one
 returns, with six questions over one 8,162-token state that stays retained. Chat alone is two greedy

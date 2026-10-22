@@ -192,10 +192,7 @@ test('each status gets its own explanation', () => {
   })
   const questions = parseJson('{"q":{"type":"noul"}}')
   const unknown = describeFailure(
-    run(
-      404,
-      "model 'nope' not found; System One models: systemone-decision-v7, jev-latest (systemone-decision-v7)",
-    ),
+    run(404, "model 'nope' not found; System One models: decision-1, jev-latest (decision-1)"),
     questions,
     '/x',
   )

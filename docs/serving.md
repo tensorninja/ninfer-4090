@@ -674,7 +674,7 @@ There is no trained refusal detector, and NInfer does not fabricate `refusal` an
 
 Both decision surfaces use the same Engine, weights, `--lora-slots`, bounded FIFO, KV pool and
 continuation cache as chat. They are prefill-only: one state, then one independent branch per
-question. Use an actual decision adapter pool name such as `systemone-decision-v7`; there is no
+question. Use an actual decision adapter pool name such as `decision-1`; there is no
 `gpt-6-luna` alias, and `jev-latest` exists only on TypeSafe. Root `/v1/models` and
 `/v1/models/{id}` advertise decision adapters as OpenAI model objects with
 `supported_endpoints: ["/v1/decisions"]`, `modalities.vision` reflecting startup Vision capability,
@@ -689,7 +689,7 @@ from openai import OpenAI
 
 client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
 result = client.decisions.create(
-    model="systemone-decision-v7",
+    model="decision-1",
     input="I was charged twice this month. Please refund one charge before Friday.",
     questions=[
         {"type": "predicate", "name": "billing",
@@ -759,7 +759,7 @@ from openai import OpenAI
 client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
 image = base64.b64encode(Path("product.png").read_bytes()).decode("ascii")
 result = client.decisions.create(
-    model="systemone-decision-v7",
+    model="decision-1",
     input=[{"role": "user", "content": [
         {"type": "input_text", "text": "Inspect this product."},
         {"type": "input_image", "image_url": f"data:image/png;base64,{image}",
@@ -817,7 +817,7 @@ the text-only fidelity and mixed-load measurements do not establish either. The 
 and six LoRA modules are used, and no image-trained adapter or refusal detector is fabricated.
 
 Numerical integration checked on 2026-10-07 with RTX 4090 (`sm_89`, CUDA 13.2), the groupwise-int
-27B artifact, `systemone-decision-v7` and BF16 KV: 10 cold synthetic image requests / 30 questions
+27B artifact, `decision-1` and BF16 KV: 10 cold synthetic image requests / 30 questions
 had max |Δp| **0.001869**, mean per-question max |Δp| **0.000397**, **zero changed argmax answers**,
 and exact input-token accounting against the independent PyTorch reference. Cases covered all
 effective detail profiles, same-grid resize versus padding, changed pixels, multiple images and a
@@ -964,7 +964,7 @@ process; raw HTTP checks cover both surfaces regardless. No SDK is installed by 
 ```bash
 /path/to/python3.11 tools/smoke/serve_systemone_sdk.py \
   --server-bin build-sm89/apps/ninfer-serve --artifact models/qwen3_8_27b.ninfer \
-  --lora-dir lora --adapter systemone-decision-v7 \
+  --lora-dir lora --adapter decision-1 \
   --sdk-python /path/to/typesafe-0.6/bin/python \
   --sdk-python /path/to/typesafe-0.7/bin/python \
   --openai-sdk-python /path/to/openai/bin/python
@@ -991,7 +991,7 @@ Every unit of a decision, state chunks and branch passes alike, runs BF16 activa
 activation routes of chat prefill are never admitted. The KV codec is therefore the one lossy choice
 left to the operator, and it touches only the state: a branch pass attends its own question tokens
 from their BF16 values and writes no KV, so only a branch longer than one pass stores its tokens
-through the codec. Measured on an RTX 4090, 2026-09-30, with `systemone-decision-v7`:
+through the codec. Measured on an RTX 4090, 2026-09-30, with `decision-1`:
 
 | `--kv-dtype` | Served vs reference, max \|Δp\| (mean) | Changed answers / 290 | Alone vs full request, max \|Δp\| | kev's bars |
 |---|---:|---:|---:|---|

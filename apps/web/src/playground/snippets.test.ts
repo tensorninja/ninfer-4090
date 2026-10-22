@@ -15,7 +15,7 @@ const QUESTIONS = parseJson(`[
 ]`)
 
 test('OpenAI curl sends the native input, ordered questions and actual model to decisions', () => {
-  const body = buildBody(parseJson('"it\'s urgent"'), QUESTIONS, 'systemone-decision-v7', 'openai')
+  const body = buildBody(parseJson('"it\'s urgent"'), QUESTIONS, 'decision-1', 'openai')
   const curl = curlSnippet('http://h:8080', body)
   expect(endpointFor('typesafe')).toBe('/typesafe/v1/systemone')
   expect(endpointFor('openai')).toBe('/v1/decisions')
@@ -37,18 +37,18 @@ test('OpenAI curl sends the native input, ordered questions and actual model to 
         levels: [{ label: 'Today', description: 'This afternoon' }, { label: 'Later' }],
       },
     ],
-    model: 'systemone-decision-v7',
+    model: 'decision-1',
   })
 })
 
 test('OpenAI Python uses the Decisions SDK with native typed options and message input', () => {
   const input = parseJson('[{"role":"user","content":[{"type":"input_text","text":"urgent"}]}]')
-  const body = buildBody(input, QUESTIONS, 'systemone-decision-v7', 'openai')
+  const body = buildBody(input, QUESTIONS, 'decision-1', 'openai')
   const py = pythonSnippet('http://h:8080', body)
   expect(py).toStartWith('from openai import OpenAI\n\n')
   expect(py).toContain('client = OpenAI(api_key="local", base_url="http://h:8080/v1")')
   expect(py).toContain('response = client.decisions.create(\n')
-  expect(py).toContain('    model="systemone-decision-v7",\n')
+  expect(py).toContain('    model="decision-1",\n')
   expect(py).toContain('    input=[\n')
   expect(py).toContain('"type": "input_text"')
   expect(py).toContain('    questions=[\n')

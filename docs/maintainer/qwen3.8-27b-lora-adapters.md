@@ -200,7 +200,7 @@ unchanged; rank remains the capacity lever.
 also comes from NF4 QLoRA training and quantized serving, so the two causes have to be separated
 before blaming the site set.
 
-**Evidence, 2026-09-29.** `systemone-decision-v7` was trained at rank 16 on the six modules plus the
+**Evidence, 2026-09-29.** `decision-1` was trained at rank 16 on the six modules plus the
 head, for one epoch on the decision-v7 train split, with `T = 1.414`. It was served from the
 groupwise-int artifact with BF16 KV on an RTX 4090, and `llmdata.probes.systemone` scored the
 clean knowable questions. The locked test partition was scored once, on the final build:

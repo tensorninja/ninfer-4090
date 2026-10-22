@@ -9,7 +9,7 @@ import { buildBody } from './request'
 import { ResponsePane } from './ResponsePane'
 import { PlaygroundStore } from './store'
 
-// The billing-email example and ninfer-serve's answer to it on 2026-09-30 (systemone-decision-v7,
+// The billing-email example and ninfer-serve's answer to it on 2026-09-30 (decision-1,
 // rk4v4 KV). refund_requested gained descriptions here, and its answer is the false-leaning 0.2835
 // the email preset's is_phishing received, so both noul outcomes are covered.
 const SENT = parseJson(`{
@@ -242,9 +242,9 @@ test('OpenAI preview and answer lists show every duplicate and distinguish typed
 test('the prior OpenAI response retains its protocol, token/cache usage and answers after a switch', () => {
   const store = new PlaygroundStore()
   const initial = store.getSnapshot()
-  const body = buildBody(parseJson('"state"'), OPENAI_QUESTIONS, 'systemone-decision-v7', 'openai')
+  const body = buildBody(parseJson('"state"'), OPENAI_QUESTIONS, 'decision-1', 'openai')
   const data = {
-    model: 'systemone-decision-v7',
+    model: 'decision-1',
     answers: OPENAI_ANSWERS,
     usage: {
       input_tokens: 123,
