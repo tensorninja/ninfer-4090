@@ -753,7 +753,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
+            #if defined(_WIN32)
+            constexpr auto kOrdinaryGraphAllowanceMiB = 32ULL;
+#else
+            constexpr auto kOrdinaryGraphAllowanceMiB = 12ULL;
+#endif
+            impl->graph_allowance_bytes = checked_mul(kOrdinaryGraphAllowanceMiB * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
