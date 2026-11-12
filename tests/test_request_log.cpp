@@ -60,13 +60,13 @@ int main() {
     options.speculative.proposal_head    = ninfer::ProposalHead::Optimized;
     options.enable_vision                = false;
     options.allow_prefix_reuse           = false;
-    options.preserve_thinking            = true;
+    options.preserve_thinking            = false;
     options.continuation_cache.tiers     = ninfer::ContinuationCacheTiers::L1L2L3;
     options.continuation_cache.directory = "/var/cache/ninfer";
     options.continuation_cache.cache_namespace        = "tenant-a";
     options.continuation_cache.persist_min_tokens     = 512;
     options.continuation_cache.filesystem_reserve_mib = 4096;
-    options.sampling_overrides.temperature            = 0.6F;
+    options.sampling_overrides.thinking.temperature   = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
@@ -206,17 +206,17 @@ int main() {
                           continuation_cache.at("filesystem_reserve_mib") == 4096 &&
                           continuation_cache.at("prefix_checkpoint_history") == 4,
                       "continuation cache configuration missing from server-start record");
-    failures += check(server.at("server").at("default_preserve_thinking") == true,
+    failures += check(server.at("server").at("default_preserve_thinking") == false,
                       "server preserve-thinking default missing");
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
               "registered mode-specific sampling defaults missing");
-    failures += check(
-        server.at("sampling_defaults").at("server_overrides").at("temperature").get<float>() ==
-                0.6F &&
-            server.at("sampling_defaults").at("server_overrides").at("top_p").is_null(),
-        "server sampling overrides lost omission state");
+    const Json& server_overrides = server.at("sampling_defaults").at("server_overrides");
+    failures += check(server_overrides.at("thinking").at("temperature").get<float>() == 0.6F &&
+                          server_overrides.at("thinking").at("top_p").is_null() &&
+                          server_overrides.at("non_thinking").at("temperature").is_null(),
+                      "per-mode server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
     failures += check(server.at("memory").at("request_transient").at("capacity_bytes") == 500 &&
@@ -469,9 +469,9 @@ int main() {
         const Json& decision_request = decision_done.at("request");
         failures +=
             check(decision_start.at("event") == "decision_start" &&
-                      decision_start.at("schema_version") == 24 &&
-                      decision_done.at("schema_version") == 24 &&
-                      decision_error.at("schema_version") == 24 &&
+                      decision_start.at("schema_version") == 25 &&
+                      decision_done.at("schema_version") == 25 &&
+                      decision_error.at("schema_version") == 25 &&
                       decision_start.at("request") == decision_request &&
                       decision_error.at("request") == decision_request &&
                       decision_request.at("request_id") == logged.id &&

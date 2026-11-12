@@ -191,7 +191,8 @@ The endpoint supports:
 - `system`, `developer`, `user`, `assistant`, and `tool` history;
 - string content and ordered text, `image_url`, and `video_url` parts;
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
-- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`;
+- `temperature`, `top_p`, `top_k`, `min_p`, presence/frequency penalties, and a nonnegative `seed`
+  (`top_k` and `min_p` are NInfer extensions);
 - one stop string or an array of stop strings;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
@@ -227,7 +228,8 @@ select the corresponding template effort when available. The other OpenAI protoc
 `reasoning_effort` returns `conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
-prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
+prompts. It defaults to the server setting, which is on, as in the model's chat template, unless
+`--no-preserve-thinking` is used. If
 both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
 `chat_template_kwargs` are rejected.
 
@@ -618,7 +620,8 @@ The endpoint supports system text, user/assistant history, text and image blocks
 tool-use history, tool results, client-defined tools, non-streaming responses, and Anthropic SSE
 events. `thinking.type: "disabled"` disables thinking; other supported values enable it.
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
-uses the server default.
+uses the server default. Sampling accepts `temperature`, `top_p`, and `top_k`, plus `min_p` as a
+NInfer extension.
 
 A stream opens content blocks in output order with contiguous indices: thinking, then text, then
 one `tool_use` block per call. A `tool_use` block starts as soon as its call is announced, with the
@@ -862,7 +865,7 @@ HTTP request-size limits still apply. Responses carry `x-request-id`, not TypeSa
 
 Decision events and metrics are shared with TypeSafe, not a second accounting path:
 `decision_start`, `decision_done` and `decision_error` identify the protocol as
-`openai_decisions` or `systemone` in schema 24. The `ninfer:decision_*` metrics aggregate both
+`openai_decisions` or `systemone` (schema 24 and later). The `ninfer:decision_*` metrics aggregate both
 surfaces, and both use the same retained-state and continuation-cache reuse rules described below.
 
 ## System One decisions
@@ -1157,19 +1160,21 @@ are errors. Delete and cancel routes accept no query parameters.
 | `--continuation-cache-filesystem-reserve-mib N` | minimum free space retained below the L3 root | `0` |
 | `--prefix-checkpoint-history N` | IDs retained per mutable session alias, including current head | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
-| `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--no-preserve-thinking` | drop closed-turn assistant reasoning from later prompts by default | reasoning preserved |
 | `--no-repetition-guard` | let a generation that has locked into a repeating cycle run to its output limit | guard on |
 | `--repetition-guard-window N` | how far back a repeat may reach, which also bounds the detectable period | `512` |
 | `--repetition-guard-ngram N` | token n-gram whose recurrence proposes a period | `24` |
 | `--repetition-guard-cycles N` | whole periods confirmed before the cycle counts as locked | `3` |
 | `--repetition-guard-min-tokens N` | confirmed tokens required regardless of period | `64` |
 | `--cors` | permissive browser CORS headers | off |
-| `--temperature F` | process-level temperature override | unset |
-| `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override | unset |
-| `--min-p F` | process-level min-p override | unset |
-| `--presence-penalty F` | process-level presence-penalty override | unset |
-| `--frequency-penalty F` | process-level frequency-penalty override | unset |
+| `--temperature F` | process-level temperature override for both modes | unset |
+| `--top-p F` | process-level top-p override for both modes | unset |
+| `--top-k N` | process-level top-k override for both modes | unset |
+| `--min-p F` | process-level min-p override for both modes | unset |
+| `--presence-penalty F` | process-level presence-penalty override for both modes | unset |
+| `--frequency-penalty F` | process-level frequency-penalty override for both modes | unset |
+| `--thinking-<field> V` | the same override for thinking requests only, for each field above | unset |
+| `--non-thinking-<field> V` | the same override for non-thinking requests only, for each field above | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
@@ -1178,7 +1183,11 @@ Qwen3.8-27B uses `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
 non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
-request fields override process flags, and `--greedy` finally forces temperature `0`.
+request fields override process flags, and `--greedy` finally forces temperature `0`. An unprefixed
+flag applies to both modes, so `--temperature 0.6` alone also replaces the non-thinking preset's
+`0.7`; use `--thinking-temperature 0.6` to change one mode. A mode flag takes precedence over the
+unprefixed flag in any argument order. The `server_start` record lists the process overrides for
+each mode under `sampling_defaults.server_overrides.thinking` and `.non_thinking`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

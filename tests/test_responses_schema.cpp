@@ -110,10 +110,11 @@ int test_basic_request() {
     failures +=
         check(request.reasoning_summary == "detailed" && request.prompt_cache_key == "session_123",
                "reasoning summary and prompt cache key retained");
-    failures += check(request.generation.prompt_cache_routing_hint == "session_123" &&
-                          to_request_options(request.generation, ServeOptions{})
-                                  .execution.routing_hint == "session_123",
-                      "Responses prompt cache key did not reach execution routing metadata");
+    failures +=
+        check(request.generation.prompt_cache_routing_hint == "session_123" &&
+                  to_request_options(request.generation, ServeOptions{}, ResolvedPromptSemantics{})
+                          .execution.routing_hint == "session_123",
+              "Responses prompt cache key did not reach execution routing metadata");
     failures += check(request.store && !request.stream, "Responses defaults applied");
     ResponsesRequest composed = request;
     ChatTurn previous;

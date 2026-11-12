@@ -425,7 +425,7 @@ def check_images(base_url: str, adapter: str, vision: bool, log_path: Path) -> d
         event = next(item for item in events if item["event"] == "decision_done"
                      and item["request"]["x_request_id"] == request_id)
         request, timings = event["request"], event["timings_seconds"]
-        require(event["schema_version"] == 24 and request["images"] > 0
+        require(event["schema_version"] == 25 and request["images"] > 0
                 and request["vision_tokens"] > 0
                 and request["input_tokens"] == request["state_tokens"] + request["branch_tokens"] == input_tokens
                 and event["result"]["output_tokens"] == 0

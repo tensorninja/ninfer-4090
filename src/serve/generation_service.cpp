@@ -385,15 +385,15 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options = to_request_options(request, options_);
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    ninfer::RequestOptions request_options = to_request_options(request, options_, semantics);
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
     if (prepared.tool_capable) {
         prepared.tool_parameters = ToolParameterKinds::from_tools(request.tools);
     }
-    const ResolvedPromptSemantics semantics =
-        resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;

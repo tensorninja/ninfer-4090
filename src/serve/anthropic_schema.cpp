@@ -459,6 +459,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.temperature     = get_number(body, "temperature");
     s.top_p           = get_number(body, "top_p");
     s.top_k           = get_int(body, "top_k");
+    s.min_p           = get_number(body, "min_p"); // NInfer extension
     // The Anthropic API has no presence/frequency penalty or seed; those keep the
     // server defaults resolved in translate.cpp.
 }

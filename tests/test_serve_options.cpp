@@ -34,8 +34,6 @@ int main() {
     failures +=
         check(defaults.prefix_checkpoint_policy == ninfer::PrefixCheckpointPolicy::RollingTool,
               "rolling tool checkpoints are not enabled by default");
-    failures +=
-        check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -87,11 +85,15 @@ int main() {
                            defaults.continuation_cache.filesystem_reserve_mib == 0 &&
                            defaults.continuation_cache.prefix_checkpoint_history == 4,
                       "continuation cache defaults mismatch");
-    failures += check(
-        !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
-            !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
-            !defaults.sampling_overrides.frequency_penalty,
-        "server defaults unexpectedly override registered model sampling");
+    for (const ninfer::SamplingMode mode :
+         {ninfer::SamplingMode::Thinking, ninfer::SamplingMode::NonThinking}) {
+        const ninfer::SamplingOverrides& unset = defaults.sampling_overrides.for_mode(mode);
+        failures += check(!unset.temperature && !unset.top_p && !unset.top_k && !unset.min_p &&
+                              !unset.presence_penalty && !unset.frequency_penalty && !unset.seed,
+                          "server defaults unexpectedly override registered model sampling");
+    }
+    failures += check(defaults.preserve_thinking,
+                      "closed-turn reasoning is not preserved by default as in the model template");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
@@ -154,12 +156,12 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency",
                "4", "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context",
                "4096", "--kv-capacity", "8192", "--log-stats-interval-ms", "0",
-               "--preserve-thinking", "--prefix-checkpoint-policy", "stable-turn"});
+               "--no-preserve-thinking", "--prefix-checkpoint-policy", "stable-turn"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
-    failures +=
-        check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
+    failures += check(!configured.preserve_thinking,
+                      "--no-preserve-thinking did not reach serving options");
     failures +=
         check(configured.repetition_guard.enabled, "the repetition guard was not on by default");
 
@@ -257,37 +259,88 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
                "40", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
                "--seed", "0"});
-    failures += check(sampling.sampling_overrides.temperature == 0.0F &&
-                          sampling.sampling_overrides.top_p == 0.9F &&
-                          sampling.sampling_overrides.top_k == 40 &&
-                          sampling.sampling_overrides.min_p == 0.1F &&
-                          sampling.sampling_overrides.presence_penalty == 1.25F &&
-                          sampling.sampling_overrides.frequency_penalty == -0.5F &&
-                          sampling.sampling_overrides.seed == 0,
-                      "server sampling flags did not preserve explicit values and zeros");
+    for (const ninfer::SamplingMode mode :
+         {ninfer::SamplingMode::Thinking, ninfer::SamplingMode::NonThinking}) {
+        const ninfer::SamplingOverrides& both = sampling.sampling_overrides.for_mode(mode);
+        failures += check(both.temperature == 0.0F && both.top_p == 0.9F && both.top_k == 40 &&
+                              both.min_p == 0.1F && both.presence_penalty == 1.25F &&
+                              both.frequency_penalty == -0.5F && both.seed == 0,
+                          "server sampling flags did not preserve explicit values and zeros");
+    }
+
+    // A mode-specific flag wins over the unprefixed flag in either argument order and leaves
+    // the other mode alone.
+    const ServeOptions per_mode = parse(
+        {"ninfer-serve", "model.ninfer", "--thinking-temperature", "0.6", "--temperature", "0.9",
+         "--non-thinking-presence-penalty", "0.5", "--non-thinking-top-p", "0.7", "--seed", "7"});
+    const ninfer::SamplingOverrides& thinking_flags     = per_mode.sampling_overrides.thinking;
+    const ninfer::SamplingOverrides& non_thinking_flags = per_mode.sampling_overrides.non_thinking;
+    failures += check(thinking_flags.temperature == 0.6F && !thinking_flags.top_p &&
+                          !thinking_flags.presence_penalty && thinking_flags.seed == 7,
+                      "thinking sampling flags were not layered over the shared flags");
+    failures +=
+        check(non_thinking_flags.temperature == 0.9F && non_thinking_flags.top_p == 0.7F &&
+                  non_thinking_flags.presence_penalty == 0.5F && non_thinking_flags.seed == 7,
+              "non-thinking sampling flags were not layered over the shared flags");
+    bool invalid_mode_flag_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--non-thinking-top-p", "1.5"});
+    } catch (const std::invalid_argument&) { invalid_mode_flag_rejected = true; }
+    failures += check(invalid_mode_flag_rejected, "out-of-range mode sampling flag was accepted");
+    bool unknown_mode_flag_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--thinking-seed", "1"});
+    } catch (const std::invalid_argument&) { unknown_mode_flag_rejected = true; }
+    failures += check(unknown_mode_flag_rejected, "a mode-scoped seed flag was accepted");
 
     GenerationRequest request;
     request.max_tokens = 1;
     ninfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
-    failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
-                      "default server policy did not reach Engine options");
-    failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
-                      "disabled server policy did not reach Engine options");
-    const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
+    const ResolvedPromptSemantics thinking_semantics{.enable_thinking = true};
+    const ResolvedPromptSemantics non_thinking_semantics{.enable_thinking = false};
+    failures += check(
+        to_request_options(request, defaults, thinking_semantics).execution.allow_prefix_reuse,
+        "default server policy did not reach Engine options");
+    failures += check(
+        !to_request_options(request, configured, thinking_semantics).execution.allow_prefix_reuse,
+        "disabled server policy did not reach Engine options");
+    const ninfer::RequestOptions inherited_sampling =
+        to_request_options(request, sampling, thinking_semantics);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
                       "server sampling overrides did not reach Engine options");
-    request.sampling.temperature = 1.1;
-    failures += check(to_request_options(request, sampling).execution.sampling.temperature == 1.1F,
-                      "request sampling override did not win over the server override");
+    const ninfer::SamplingOverrides thinking_resolved =
+        to_request_options(request, per_mode, thinking_semantics).execution.sampling;
+    const ninfer::SamplingOverrides non_thinking_resolved =
+        to_request_options(request, per_mode, non_thinking_semantics).execution.sampling;
     failures +=
-        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
+        check(thinking_resolved.temperature == 0.6F && !thinking_resolved.top_p &&
+                  non_thinking_resolved.temperature == 0.9F && non_thinking_resolved.top_p == 0.7F,
+              "the resolved prompt mode did not select its server sampling overrides");
+    request.sampling.temperature = 1.1;
+    request.sampling.min_p       = 0.05;
+    const ninfer::SamplingOverrides request_resolved =
+        to_request_options(request, sampling, thinking_semantics).execution.sampling;
+    failures += check(request_resolved.temperature == 1.1F && request_resolved.min_p == 0.05F,
+                      "request sampling override did not win over the server override");
+    request.sampling.min_p      = 1.5;
+    bool invalid_min_p_rejected = false;
+    try {
+        (void)to_request_options(request, defaults, thinking_semantics);
+    } catch (const ApiException&) { invalid_min_p_rejected = true; }
+    failures += check(invalid_min_p_rejected, "out-of-range request min_p was accepted");
+    request.sampling.min_p = std::nullopt;
+    failures +=
+        check(resolve_prompt_semantics(request, defaults, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");
-    request.preserve_thinking = false;
     failures +=
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
+              "--no-preserve-thinking was not resolved");
+    request.preserve_thinking = true;
+    failures +=
+        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
     failures +=
@@ -297,8 +350,8 @@ int main() {
                           std::string::npos,
                       "serve help omits --prefix-checkpoint-policy");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
-              "serve help omits --preserve-thinking");
+        check(serve_usage_text("ninfer-serve").find("--no-preserve-thinking") != std::string::npos,
+              "serve help omits --no-preserve-thinking");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

@@ -149,6 +149,7 @@ struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
     std::optional<int> top_k;
+    std::optional<double> min_p;
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;

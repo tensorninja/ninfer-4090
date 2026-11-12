@@ -29,10 +29,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
 
-// Build public request options (output budget, thinking, stop policy, sampler). The
-// sampler is resolved from the request's SamplingParams over the server defaults;
-// --greedy on the server forces exact argmax regardless of the request.
-ninfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server);
+// Build public request options (output budget, stop policy, sampler). The sampler is
+// resolved from the request's SamplingParams over the server overrides for the resolved
+// prompt mode; --greedy on the server forces exact argmax regardless of the request.
+ninfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server,
+                                          const ResolvedPromptSemantics& semantics);
 
 // Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
 // "stop" (a disconnected client is not an error state on the wire).

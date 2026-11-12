@@ -771,7 +771,9 @@ std::string format_server_start_json(
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
-             {"server_overrides", overrides_json(options.sampling_overrides)},
+             {"server_overrides",
+              Json{{"thinking", overrides_json(options.sampling_overrides.thinking)},
+                   {"non_thinking", overrides_json(options.sampling_overrides.non_thinking)}}},
              {"omitted_seed", "random"},
              {"greedy", options.greedy}};
     record["memory"] =

@@ -32,11 +32,13 @@ std::uint64_t random_seed() {
 }
 
 ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
-                                                     const ServeOptions& server) {
-    ninfer::SamplingOverrides sampling = server.sampling_overrides;
+                                                     const ServeOptions& server,
+                                                     ninfer::SamplingMode mode) {
+    ninfer::SamplingOverrides sampling = server.sampling_overrides.for_mode(mode);
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
+    if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
     if (request.presence_penalty) {
         sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
     }
@@ -45,9 +47,7 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     }
     if (request.seed) {
         sampling.seed = *request.seed;
-    } else if (server.sampling_overrides.seed) {
-        sampling.seed = *server.sampling_overrides.seed;
-    } else {
+    } else if (!sampling.seed) {
         sampling.seed = random_seed();
     }
 
@@ -232,13 +232,17 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 }
 
 ninfer::RequestOptions to_request_options(const GenerationRequest& request,
-                                          const ServeOptions& server) {
+                                          const ServeOptions& server,
+                                          const ResolvedPromptSemantics& semantics) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
     options.execution.routing_hint            = request.prompt_cache_routing_hint;
     if (!request.adapter.empty()) { options.execution.adapter = request.adapter; }
-    options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
+    options.execution.sampling =
+        resolve_sampling_overrides(request.sampling, server,
+                                   semantics.enable_thinking ? ninfer::SamplingMode::Thinking
+                                                             : ninfer::SamplingMode::NonThinking);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.stop.strings.reserve(request.stop_strings.size());

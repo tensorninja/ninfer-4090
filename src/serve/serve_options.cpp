@@ -2,11 +2,14 @@
 #include "product/prefix_checkpoint_options.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,6 +104,66 @@ std::uint32_t parse_cache_u32(const char* text, const char* label) {
     return static_cast<std::uint32_t>(value);
 }
 
+enum class SamplingFlagScope : std::uint8_t { BothModes, Thinking, NonThinking };
+
+struct SamplingFlag {
+    SamplingFlagScope scope = SamplingFlagScope::BothModes;
+    std::string field;
+};
+
+// Recognizes `--<field>`, `--thinking-<field>`, and `--non-thinking-<field>` for each
+// mode-dependent sampler field. The seed is not mode-dependent and is parsed separately.
+std::optional<SamplingFlag> parse_sampling_flag(std::string_view arg) {
+    constexpr std::string_view kThinking    = "--thinking-";
+    constexpr std::string_view kNonThinking = "--non-thinking-";
+    constexpr std::array<std::string_view, 6> kFields{
+        "temperature", "top-p", "top-k", "min-p", "presence-penalty", "frequency-penalty"};
+    SamplingFlag flag;
+    if (arg.starts_with(kThinking)) {
+        flag = {SamplingFlagScope::Thinking, std::string(arg.substr(kThinking.size()))};
+    } else if (arg.starts_with(kNonThinking)) {
+        flag = {SamplingFlagScope::NonThinking, std::string(arg.substr(kNonThinking.size()))};
+    } else if (arg.starts_with("--")) {
+        flag = {SamplingFlagScope::BothModes, std::string(arg.substr(2))};
+    } else {
+        return std::nullopt;
+    }
+    if (std::find(kFields.begin(), kFields.end(), flag.field) == kFields.end()) {
+        return std::nullopt;
+    }
+    return flag;
+}
+
+void set_sampling_field(SamplingOverrides& layer, const std::string& field, const char* label,
+                        const char* text) {
+    if (field == "temperature") {
+        layer.temperature = parse_float_in(text, label, 0.0F, 2.0F);
+    } else if (field == "top-p") {
+        layer.top_p = parse_float_in(text, label, 0.0F, 1.0F);
+    } else if (field == "top-k") {
+        layer.top_k = parse_nonnegative_int(text, label);
+    } else if (field == "min-p") {
+        layer.min_p = parse_float_in(text, label, 0.0F, 1.0F);
+    } else if (field == "presence-penalty") {
+        layer.presence_penalty = parse_float_in(text, label, -2.0F, 2.0F);
+    } else if (field == "frequency-penalty") {
+        layer.frequency_penalty = parse_float_in(text, label, -2.0F, 2.0F);
+    } else {
+        throw std::logic_error("unknown sampling field: " + field);
+    }
+}
+
+// A mode-specific flag wins over the unprefixed flag regardless of argument order.
+SamplingOverrides layer_mode(SamplingOverrides both, const SamplingOverrides& mode) {
+    if (mode.temperature) { both.temperature = mode.temperature; }
+    if (mode.top_p) { both.top_p = mode.top_p; }
+    if (mode.top_k) { both.top_k = mode.top_k; }
+    if (mode.min_p) { both.min_p = mode.min_p; }
+    if (mode.presence_penalty) { both.presence_penalty = mode.presence_penalty; }
+    if (mode.frequency_penalty) { both.frequency_penalty = mode.frequency_penalty; }
+    return both;
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -130,12 +193,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--continuation-cache-persist-interval-seconds N] "
            "[--continuation-cache-persist-min-tokens N] "
            "[--continuation-cache-filesystem-reserve-mib N] [--prefix-checkpoint-history N] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--no-preserve-thinking] [--cors] "
            "[--no-repetition-guard] [--repetition-guard-window N] "
            "[--repetition-guard-ngram N] [--repetition-guard-cycles N] "
            "[--repetition-guard-min-tokens N] "
-           "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--[thinking-|non-thinking-]temperature F] [--[thinking-|non-thinking-]top-p F] "
+           "[--[thinking-|non-thinking-]top-k N] [--[thinking-|non-thinking-]min-p F] "
+           "[--[thinking-|non-thinking-]presence-penalty F] "
+           "[--[thinking-|non-thinking-]frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -184,9 +249,12 @@ std::string serve_usage_text(const char* argv0) {
            "       Persist minimum 0 makes every publication due; filesystem reserve defaults to 0 "
            "MiB; prefix checkpoint history defaults "
            "to 4\n"
-           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       closed-turn assistant reasoning stays in later prompts, as in the model's "
+           "template; --no-preserve-thinking drops it\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
-           "server flags and request fields override individual values.\n"
+           "server flags and request fields override individual values. An unprefixed "
+           "sampler flag sets both modes; a --thinking- or --non-thinking- flag sets one mode "
+           "and takes precedence.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -206,6 +274,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool continuation_tiers_explicit = false;
+    SamplingOverrides both_modes_sampling;
+    SamplingOverrides thinking_sampling;
+    SamplingOverrides non_thinking_sampling;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -420,36 +491,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
-        } else if (arg == "--preserve-thinking") {
-            options.preserve_thinking = true;
+        } else if (arg == "--no-preserve-thinking") {
+            options.preserve_thinking = false;
         } else if (arg == "--cors") {
             options.enable_cors = true;
-        } else if (arg == "--temperature") {
-            options.sampling_overrides.temperature =
-                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
-        } else if (arg == "--top-p") {
-            options.sampling_overrides.top_p =
-                parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
-        } else if (arg == "--top-k") {
-            options.sampling_overrides.top_k =
-                parse_nonnegative_int(require_value("--top-k"), "top-k");
-        } else if (arg == "--min-p") {
-            options.sampling_overrides.min_p =
-                parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
-        } else if (arg == "--presence-penalty") {
-            options.sampling_overrides.presence_penalty = parse_float_in(
-                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
-        } else if (arg == "--frequency-penalty") {
-            options.sampling_overrides.frequency_penalty = parse_float_in(
-                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+        } else if (const std::optional<SamplingFlag> flag = parse_sampling_flag(arg)) {
+            SamplingOverrides& layer =
+                flag->scope == SamplingFlagScope::Thinking      ? thinking_sampling
+                : flag->scope == SamplingFlagScope::NonThinking ? non_thinking_sampling
+                                                                : both_modes_sampling;
+            set_sampling_field(layer, flag->field, arg.c_str() + 2, require_value(arg.c_str()));
         } else if (arg == "--seed") {
-            options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
+            both_modes_sampling.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    options.sampling_overrides.thinking = layer_mode(both_modes_sampling, thinking_sampling);
+    options.sampling_overrides.non_thinking =
+        layer_mode(both_modes_sampling, non_thinking_sampling);
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }

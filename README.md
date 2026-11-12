@@ -533,7 +533,7 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --continuation-cache-l2-mib 16384 \
   --continuation-cache-l3-mib 49152 \
   --continuation-cache-filesystem-reserve-mib 4096 \
-  --preserve-thinking --web-dir /opt/ninfer/web
+  --web-dir /opt/ninfer/web
 ```
 
 To serve adapters, mount the adapter directory and pass the full command with `--lora-dir`. A
@@ -552,7 +552,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --continuation-cache l1-l2-l3 --continuation-cache-dir /var/cache/ninfer \
   --continuation-cache-filesystem-reserve-mib 4096 \
   --lora-dir /opt/ninfer/lora --lora-slots 2 \
-  --preserve-thinking --web-dir /opt/ninfer/web
+  --web-dir /opt/ninfer/web
 ```
 
 Two flags are worth knowing for agent work:
@@ -617,7 +617,7 @@ same profile as the Docker image:
 ./build-sm89/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --max-context 262144 --kv-capacity 262144 --max-concurrency 4 \
   --kv-dtype rk4v4 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --prefix-checkpoint-policy rolling-tool --preserve-thinking
+  --prefix-checkpoint-policy rolling-tool
 ```
 
 `make test` builds and runs the test suite. Override `BUILD_DIR`, `JOBS`, `BUILD_TESTING`,

@@ -19,6 +19,17 @@ inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
+// Process-level explicit sampling overrides for each resolved prompt mode, layered between the
+// registered model/mode preset and request fields. Both modes carry the same seed.
+struct ServerSamplingOverrides {
+    SamplingOverrides thinking;
+    SamplingOverrides non_thinking;
+
+    [[nodiscard]] const SamplingOverrides& for_mode(SamplingMode mode) const noexcept {
+        return mode == SamplingMode::Thinking ? thinking : non_thinking;
+    }
+};
+
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
@@ -61,12 +72,11 @@ struct ServeOptions {
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
-    bool preserve_thinking = false;
+    bool preserve_thinking = true; // --no-preserve-thinking drops closed-turn reasoning
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
-    // Process-level explicit overrides layered between registered model/mode defaults and request
-    // fields. An omitted seed is replaced per request with a fresh random seed.
-    SamplingOverrides sampling_overrides;
+    // An omitted seed is replaced per request with a fresh random seed.
+    ServerSamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted

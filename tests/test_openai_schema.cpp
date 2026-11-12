@@ -125,10 +125,11 @@ int test_prompt_cache_key_compatibility() {
     Json keyed = base;
     keyed["prompt_cache_key"] = "session_123";
     const GenerationRequest request = parse_chat_completion_request(keyed, default_limits());
-    int failures = check(request.prompt_cache_routing_hint == "session_123" &&
-                             to_request_options(request, default_server()).execution.routing_hint ==
-                                 "session_123",
-                         "Chat prompt_cache_key did not reach execution routing metadata");
+    int failures =
+        check(request.prompt_cache_routing_hint == "session_123" &&
+                  to_request_options(request, default_server(), ResolvedPromptSemantics{})
+                          .execution.routing_hint == "session_123",
+              "Chat prompt_cache_key did not reach execution routing metadata");
     Json invalid = base;
     invalid["prompt_cache_key"] = 42;
     failures += check(throws_api(
@@ -420,7 +421,8 @@ int test_parse_function_tools_and_choices() {
                       "tool definition json carried");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
     failures += check(req.uses_tools(), "tools enabled by default");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(to_request_options(req, default_server(), ResolvedPromptSemantics{})
+                          .output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
 
     Json none           = base;
@@ -428,7 +430,8 @@ int test_parse_function_tools_and_choices() {
     req                 = parse_chat_completion_request(none, default_limits());
     failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
     failures += check(!req.uses_tools(), "tool_choice none disables tools");
-    failures += check(!to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(!to_request_options(req, default_server(), ResolvedPromptSemantics{})
+                           .output.preserve_special_tokens,
                       "disabled tools do not preserve special tokens");
 
     Json automatic           = base;
@@ -497,7 +500,8 @@ int test_parse_tool_history_messages() {
     failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
     failures +=
         check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(to_request_options(req, default_server(), ResolvedPromptSemantics{})
+                          .output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
     Json bad_args                                                     = body;
@@ -547,7 +551,8 @@ int test_parse_stop_and_max_tokens() {
     failures += check(req.stop_strings.size() == 2, "two stop strings");
     failures += check(req.stop_strings[0] == "</s>", "stop string 0");
     failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options =
+        to_request_options(req, default_server(), ResolvedPromptSemantics{});
     failures += check(options.execution.requested_output_tokens == 42,
                       "max_completion_tokens reaches Engine options");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
@@ -569,6 +574,7 @@ int test_parse_sampling_carried() {
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
                                    {"temperature", 0.7},
                                    {"top_p", 0.9},
+                                   {"min_p", 0.05},
                                    {"seed", 123},
                                    {"logit_bias", Json::object()}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
@@ -577,10 +583,12 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.9, "top_p carried");
     failures += check(req.sampling.seed.has_value() && *req.sampling.seed == 123u, "seed carried");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options =
+        to_request_options(req, default_server(), ResolvedPromptSemantics{});
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");
     failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");
+    failures += check(options.execution.sampling.min_p == 0.05F, "min_p reaches Engine overrides");
     failures += check(options.execution.sampling.seed == 123u, "seed reaches Engine overrides");
     failures +=
         check(!options.execution.sampling.top_k && !options.execution.sampling.presence_penalty,

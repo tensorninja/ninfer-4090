@@ -63,6 +63,7 @@ void reject_unknown_top_level(const Json& body) {
                                  "max_tokens",
                                  "messages",
                                  "metadata",
+                                 "min_p",
                                  "modalities",
                                  "model",
                                  "n",
@@ -474,6 +475,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.temperature       = get_number(body, "temperature");
     s.top_p             = get_number(body, "top_p");
     s.top_k             = get_int(body, "top_k");
+    s.min_p             = get_number(body, "min_p");
     s.presence_penalty  = get_number(body, "presence_penalty");
     s.frequency_penalty = get_number(body, "frequency_penalty");
     s.seed              = get_u64(body, "seed");
