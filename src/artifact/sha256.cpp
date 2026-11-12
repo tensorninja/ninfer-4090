@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
 #    define NINFER_SHA256_X86 1
 #    include <immintrin.h>
 #endif

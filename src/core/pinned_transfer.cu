@@ -104,7 +104,7 @@ void PinnedTransferBuffer::copy_device_to_host(
         CUDA_CHECK(cudaEventSynchronize(impl_->events[index]));
         for (const Piece& piece : staged[index]) {
             std::memcpy(piece.destination->data() + piece.destination_offset,
-                        impl_->slots[index].data() + piece.slot_offset, piece.bytes);
+                        static_cast<std::uint8_t*>(impl_->slots[index].data()) + piece.slot_offset, piece.bytes);
         }
         staged[index].clear();
         pending[index] = false;
@@ -133,7 +133,7 @@ void PinnedTransferBuffer::copy_device_to_host(
                 const std::size_t chunk =
                     std::min(impl_->slot_bytes - used, transfer.bytes - copied);
                 CUDA_CHECK(cudaMemcpyAsync(
-                    impl_->slots[slot].data() + used,
+                    static_cast<std::uint8_t*>(impl_->slots[slot].data()) + used,
                     static_cast<const std::uint8_t*>(transfer.source) + copied, chunk,
                     cudaMemcpyDeviceToHost, stream));
                 staged[slot].push_back(
@@ -202,11 +202,11 @@ void PinnedTransferBuffer::copy_host_to_device(
                 if (used == impl_->slot_bytes) { rotate(); }
                 const std::size_t chunk =
                     std::min(impl_->slot_bytes - used, transfer.bytes - copied);
-                std::memcpy(impl_->slots[slot].data() + used,
+                std::memcpy(static_cast<std::uint8_t*>(impl_->slots[slot].data()) + used,
                             transfer.source->data() + transfer.source_offset + copied, chunk);
                 CUDA_CHECK(cudaMemcpyAsync(
                     static_cast<std::uint8_t*>(transfer.destination) + copied,
-                    impl_->slots[slot].data() + used, chunk, cudaMemcpyHostToDevice, stream));
+                    static_cast<std::uint8_t*>(impl_->slots[slot].data()) + used, chunk, cudaMemcpyHostToDevice, stream));
                 used += chunk;
                 copied += chunk;
                 slot_has_work = true;
