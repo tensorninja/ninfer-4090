@@ -60,7 +60,7 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
         "shared_semantic_vocabulary": True,
     }
     assert report["quantization"] == {
-        "encoder_profile": "MAXABS_F16_RECIP_RNE_V1",
+        "encoder_profile": "WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2",
         "component_tensor_bytes": {
             **convert.EXPECTED_COMPONENT_BYTES,
             "total": 22_770_245_536,

@@ -4,7 +4,10 @@ Canonical invocation::
 
     python3 -m tools.convert.qwen3_8_27b.convert \
       --model /path/to/Qwen3.8-27B \
+      --importance /path/to/importance.safetensors \
       --out out/qwen3_8_27b.ninfer
+
+The importance file comes from ``tools.convert.qwen3_8_27b.calibrate``.
 """
 
 from __future__ import annotations
@@ -24,12 +27,12 @@ from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_8.common import conversion as family_conversion
 from tools.convert.qwen3_8_27b import base_convert
-from tools.convert.qwen3_8_27b import draft_head, recipe
+from tools.convert.qwen3_8_27b import calibrate, draft_head, recipe
 
 from . import inventory
 
 
-RECIPE_ID = "qwen3_8_27b-v1"
+RECIPE_ID = "qwen3_8_27b-v2"
 
 OFFICIAL_RESOURCE_SHA256 = {
     "frontend/tokenizer.json": (
@@ -149,8 +152,11 @@ def encode_tensor_payload(
     tensor: torch.Tensor,
     spec: inventory.TensorSpec,
     device: str | torch.device,
+    importance: calibrate.Importance,
 ) -> bytes:
-    return family_conversion.encode_tensor_payload(tensor, spec, device)
+    return family_conversion.encode_tensor_payload(
+        tensor, spec, device, importance.vectors.get(spec.name)
+    )
 
 
 def build_conversion_report(
@@ -165,10 +171,12 @@ def build_conversion_report(
     final_bytes: int,
     device: torch.device,
     ranking_path: str | Path,
+    importance: calibrate.Importance,
+    importance_path: str | Path,
     revision: str | None = None,
     environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return family_conversion.build_conversion_report(
+    report = family_conversion.build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
@@ -186,11 +194,19 @@ def build_conversion_report(
         revision=revision,
         environment_summary=environment,
     )
+    report["calibration"] = {
+        "path": str(Path(importance_path).resolve()),
+        "sha256": importance.sha256,
+        "weighted_objects": len(importance.vectors),
+        "manifest": importance.manifest,
+    }
+    return report
 
 
 def convert(
     model_dir: str | Path,
     out_path: str | Path,
+    importance_path: str | Path,
     *,
     device: str | torch.device = "cuda",
 ) -> Path:
@@ -200,6 +216,7 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     preflight = preflight_conversion(model)
+    importance = calibrate.load_importance(importance_path)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -221,7 +238,9 @@ def convert(
                     payload = resources[spec.name]
                 else:
                     tensor = materialize_tensor(spec, reader, preflight.draft)
-                    payload = encode_tensor_payload(tensor, spec, resolved_device)
+                    payload = encode_tensor_payload(
+                        tensor, spec, resolved_device, importance
+                    )
                     del tensor
                 writer.write(spec.name, payload)
                 del payload
@@ -236,6 +255,7 @@ def convert(
     arguments = {
         "model": str(model_dir),
         "out": str(out_path),
+        "importance": str(importance_path),
         "device": requested_device,
     }
     report = build_conversion_report(
@@ -249,6 +269,8 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
         ranking_path=ranking,
+        importance=importance,
+        importance_path=importance_path,
     )
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
@@ -264,10 +286,11 @@ def convert(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--importance", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, args.importance, device=args.device)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
-from tools.convert.qwen3_8_27b import convert, inventory, recipe
+from tools.convert.qwen3_8_27b import calibrate, convert, inventory, recipe
 
 
 OFFICIAL_MODEL = Path(
@@ -52,8 +52,17 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
     quant = torch.linspace(-2, 2, 130, dtype=torch.float32).reshape(2, 65).to(
         torch.bfloat16
     )
-    direct_payload = convert.encode_tensor_payload(direct, direct_target, "cpu")
-    quant_payload = convert.encode_tensor_payload(quant, quant_target, "cpu")
+    importance = calibrate.Importance(
+        vectors={quant_target.name: torch.linspace(0.5, 1.0, 65)},
+        manifest={"calibration_tokens": 4096},
+        sha256="0" * 64,
+    )
+    direct_payload = convert.encode_tensor_payload(direct, direct_target, "cpu", importance)
+    quant_payload = convert.encode_tensor_payload(quant, quant_target, "cpu", importance)
+    unweighted = convert.encode_tensor_payload(
+        quant, quant_target, "cpu", calibrate.Importance({}, {}, "0" * 64)
+    )
+    assert quant_payload != unweighted
     assert len(direct_payload) == encoded_size(
         direct_target.layout, direct_target.format, direct_target.shape
     )
@@ -123,6 +132,8 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
         final_bytes=path.stat().st_size,
         device=torch.device("cpu"),
         ranking_path=tmp_path / "ranking.i64",
+        importance=importance,
+        importance_path=tmp_path / "importance.safetensors",
         revision="test-revision",
         environment={"python": "test", "torch": "test", "device": "cpu"},
     )
@@ -143,3 +154,6 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
     assert report["converter"]["revision"] == "test-revision"
     assert report["objects"]["count"] == 3
     assert report["artifact"]["bytes"] == path.stat().st_size
+    assert report["calibration"]["sha256"] == "0" * 64
+    assert report["calibration"]["weighted_objects"] == 1
+    assert report["calibration"]["manifest"] == {"calibration_tokens": 4096}

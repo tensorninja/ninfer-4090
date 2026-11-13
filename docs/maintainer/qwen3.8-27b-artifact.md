@@ -12,7 +12,7 @@ filename   = qwen3_8_27b.ninfer
 model_id   = qwen3.8-27b
 weights_id = groupwise-int
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b-v1
+recipe_id  = qwen3_8_27b-v2
 ```
 
 The artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
@@ -49,18 +49,62 @@ logical row views, and aliases are defined by
 
 ## 3. Conversion
 
-The converter consumes the Qwen3.8-27B BF16 checkpoint and writes one complete artifact:
+Conversion has two steps. Calibration runs the BF16 model over a calibration corpus and records the
+mean squared input activation of every column of every quantized text matrix. The converter then
+quantizes each matrix with the importance-weighted scale search of
+[`tensor-formats.md`](tensor-formats.md) Section 7:
 
 ```bash
+python3 -m tools.convert.qwen3_8_27b.calibrate \
+  --model /path/to/Qwen3.8-27B \
+  --corpus /path/to/calibration-corpus.jsonl \
+  --out out/importance.safetensors
+
 python3 -m tools.convert.qwen3_8_27b.convert \
   --model /path/to/Qwen3.8-27B \
+  --importance out/importance.safetensors \
   --out out/qwen3_8_27b.ninfer \
   --device cuda
 ```
 
-Before opening the output, it validates the checkpoint configuration, source tensor shapes and
-dtypes, frontend resources, conversion recipes, and complete object plan. It writes the conversion
-report to `out/qwen3_8_27b.ninfer.conversion.json`.
+The corpus is JSONL, one conversation per line: `{"domain": ..., "messages": [...]}` in the
+official message schema, with `reasoning_content` on assistant turns. Calibration renders each
+conversation with the checkpoint's own chat template and packs it into 2048-token windows. Within
+each domain, conversations in hash order first fill 12 held-out windows. The following
+conversations supply up to 64 calibration windows. Calibration never reads the held-out windows.
+`tools.parity.qwen3_8_27b.weight_kld` scores them to compare artifacts with the BF16 checkpoint.
+The current corpus has reasoning, code, chat and agentic tool-use domains, about 0.5M calibration
+tokens. The model generated its own thinking-mode replies to the reasoning, code and chat prompts.
+
+The importance file holds one `float32[K]` vector per weighted object, keyed by object name, and the
+corpus manifest in its metadata:
+
+| Objects | Importance source |
+|---|---|
+| attention `query_key`, `gate_value` | normalized layer input |
+| attention `output` | gated attention output |
+| GDN `query_key`, `value_z` | normalized layer input |
+| GDN `output` | gated, normalized GDN output |
+| MLP `gate_up` | normalized post-attention input |
+| MLP `down` | SiLU-gated activation |
+| `text/output_head`, `text/draft_head` | final-norm hidden state |
+
+`text/token_embedding` is a lookup table. MTP and Vision matrices see no text calibration
+activations. Those tensors use equal column weights.
+
+Before opening the output, the converter validates the following:
+- the checkpoint configuration, source tensor shapes and dtypes;
+- the frontend resources;
+- the conversion recipes and complete object plan;
+- the importance file's object set and vector shapes.
+
+It writes the conversion report to `out/qwen3_8_27b.ninfer.conversion.json`. The report records
+the calibration file's SHA-256 and corpus manifest. The verifier needs the same importance file:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.verify out/qwen3_8_27b.ninfer \
+  --model /path/to/Qwen3.8-27B --importance out/importance.safetensors
+```
 
 The converter owns and pins the official Qwen3.8 six-resource frontend profile. Relative to the
 Qwen3.8-27B profile, `tokenizer.json`, `tokenizer_config.json`, and `chat_template.jinja` have

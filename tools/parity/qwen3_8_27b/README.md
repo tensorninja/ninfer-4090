@@ -17,6 +17,26 @@ python -m tools.parity.qwen3_8_27b.vision \
 The diagnostic reports numerical differences directly; it does not materialize an activation dump
 or require exact generated-token equality between independent implementations.
 
+## Weight quantization KLD
+
+`weight_kld.py` measures how far artifact weights move the model's next-token distribution away
+from the source BF16 checkpoint. It scores the held-out windows that the calibration step sets
+aside from the same corpus. Each stream runs one layer-major reference forward, and only the weights
+differ between streams: source BF16 for the reference, and each artifact's own decoded text objects
+for the others.
+
+```bash
+python -m tools.parity.qwen3_8_27b.weight_kld \
+  --model /path/to/Qwen3.8-27B \
+  --corpus /path/to/calibration-corpus.jsonl \
+  --artifact v1=old/qwen3_8_27b.ninfer --artifact v2=out/qwen3_8_27b.ninfer \
+  --out weight-kld.json
+```
+
+It reports mean and p99 KLD and top-1 agreement for each corpus domain, plus each layer's relative
+hidden-state error. The comparison isolates weight quantization. It does not exercise production
+kernels, the KV codec or activation quantization.
+
 ## LoRA transfer
 
 An adapter is fitted against a bitsandbytes NF4 frozen base but served on top of the

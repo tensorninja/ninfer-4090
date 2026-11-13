@@ -116,8 +116,9 @@ both resources into the 248077-entry token domain.
 | Vision merger matrices | `W8G32_F16S` |
 | all other Vision weights and biases | `BF16` |
 
-Every quantized tensor uses encoder profile `MAXABS_F16_RECIP_RNE_V1` and storage layout
-`row-split-k128-v1`. Every direct tensor uses `contiguous-le-v1`.
+Every quantized tensor uses encoder profile `WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2` with equal
+column weights, and storage layout `row-split-k128-v1`. This target has no calibration step. Every
+direct tensor uses `contiguous-le-v1`.
 
 ### 3.2 Fused row order
 
@@ -494,8 +495,8 @@ exact source filenames.
 For every quantized artifact object:
 
 1. complete the specified concatenate or reshape as a contiguous logical `[N,K]` BF16 matrix;
-2. apply `MAXABS_F16_RECIP_RNE_V1` independently to every output row and every G32 or G64 group
-   along `K`;
+2. apply `WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2` with equal column weights independently to every
+   output row and every G32 or G64 group along `K`;
 3. encode the resulting codes and binary16 scales with `row-split-k128-v1`.
 
 Groups do not cross output rows. Layout padding does not change the logical shape recorded in the

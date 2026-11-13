@@ -32,8 +32,8 @@ from tools.convert.qwen3_8.common import official_resources
 from . import draft_head, inventory, recipe
 
 
-RECIPE_ID = "qwen3_6_35b_a3b-v2"
-ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
+RECIPE_ID = "qwen3_6_35b_a3b-v3"
+ENCODER_PROFILE = "WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2"
 GGUF_EVIDENCE_PATH = Path(
     "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
     "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"

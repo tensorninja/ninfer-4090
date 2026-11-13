@@ -726,16 +726,22 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     float vals[64];
     for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
-            float maxabs = 0.0f;
+            float positive_max = 0.0f;
+            float negative_max = 0.0f;
             for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
                 const std::int32_t kk = g * spec.group_size + lane;
                 const float v = (kk < k) ? source[static_cast<std::size_t>(row) * k + kk] : 0.0f;
                 vals[lane]    = v;
-                maxabs        = std::max(maxabs, std::abs(v));
+                positive_max          = std::max(positive_max, v);
+                negative_max          = std::max(negative_max, -v);
             }
 
-            std::uint16_t scale_h = detail::f32_to_f16(maxabs / static_cast<float>(spec.qmax));
-            if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
+            // The converter's smallest non-clipping scale: a group whose most
+            // negative value dominates stores the minimum code (-8, -16, -32).
+            const float raw_scale = std::max(positive_max / static_cast<float>(spec.qmax),
+                                             negative_max / static_cast<float>(-spec.qmin));
+            std::uint16_t scale_h = detail::f32_to_f16(raw_scale);
+            if (scale_h == 0 && raw_scale > 0.0f) { scale_h = 0x0001u; }
             const float scale = detail::f16_to_f32(scale_h);
             const float inv   = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
             for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {

@@ -58,6 +58,10 @@ artifact validation, independent codec and operator correctness, actual loading 
 runtime stability, memory use, and end-to-end prefill and decode performance. Those local checks do
 not substitute for, or claim to be, an independent model-quality study.
 
+The encoder profile in Section 7 is the one local quality decision. A change of encoder keeps the
+formats, bytes and kernels, so it is judged directly by its effect on the model: next-token KL
+divergence and top-1 agreement against the source BF16 checkpoint on held-out conversations.
+
 ## 2. Terms and ownership
 
 The registry keeps the following concerns separate.
@@ -100,10 +104,11 @@ scales of a scheme. Scale selection, rounding order, calibration, clipping, and 
 belong here.
 
 NInfer defines one canonical encoder profile for the four grouped signed-integer schemes in
-Section 7. That encoder provides their defined baseline and independent artifact oracle. A
-checkpoint-specific process may use another documented encoder to produce one of those schemes—for
-example, an upstream error-optimized recipe—but that does not create a new quantization scheme if
-the resulting persistent codes and binary16 scales obey the same logical contract.
+Section 7: an importance-weighted binary16 scale search. The checkpoint recipe supplies the
+importance vector for each matrix. A checkpoint-specific process may use another documented encoder
+to produce one of those schemes, for example an upstream error-optimized recipe. That does not
+create a new quantization scheme if the resulting persistent codes and binary16 scales obey the same
+logical contract.
 
 `NVFP4` has the exact decode contract in Section 3.3, but no NInfer-owned canonical source-to-NVFP4
 encoder. Its current checkpoint recipe copies already selected E2M1, E4M3FN, and FP32 divisor words
@@ -469,67 +474,91 @@ per weight at G32, while the scale contributes 0.25 bit per weight to Q4 at G64;
 their code payload. This cost calculation explains why the finer W8 grouping is affordable. It is
 not independent quality evidence or a claim that G32 is universally optimal.
 
-## 7. Canonical grouped signed-integer reference encoder
+## 7. Canonical grouped signed-integer encoder
 
 ### 7.1 Purpose and input boundary
 
-The canonical profile identity is `MAXABS_F16_RECIP_RNE_V1`. NInfer owns exactly one current
-canonical profile for the four grouped signed-integer schemes, providing conversion consistency,
-converter parity, and artifact verification. It is a per-row, per-group symmetric
-maximum-absolute-value encoder. It fixes the arithmetic order used by the registered converter.
-Direct division during code selection is not interchangeable with its reciprocal-multiply order at
-rounding boundaries. It does not encode `NVFP4`.
+The canonical profile identity is `WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2`. NInfer owns exactly one
+current encoder profile for the four grouped signed-integer schemes. It replaces
+`MAXABS_F16_RECIP_RNE_V1`, which always used the maximum absolute value of a group divided by
+`qmax`. V1's scale is the first candidate of V2, so V2 never has a larger weighted group error. It
+does not encode `NVFP4`.
 
-The current implementation applies this profile to positive rank-two matrices, rejects non-finite
-source values and unrepresentable scales, and defines physical tail padding through
-`row-split-k128-v1`.
+For each group, the encoder searches a fixed, ordered list of binary16 scales. It keeps the scale
+with the smallest importance-weighted squared reconstruction error. Codes are always
+round-to-nearest against the stored scale, so the stored scale alone determines them.
 
-The checkpoint adapter supplies a logical tensor in the shape and axis convention of Section 4.
+The encoder input is a positive rank-two logical matrix `[N,K]` plus an optional column-importance
+vector `u[K]`. The checkpoint recipe supplies `u`; for a linear layer it is normally the mean
+squared calibration activation of each input column. A recipe that has no calibration data for a
+tensor omits `u`, and every column then weighs the same. The current implementation rejects
+non-finite source values, non-finite or negative importance, and an unrepresentable
+maximum-absolute-value scale. It defines physical tail padding through `row-split-k128-v1`.
+
 Each source value is converted to IEEE-754 binary32 using round-to-nearest, ties-to-even before group
 processing. Finite BF16 and binary16 values convert exactly; finite binary32 values are unchanged.
-If a source value cannot be represented as finite binary32, the encoder fails. NaN and infinity are
-never quantized silently.
+NaN and infinity are never quantized silently. All binary64, binary32 and binary16 operations below
+use round-to-nearest, ties-to-even, with no flush-to-zero.
 
-All binary32 and binary16 operations below use round-to-nearest, ties-to-even. No flush-to-zero is
-permitted where it would change a specified binary16 scale. A bit-level host/software implementation
-of this ordered algorithm is the encoder oracle. A production CPU or GPU converter may use faster
-arithmetic only after parity with that oracle is established on the conformance boundaries in
-Section 12.
-
-### 7.2 Per-group algorithm
-
-For one logical group of finite binary32 values `x[i]`, let `(qmin, qmax)` be the interval for the
-selected scheme. The canonical result is:
+### 7.2 Column weights
 
 ```text
-amax = max_i(abs(x[i]))                         # binary32 values
-
-if amax == +0:
-    scale16 = binary16(+0)
-    code[i] = 0 for every i
-else:
-    raw_scale32 = round_f32(amax / binary32(qmax))
-    scale16     = round_f16(raw_scale32)
-
-    if scale16 == +0:
-        scale16 = binary16_from_bits(0x0001)    # 2^-24 underflow rescue
-
-    if scale16 is not finite and positive:
-        fail
-
-    scale32 = exact_binary16_to_binary32(scale16)
-    inv32   = round_f32(binary32(1.0) / scale32)
-
-    for every i:
-        normalized32 = round_f32(x[i] * inv32)
-        rounded       = round_to_integral_ties_to_even(normalized32)
-        code[i]       = clamp(rounded, qmin, qmax)
+d[k] = 1                                  if u is absent or mean(u) == 0
+d[k] = u[k] + 0.001 * mean(u)             otherwise          # binary64, logical k only
+d[k] = 0                                  for physical padding columns
 ```
 
-`qmax`, not `abs(qmin)`, is the scale denominator. Thus Q4 uses 7, Q5 uses 15, Q6 uses 31, and W8
-uses 127. The clamp happens after integral rounding. The W8 result therefore never emits `-128`.
+The floor keeps a column that calibration never excited from being ignored completely.
 
-The integral rounding examples are:
+### 7.3 Per-group algorithm
+
+For one logical group of binary32 values `x[i]` with weights `d[i]`, and the scheme interval
+`(qmin, qmax)`:
+
+```text
+P = max(+0, max_i x[i])                   # binary32 values, -0 normalized to +0
+M = max(+0, max_i -x[i])
+
+scale(v):                                 # v is a nonnegative binary64 value
+    s = round_f16(round_f32(v))
+    if s == +0 and v > 0: s = binary16_from_bits(0x0001)    # 2^-24 underflow rescue
+    return s                              # an infinite s is never selected
+
+codes(s)[i]:
+    if s == +0: return 0
+    inv32 = round_f32(1.0 / s)
+    return clamp(round_to_integral_ties_to_even(round_f32(x[i] * inv32)), qmin, qmax)
+
+E(s) = sum_i d[i] * (x[i] - s * codes(s)[i])^2                 # binary64
+
+candidates, in order:
+    scale(max(P, M) / qmax)                                     # V1 maximum-absolute-value scale
+    base = max(P / qmax, M / -qmin)                             # smallest non-clipping scale
+    for f in 0.70, 0.72, ..., 1.10:                             # 21 factors, f = (70 + 2j) / 100
+        c = scale(base * f)
+        q = codes(c)
+        r = sum_i d[i] x[i] q[i] / sum_i d[i] q[i]^2            # weighted least-squares refit,
+                                                                # base * f if the denominator is 0
+        append c, then scale(max(r, 0))
+
+scale16 = the first candidate with the smallest finite E
+code[i] = codes(scale16)[i]
+```
+
+If the first candidate overflows binary16, encoding fails. An all-zero group produces only `+0`
+candidates and therefore the unique `scale = +0, codes = 0` representation.
+
+`base` anchors on the most negative value as well as the most positive one, so Q4, Q5 and Q6 can
+store their minimum codes `-8`, `-16` and `-32`. V1 never used those codes. For W8 the interval is
+symmetric, and the clamp still never emits `-128`. The refit and the factors below 1.0 let the
+encoder trade clipping of a rare large value for finer resolution of the rest of the group. The
+importance weights decide that trade-off by the effect on the layer output instead of on the raw
+weight.
+
+The sequence `inv32 = round_f32(1 / scale32)` followed by `normalized32 = round_f32(x * inv32)` is
+normative. Replacing it with `round_f32(x / scale32)` can select a different integer code even
+though the real-number expressions are algebraically equivalent. The integral rounding examples
+are:
 
 ```text
 +0.5 ->  0       -0.5 ->  0
@@ -537,34 +566,38 @@ The integral rounding examples are:
 +2.5 ->  2       -2.5 -> -2
 ```
 
-The sequence `inv32 = round_f32(1 / scale32)` followed by
-`normalized32 = round_f32(x * inv32)` is normative for this encoder. Replacing it with
-`round_f32(x / scale32)` can select a different integer code even though the real-number
-expressions are algebraically equivalent.
+### 7.4 Conformance
 
-If conversion of `raw_scale32` to binary16 produces infinity, encoding fails rather than storing it
-or silently clipping the scale. If a nonzero `raw_scale32` rounds to binary16 zero, the explicit
-`0x0001` rescue preserves a positive dequantization scale. An all-zero group is handled before the
-reciprocal and always produces positive-zero scale and zero codes.
+The encoder computes candidate values and sums in binary64, but it does not prescribe a summation
+order. A CPU and a GPU implementation can therefore associate `E` and the refit sums differently.
+Their selections can differ only when two candidates' errors agree to binary64 rounding, or when a
+refit lands within that rounding of a binary16 boundary. A representation conforms to this profile
+when, for every group:
 
-### 7.3 Alternative encoders
+1. every code equals `codes(scale16)` exactly;
+2. `scale16` is within one binary16 step of a candidate computed by an independent oracle;
+3. `E(scale16)` is at most the oracle's minimum candidate error times `1 + 1e-9`.
+
+The checkpoint verifier applies these checks to representative groups with the importance vector
+the artifact was converted with.
+
+### 7.5 Alternative encoders
 
 The scheme identity is determined by the persistent representation and reconstruction contract,
 not by how a converter found its codes. A documented upstream, calibrated, or error-optimized
 encoder may emit the same four schemes if all output codes and scales satisfy Sections 4 through 6.
 
 Such an encoder is not an implicit NInfer user option and cannot silently replace the canonical
-reference path. Its exact recipe and provenance belong to the selected checkpoint's quantization
-policy, and its cited upstream quality evidence applies only to that checkpoint and recipe. If it
+path. Its exact recipe and provenance belong to the selected checkpoint's quantization policy. If it
 needs a zero point, different group geometry, different scale type, codebook, shared exponent, or
 different reconstruction equation, it is a different scheme and must pass the admission process in
 Section 11.
 
 Any change to the canonical algorithm that can alter a code or scale creates a new encoder-profile
-version. It does not change the quantization scheme when the resulting representation still obeys
-Sections 4 through 6, but it must be distinguishable in checkpoint provenance and must never replace
-`MAXABS_F16_RECIP_RNE_V1` silently. NInfer still exposes only the one profile selected by each
-current checkpoint recipe; profile versioning is provenance, not a user-facing quality menu.
+version and a new recipe identity for every checkpoint that uses it. It does not change the
+quantization scheme when the resulting representation still obeys Sections 4 through 6. NInfer
+exposes only the one profile selected by each current checkpoint recipe; profile versioning is
+provenance, not a user-facing quality menu.
 
 ## 8. Conformance responsibilities
 
@@ -590,8 +623,8 @@ error by itself. Whether such a word is allowed in one tensor is a checkpoint-re
 Physical padding is produced and validated by the selected storage layout, not by the logical direct
 or quantization encoder.
 
-Only a grouped signed-integer encoder claiming canonical-reference parity must reproduce Section 7
-bit for bit. Another approved checkpoint recipe may choose different valid words for any
+A grouped signed-integer producer claiming the Section 7 profile must satisfy its conformance
+criteria in Section 7.4. Another approved checkpoint recipe may choose different valid words for any
 quantization scheme, but it cannot change their registered meaning.
 
 ### 8.2 Container and layout
@@ -759,14 +792,16 @@ enum spellings or private kernel layout. The retained codec and encoder evidence
   reconstruction equation, and known block-scale swizzle offsets;
 - canonical binary16 scale rounding, reciprocal-multiply rather than direct division, positive and
   negative ties-to-even, minimum-subnormal rescue, and rejection of non-finite or overflowing source
-  groups;
+  groups and of invalid importance;
+- minimum codes reached through the negative anchor, a weighted group error never above the
+  maximum-absolute-value scale's, and identical CPU and GPU words on random data;
 - canonical quantization followed by exact stored code/scale decode for a partially populated group.
 
 For direct formats, the independent decode oracle is the abstract logical word in Section 3.1. For
-grouped signed-integer formats, it is the binary32 reconstruction in Section 6.2. Their canonical
-encode oracle is a bit-level host/software implementation of the ordered algorithm in Section 7;
-production converters claiming that profile require parity against it rather than defining the
-oracle through their own arithmetic. The `NVFP4` decode oracle is the E2M1/E4M3FN/FP32 divisor
+grouped signed-integer formats, it is the binary32 reconstruction in Section 6.2. Their encode
+oracle is an independent host implementation of the candidate list in Section 7, and production
+converters claiming that profile are checked against it with the Section 7.4 criteria rather than
+defining the oracle through their own arithmetic. The `NVFP4` decode oracle is the E2M1/E4M3FN/FP32 divisor
 reconstruction in Section 3.3; its current producer is protected by exact source-word comparison
 rather than Section 7. An NVFP4 Op oracle starts from the represented public activation and this
 exact-decoded persistent weight. A site-level activation divisor and any private activation
@@ -791,8 +826,9 @@ questions open:
   with codes and reconstruction defined in Sections 5 and 6;
 - `NVFP4` uses E2M1 codes, one E4M3FN scale per K-axis group of 16, and one positive FP32 matrix
   divisor under Section 3.3;
-- the canonical `MAXABS_F16_RECIP_RNE_V1` encoder applies only to the four grouped signed-integer
-  formats and uses FP16-rounded scale followed by binary32 reciprocal-multiply;
+- the canonical `WEIGHTED_SCALE_SEARCH_F16_RECIP_RNE_V2` encoder applies only to the four grouped
+  signed-integer formats; it selects an FP16 scale by importance-weighted error and chooses codes by
+  binary32 reciprocal-multiply against that scale;
 - the container, checkpoint recipe, compute profile, and runtime-state codecs remain separate
   contracts.
 

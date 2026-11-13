@@ -90,7 +90,7 @@ def test_closed_allocation_inventory_and_site_coverage():
         views["text/layers/{l}/gdn/z"].row_end,
     ) == ("text/layers/{l}/gdn/query_key_value_z", 10240, 16384)
 
-    assert convert_nvfp4.RECIPE_ID == "qwen3_8_27b_nvfp4-v1"
+    assert convert_nvfp4.RECIPE_ID == "qwen3_8_27b_nvfp4-v2"
 
 
 def test_fused_text_attention_dispatch_does_not_capture_mtp_parent():

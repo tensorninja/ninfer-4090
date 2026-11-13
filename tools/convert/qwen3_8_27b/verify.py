@@ -30,9 +30,10 @@ from tools.artifact.layouts import (
     row_split_geometry,
 )
 from tools.artifact.numeric import QuantFormat, get_format
+from tools.convert.common.quantize import IMPORTANCE_FLOOR, SEARCH_FACTORS
 from tools.convert.common.safetensors import ShardReader
 
-from . import draft_head, inventory, recipe
+from . import calibrate, draft_head, inventory, recipe
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -387,60 +388,74 @@ def _materialize_rows(
     raise TypeError(f"unsupported matrix row probe: {type(expression).__name__}")
 
 
-def _profile_quantize_rows(
-    source_rows: torch.Tensor,
-    format_name: str,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply an independent host oracle to selected logical rows."""
+def _oracle_codes(
+    values: np.ndarray,
+    scales: np.ndarray,
+    format_spec: QuantFormat,
+) -> np.ndarray:
+    """Round-to-nearest codes of binary32 groups against binary16 scales."""
 
-    format_spec = get_format(format_name)
-    if not isinstance(format_spec, QuantFormat):
-        raise TypeError(f"{format_name} is not quantized")
-    geometry = row_split_geometry(format_spec, source_rows.shape)
-    values = source_rows.detach().cpu().float().numpy()
-    if not np.isfinite(values).all():
-        _contract_error("quantized source probe contains NaN or infinity")
-    if geometry.k_pad != geometry.k:
-        padded = np.zeros(
-            (geometry.n, geometry.k_pad),
-            dtype=np.float32,
-        )
-        padded[:, : geometry.k] = values
-        values = padded
-    grouped = values.reshape(
-        geometry.n,
-        geometry.groups_per_row,
-        format_spec.group_size,
-    )
-    max_abs = np.max(np.abs(grouped), axis=-1)
-    with np.errstate(over="ignore", invalid="ignore"):
-        raw_scale = (
-            max_abs.astype(np.float64) / float(format_spec.qmax)
-        ).astype(np.float32)
-        scales = raw_scale.astype(np.float16)
-    underflow = (scales == 0) & (max_abs > 0)
-    if underflow.any():
-        scales = scales.copy()
-        scales[underflow] = np.array(_FP16_MIN_SUBNORMAL, dtype=np.float16)
-    if np.any((max_abs > 0) & (~np.isfinite(scales) | (scales <= 0))):
-        _contract_error("quantized source probe has an invalid binary16 scale")
     reciprocal = np.zeros(scales.shape, dtype=np.float32)
     positive = scales > 0
-    reciprocal[positive] = (
-        1.0 / scales[positive].astype(np.float64)
-    ).astype(np.float32)
+    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(np.float32)
     # Products of two binary32 values are exact in binary64. Casting explicitly
     # supplies the specified binary32 rounding before integral ties-to-even.
     normalized = (
-        grouped.astype(np.float64) * reciprocal.astype(np.float64)[..., None]
+        values.astype(np.float64) * reciprocal.astype(np.float64)[..., None]
     ).astype(np.float32)
-    codes = np.clip(
-        np.rint(normalized),
-        format_spec.qmin,
-        format_spec.qmax,
-    ).astype(np.int8)
-    return torch.from_numpy(scales).to(device), torch.from_numpy(codes).to(device)
+    return np.clip(np.rint(normalized), format_spec.qmin, format_spec.qmax)
+
+
+def _oracle_binary16(value: np.ndarray) -> np.ndarray:
+    with np.errstate(over="ignore"):
+        scales = value.astype(np.float32).astype(np.float16)
+    rescue = (scales == 0) & (value > 0)
+    scales[rescue] = np.float16(_FP16_MIN_SUBNORMAL)
+    return scales
+
+
+def _oracle_error(
+    values: np.ndarray,
+    weights: np.ndarray,
+    scales: np.ndarray,
+    format_spec: QuantFormat,
+) -> tuple[np.ndarray, np.ndarray]:
+    finite = np.isfinite(scales)
+    safe = np.where(finite, scales, np.float16(0))
+    codes = _oracle_codes(values, safe, format_spec)
+    residual = values.astype(np.float64) - safe.astype(np.float64)[..., None] * codes
+    error = np.sum(weights * residual * residual, axis=-1)
+    return np.where(finite, error, np.inf), codes
+
+
+def _oracle_scale_candidates(
+    values: np.ndarray,
+    weights: np.ndarray,
+    format_spec: QuantFormat,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Independent host evaluation of every registered encoder candidate.
+
+    Returns candidate binary16 scales ``[C, rows, groups]`` in encoder order and
+    their binary64 importance-weighted squared errors.
+    """
+
+    x = values.astype(np.float64)
+    positive_max = np.max(np.maximum(x, 0.0), axis=-1)
+    negative_max = np.max(np.maximum(-x, 0.0), axis=-1)
+    base = np.maximum(positive_max / format_spec.qmax, negative_max / -format_spec.qmin)
+    candidates = [_oracle_binary16(np.maximum(positive_max, negative_max) / format_spec.qmax)]
+    for index in range(len(SEARCH_FACTORS)):
+        candidate = base * ((70 + 2 * index) / 100)
+        scales = _oracle_binary16(candidate)
+        _, codes = _oracle_error(values, weights, scales, format_spec)
+        numerator = np.sum(weights * x * codes, axis=-1)
+        denominator = np.sum(weights * codes * codes, axis=-1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            refit = np.where(denominator > 0, numerator / denominator, candidate)
+        candidates += [scales, _oracle_binary16(np.maximum(refit, 0.0))]
+    stacked = np.stack(candidates)
+    errors = np.stack([_oracle_error(values, weights, c, format_spec)[0] for c in stacked])
+    return stacked, errors
 
 
 def verify_quantized_rows(
@@ -449,40 +464,63 @@ def verify_quantized_rows(
     shape: tuple[int, int],
     row_indices: Sequence[int],
     source_rows: torch.Tensor,
+    importance: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
 ) -> int:
-    """Compare representative stored groups with profile results for source rows."""
+    """Check representative stored groups against an independent encoder oracle.
 
+    Codes must be exactly round-to-nearest against the stored scale.  The stored
+    scale must be one of the oracle's candidates (one binary16 step apart at
+    most, since candidate sums may associate differently) and must reach the
+    oracle's minimum weighted error up to binary64 reduction differences.
+    """
+
+    format_spec = get_format(format_name)
+    if not isinstance(format_spec, QuantFormat):
+        raise TypeError(f"{format_name} is not quantized")
     geometry = row_split_geometry(format_name, shape)
     gathered = gather_row_planes(payload, geometry, row_indices)
-    target = torch.device(device)
     stored_scales, stored_codes = decode_row_split_codes(
         gathered,
         format_name,
         (len(row_indices), shape[1]),
-        device=target,
+        device=torch.device(device),
     )
-    expected_scales, expected_codes = _profile_quantize_rows(
-        source_rows,
-        format_name,
-        target,
-    )
-    group_indices = torch.tensor(
-        _three_indices(geometry.groups_per_row),
-        dtype=torch.long,
-        device=target,
-    )
-    if not torch.equal(
-        stored_scales.index_select(1, group_indices).view(torch.int16),
-        expected_scales.index_select(1, group_indices).view(torch.int16),
-    ):
-        _contract_error("representative stored quantization scales differ")
-    if not torch.equal(
-        stored_codes.index_select(1, group_indices),
-        expected_codes.index_select(1, group_indices),
-    ):
+    groups = list(_three_indices(geometry.groups_per_row))
+    stored_scales = stored_scales.cpu().numpy()[:, groups]
+    stored_codes = stored_codes.cpu().numpy()[:, groups].astype(np.float64)
+
+    values = source_rows.detach().cpu().float().numpy()
+    if not np.isfinite(values).all():
+        _contract_error("quantized source probe contains NaN or infinity")
+    padded = np.zeros((len(row_indices), geometry.k_pad), dtype=np.float32)
+    padded[:, : geometry.k] = values
+    grouped = padded.reshape(len(row_indices), geometry.groups_per_row, format_spec.group_size)
+    grouped = grouped[:, groups]
+    weights = np.zeros(geometry.k_pad, dtype=np.float64)
+    vector = None if importance is None else importance.detach().cpu().double().numpy()
+    if vector is None or vector.mean() <= 0.0:
+        weights[: geometry.k] = 1.0
+    else:
+        weights[: geometry.k] = vector + IMPORTANCE_FLOOR * vector.mean()
+    weights = weights.reshape(geometry.groups_per_row, format_spec.group_size)[groups]
+
+    if not (np.isfinite(stored_scales) & (stored_scales >= 0)).all():
+        _contract_error("representative stored quantization scale is not finite and nonnegative")
+    if not np.array_equal(stored_codes, _oracle_codes(grouped, stored_scales, format_spec)):
         _contract_error("representative stored quantization codes differ")
-    return len(row_indices) * len(group_indices)
+    candidates, errors = _oracle_scale_candidates(grouped, weights, format_spec)
+    distance = np.abs(
+        candidates.view(np.int16).astype(np.int32)
+        - stored_scales.view(np.int16).astype(np.int32)[None]
+    )
+    if not (distance <= 1).any(axis=0).all():
+        _contract_error("representative stored quantization scale is not an encoder candidate")
+    stored_error, _ = _oracle_error(grouped, weights, stored_scales, format_spec)
+    best = errors.min(axis=0)
+    if not (stored_error <= best * (1.0 + 1.0e-9) + 1.0e-300).all():
+        _contract_error("representative stored quantization scale is not error-minimal")
+    return len(row_indices) * len(groups)
 
 
 def validate_draft_token_ids(token_ids: torch.Tensor) -> None:
@@ -556,6 +594,7 @@ def _verify_resources_and_frontend(
 def verify_payloads(
     artifact: Artifact,
     model_dir: str | Path,
+    importance: calibrate.Importance,
     device: str | torch.device = "cpu",
 ) -> PayloadSummary:
     """Verify representative values without requantizing complete matrices."""
@@ -593,6 +632,7 @@ def verify_payloads(
                 obj.shape,
                 rows,
                 source_rows,
+                importance.vectors.get(object_name),
                 target,
             )
             quant_rows += len(rows)
@@ -616,10 +656,12 @@ def verify_payloads(
 def verify_artifact(
     artifact: Artifact,
     model_dir: str | Path,
+    importance_path: str | Path,
     device: str | torch.device = "cpu",
 ) -> VerificationSummary:
     structure = validate_structure(artifact)
-    payload = verify_payloads(artifact, model_dir, device)
+    importance = calibrate.load_importance(importance_path)
+    payload = verify_payloads(artifact, model_dir, importance, device)
     return VerificationSummary(structure=structure, payload=payload)
 
 
@@ -630,6 +672,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
+        "--importance",
+        type=Path,
+        required=True,
+        help="calibration file the artifact was converted with",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -639,7 +687,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     with Artifact.open(arguments.artifact) as artifact:
-        summary = verify_artifact(artifact, arguments.model, arguments.device)
+        summary = verify_artifact(
+            artifact, arguments.model, arguments.importance, arguments.device
+        )
     print(json.dumps(asdict(summary), indent=2, sort_keys=True))
     return 0
 

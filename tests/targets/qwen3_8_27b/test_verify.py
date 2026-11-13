@@ -11,6 +11,7 @@ from tools.artifact.container import (
     plan_objects,
 )
 from tools.artifact.layouts import encode_row_split
+from tools.artifact.numeric import get_format
 from tools.convert.common.quantize import quantize_matrix
 from tools.convert.qwen3_8_27b import inventory, verify
 
@@ -82,9 +83,14 @@ def test_structure_rejects_identity_signature_and_offset_drift() -> None:
         ("W8G32_F16S", 33),
     ),
 )
-def test_representative_quantized_row_group_verifier(format_name: str, k: int) -> None:
-    source = torch.linspace(-3.0, 4.0, 5 * k, dtype=torch.float32).reshape(5, k)
-    quantized = quantize_matrix(source, format_name, device="cpu")
+@pytest.mark.parametrize("weighted", (False, True))
+def test_representative_quantized_row_group_verifier(
+    format_name: str, k: int, weighted: bool
+) -> None:
+    generator = torch.Generator().manual_seed(k)
+    source = torch.randn((5, k), generator=generator)
+    importance = torch.rand(k, generator=generator) ** 4 if weighted else None
+    quantized = quantize_matrix(source, format_name, importance=importance, device="cpu")
     payload = encode_row_split(
         quantized.codes,
         quantized.scales,
@@ -92,27 +98,42 @@ def test_representative_quantized_row_group_verifier(format_name: str, k: int) -
         source.shape,
     )
     rows = (0, 2, 4)
-    compared = verify.verify_quantized_rows(
-        payload,
-        format_name,
-        tuple(source.shape),
-        rows,
-        source[list(rows)],
-        "cpu",
-    )
-    assert compared in (6, 9)
 
-    damaged = bytearray(payload)
-    damaged[0] ^= 1
-    with pytest.raises(verify.VerificationError, match="codes differ"):
-        verify.verify_quantized_rows(
-            damaged,
+    def check(candidate_payload) -> int:
+        return verify.verify_quantized_rows(
+            candidate_payload,
             format_name,
             tuple(source.shape),
             rows,
             source[list(rows)],
+            importance,
             "cpu",
         )
+
+    assert check(payload) in (6, 9)
+
+    damaged = bytearray(payload)
+    damaged[0] ^= 1
+    with pytest.raises(verify.VerificationError, match="codes differ"):
+        check(damaged)
+
+    # Maximum-absolute-value scales with their own round-to-nearest codes are
+    # self-consistent but are not the weighted-error minimum.
+    spec = get_format(format_name)
+    groups = quantized.scales.shape[1]
+    padded = torch.zeros((5, groups * spec.group_size))
+    padded[:, :k] = source
+    grouped = padded.reshape(5, groups, spec.group_size)
+    absmax_scales = (grouped.abs().amax(-1).double() / spec.qmax).float().half()
+    reciprocal = torch.where(
+        absmax_scales > 0, (1.0 / absmax_scales.double()).float(), torch.zeros(())
+    )
+    absmax_codes = torch.clamp(
+        torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
+    ).to(torch.int8)
+    absmax_payload = encode_row_split(absmax_codes, absmax_scales, format_name, source.shape)
+    with pytest.raises(verify.VerificationError, match="error-minimal"):
+        check(absmax_payload)
 
 
 def test_draft_id_domain_and_uniqueness() -> None:

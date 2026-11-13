@@ -119,10 +119,13 @@ def encode_tensor_payload(
     tensor: torch.Tensor,
     spec: TensorSpec,
     device: str | torch.device,
+    importance: torch.Tensor | None = None,
 ) -> bytes:
     if spec.format in DIRECT_FORMATS:
+        if importance is not None:
+            raise ValueError(f"{spec.name}: importance applies only to quantized tensors")
         return encode_direct(tensor, spec.format)
-    return quantize_and_encode(tensor, spec.format, device=device)
+    return quantize_and_encode(tensor, spec.format, importance=importance, device=device)
 
 
 def object_statistics(objects: Sequence[ArtifactObject]) -> dict[str, object]:

@@ -399,7 +399,50 @@ scoring, and one sample per problem with temperature 0.6, top-p 0.95, top-k 20, 
 | `nvfp4` | 93.33% (28 / 30) | 93.33% (28 / 30) | 84.34% (167 / 198) |
 
 These are single-sample results under the stated evaluation profile, not pass@k scores. Each
-benchmark remains independently reportable; no combined score is computed.
+benchmark remains independently reportable; no combined score is computed. The `groupwise-int`
+row predates the importance-weighted encoder below.
+
+### Importance-weighted quantization
+
+Recipe `qwen3_8_27b-v2` replaces the maximum-absolute-value group scale of `qwen3_8_27b-v1` with
+the importance-weighted scale search of
+[`tensor-formats.md`](maintainer/tensor-formats.md) Section 7. Both artifacts have the same formats,
+the same 18,210,531,328 bytes and the same kernels, so throughput does not change. Measured on
+2026-11-12 on the RTX 4090.
+
+Next-token KL divergence and top-1 agreement against the BF16 checkpoint, from
+`tools.parity.qwen3_8_27b.weight_kld` on the 48 held-out 2,048-token windows that calibration never
+reads (12 per domain, 98,304 tokens):
+
+| Domain | v1 mean KLD | v2 mean KLD | v1 top-1 | v2 top-1 |
+|---|---:|---:|---:|---:|
+| Agentic tool use | 0.7104 | 0.5306 | 87.87% | 90.05% |
+| Chat | 0.0709 | 0.0463 | 93.97% | 95.24% |
+| Code | 0.0324 | 0.0224 | 94.51% | 95.63% |
+| Reasoning | 0.0332 | 0.0215 | 95.82% | 96.62% |
+| All | 0.2117 | 0.1552 | 93.04% | 94.38% |
+
+Mean KLD falls by 26.7%, and p99 KLD over all tokens falls from 6.27 to 3.77. The agentic windows
+come from one held-out trajectory, so that row has the widest uncertainty. The comparison runs a
+reference forward pass in PyTorch with each artifact's decoded weights. It does not include the KV
+codec or activation quantization.
+
+Served behavior, v1 and v2 on the same build:
+
+| Check | v1 | v2 |
+|---|---:|---:|
+| MTP3 acceptance, 30 requests | 56.2% | 57.6% |
+| MTP3 tokens per round | 2.68 | 2.73 |
+| Decode tok/s per request at concurrency 3 | 96.5 | 99.5 |
+| `decision-1` development accuracy, 1,264 questions | 87.10% | 87.18% |
+| `decision-1` development Brier score | 0.1841 | 0.1825 |
+
+The MTP workload is the three `long_decode_aime26` fixtures and the twelve cross-scenario fixtures,
+seeds 42 and 43, `rk4v4` KV, thinking replies capped at 16,384 tokens and other replies at 4,096.
+The decision check serves `decision-1` with BF16 KV. Its v1 accuracy matches the development row
+in [`qwen3.8-27b-lora-adapters.md`](maintainer/qwen3.8-27b-lora-adapters.md). The
+`decision-1` and `caveman-1` adapters predate v2 and were not retrained for it. `caveman-1` passes
+the real-artifact LoRA test on v2.
 
 ### `groupwise-int`
 

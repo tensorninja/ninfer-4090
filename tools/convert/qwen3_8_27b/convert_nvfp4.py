@@ -36,7 +36,7 @@ from . import recipe as base_recipe
 from . import recipe_nvfp4 as recipe
 
 
-RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
+RECIPE_ID = "qwen3_8_27b_nvfp4-v2"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
 
 
