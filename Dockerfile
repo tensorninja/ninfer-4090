@@ -11,12 +11,13 @@ RUN bun install --frozen-lockfile
 COPY apps/web/ ./
 RUN bun run build
 
-FROM nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
+        ccache \
         cmake \
         curl \
         libavcodec-dev \
@@ -39,19 +40,33 @@ COPY include/ include/
 COPY src/ src/
 COPY third_party/ third_party/
 
+# Empty lets Ninja pick the job count. Each nvcc job can take several GiB, so a small builder sets
+# it explicitly.
+ARG BUILD_JOBS=
+# The build directory keeps Ninja incremental on one machine. ccache hashes sources instead of
+# mtimes, so a fresh checkout in CI, which restores only the ccache directory, recompiles only
+# changed files.
+ENV CCACHE_DIR=/root/.cache/ccache CCACHE_MAXSIZE=4G
 RUN --mount=type=cache,id=ninfer-sm89-cuda13.2-release,target=/build,sharing=locked \
+    --mount=type=cache,id=ninfer-ccache,target=/root/.cache/ccache,sharing=locked \
     cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
         -DNINFER_BUILD_QWEN3_8_27B=ON \
         -DNINFER_BUILD_QWEN3_6_35B_A3B=OFF \
-    && cmake --build /build --parallel 16 --target ninfer ninfer-serve \
+    && cmake --build /build ${BUILD_JOBS:+--parallel "$BUILD_JOBS"} --target ninfer ninfer-serve \
     && install -D /build/apps/ninfer /opt/ninfer/bin/ninfer \
-    && install -D /build/apps/ninfer-serve /opt/ninfer/bin/ninfer-serve
+    && install -D /build/apps/ninfer-serve /opt/ninfer/bin/ninfer-serve \
+    && ccache --show-stats
 
-FROM nvidia/cuda:13.2.0-cudnn-runtime-ubuntu24.04
+# The binaries link only cudart, which the base image has, and NVML and the driver, which the NVIDIA
+# Container Toolkit mounts.
+FROM nvidia/cuda:13.2.0-base-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -65,29 +80,22 @@ RUN apt-get update \
         libswscale7 \
     && rm -rf /var/lib/apt/lists/*
 
-ARG MODEL_URL=https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer/resolve/2160a5161799f3c059867f77aeaf447f25418161/qwen3_8_27b.ninfer
-# Keep immutable model bytes below the frequently changing application layers.
-RUN --mount=type=bind,source=.,target=/context,readonly \
-    mkdir -p /opt/ninfer/models \
-    && if [ -f /context/models/qwen3_8_27b.ninfer ]; then \
-         cp /context/models/qwen3_8_27b.ninfer /opt/ninfer/models/qwen3_8_27b.ninfer; \
-       else \
-         curl --fail --location --retry 5 \
-           --output /opt/ninfer/models/qwen3_8_27b.ninfer \
-           "$MODEL_URL"; \
-       fi \
-    && printf '%s  %s\n' \
-         b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d \
-         /opt/ninfer/models/qwen3_8_27b.ninfer \
-       | sha256sum --check
-
 COPY --from=build /opt/ninfer/bin/ninfer /usr/local/bin/ninfer
 COPY --from=build /opt/ninfer/bin/ninfer-serve /usr/local/bin/ninfer-serve
 COPY --from=web /web/dist /opt/ninfer/web
+# The model and adapters stay out of the image. The entrypoint downloads the pinned files into the
+# /var/lib/ninfer volume on first start, so an image update downloads only what changed.
+COPY docker/assets.txt /opt/ninfer/assets.txt
+COPY --chmod=0755 docker/fetch-assets.sh /usr/local/bin/ninfer-fetch
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/ninfer-entrypoint
 
+ENV NINFER_HOME=/var/lib/ninfer
 WORKDIR /workspace
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-VOLUME ["/var/cache/ninfer"]
+VOLUME ["/var/lib/ninfer", "/var/cache/ninfer"]
+# The start period covers the first model download.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=2h --start-interval=10s \
+    CMD curl --fail --silent --show-error http://127.0.0.1:8080/health || exit 1
 
-CMD ["ninfer-serve", "/opt/ninfer/models/qwen3_8_27b.ninfer", "--model-id", "qwen3.8-27b", "--host", "0.0.0.0", "--port", "8080", "--max-context", "262144", "--kv-capacity", "262144", "--max-concurrency", "4", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "rk4v4", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--prefix-checkpoint-policy", "rolling-tool", "--continuation-cache", "l1-l2-l3", "--continuation-cache-dir", "/var/cache/ninfer", "--continuation-cache-namespace", "local", "--continuation-cache-l1-mib", "768", "--continuation-cache-l2-mib", "16384", "--continuation-cache-l3-mib", "49152", "--continuation-cache-filesystem-reserve-mib", "4096", "--web-dir", "/opt/ninfer/web"]
+ENTRYPOINT ["ninfer-entrypoint"]

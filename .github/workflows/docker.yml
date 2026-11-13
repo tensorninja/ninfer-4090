@@ -1,0 +1,117 @@
+name: docker
+
+on:
+  push:
+    branches: [tensorninja]
+    tags: ["v*"]
+    paths:
+      - .dockerignore
+      - .github/workflows/docker.yml
+      - CMakeLists.txt
+      - Dockerfile
+      - apps/**
+      - docker/**
+      - include/**
+      - src/**
+      - third_party/**
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      # The CUDA devel image and the build need more than the runner's default free space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: actions/checkout@v7
+
+      - id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Each run saves its ccache under a new key and restores the newest one, because an Actions
+      # cache entry cannot be overwritten.
+      - id: ccache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
+      # Moves the ccache directory into the Dockerfile's cache mount before the build and back out
+      # after the job, so actions/cache can save it.
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {"ccache": {"target": "/root/.cache/ccache", "id": "ninfer-ccache"}}
+          skip-extraction: ${{ steps.ccache.outputs.cache-hit }}
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      # Four nvcc jobs fit the runner's 16 GB of memory. The layer cache lives in the registry,
+      # because the CUDA layers would crowd ccache out of the 10 GB Actions cache.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: BUILD_JOBS=4
+          load: true
+          tags: ninfer:ci
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,image-manifest=true
+
+      # The runner has no GPU, so the driver libraries that the NVIDIA Container Toolkit mounts are
+      # absent. Every other library must resolve inside the image.
+      - name: Check libraries
+        run: |
+          for binary in ninfer ninfer-serve; do
+            missing="$(docker run --rm --entrypoint ldd ninfer:ci "/usr/local/bin/$binary" \
+              | grep 'not found' | grep --invert-match -e libcuda.so -e libnvidia-ml.so || true)"
+            if [ -n "$missing" ]; then
+              echo "$binary: $missing"
+              exit 1
+            fi
+          done
+
+      - name: Push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: BUILD_JOBS=4
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache

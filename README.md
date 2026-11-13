@@ -44,27 +44,27 @@ prefill rate that NInfer streams while it reads the prompt.
 ## Quick start
 
 These steps run the server in Docker with the full 262,144-token context and connect an agent to
-it. You need an RTX 4090, a recent NVIDIA driver, and Docker with the
+it. You need an RTX 4090, NVIDIA driver 580 or newer, and Docker with the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
-1. Build the image. The build compiles the engine, downloads the 17 GB model from
-   [Hugging Face](https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer), and checks its SHA-256.
+1. Start the server:
 
    ```bash
-   git clone https://github.com/tensorninja/ninfer-4090.git
-   cd ninfer-4090
-   docker build --tag ninfer-4090:sm89 .
+   docker run --detach --name ninfer --gpus all --publish 8080:8080 \
+     --volume ninfer-assets:/var/lib/ninfer \
+     --volume ninfer-cache:/var/cache/ninfer \
+     ghcr.io/tensorninja/ninfer-4090:latest
    ```
 
-2. Start the server. It checks GPU memory before it listens on port 8080.
+   On first start the container downloads the 17 GB
+   [model](https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer) and the
+   [`caveman-1`](https://huggingface.co/tensorninja2/caveman-1) and
+   [`decision-1`](https://huggingface.co/tensorninja2/decision-1) adapters into the
+   `ninfer-assets` volume and checks their SHA-256. Later starts reuse them. The server checks GPU
+   memory before it listens on port 8080. `docker logs --follow ninfer` shows the download and
+   startup.
 
-   ```bash
-   docker run --rm --gpus all --publish 8080:8080 \
-     --volume ninfer-continuations:/var/cache/ninfer \
-     ninfer-4090:sm89
-   ```
-
-3. Send a request from a second terminal:
+2. Send a request:
 
    ```bash
    curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -74,12 +74,12 @@ it. You need an RTX 4090, a recent NVIDIA driver, and Docker with the
 
    The dashboard is at `http://127.0.0.1:8080/`.
 
-4. Connect your agent. OpenAI clients use the base URL `http://127.0.0.1:8080/v1` and Anthropic
+3. Connect your agent. OpenAI clients use the base URL `http://127.0.0.1:8080/v1` and Anthropic
    clients use `http://127.0.0.1:8080`, both with the model `qwen3.8-27b`. For Caudra, follow
    [Use it from Caudra](#use-it-from-caudra).
 
-To build without Docker, see [Native build](#native-build). To add the `caveman-1` and
-`decision-1` adapters, see [Get caveman-1 and decision-1](#get-caveman-1-and-decision-1).
+To change the server flags, use Docker Compose, or build the image yourself, see [Docker](#docker).
+To build without Docker, see [Native build](#native-build).
 
 ## Speed on one RTX 4090
 
@@ -299,8 +299,9 @@ qualified on, so it trades context for decision fidelity:
   --lora-dir lora --lora-slots 2
 ```
 
-In Docker, mount the directory and pass `--lora-dir`, as the adapter profile under
-[Docker](#docker) shows.
+The Docker image downloads both adapters and serves them without extra flags. For this BF16
+profile, append `--kv-dtype bf16 --max-context 32768 --kv-capacity 32768` to the `docker run`
+command, as [Docker](#docker) shows.
 
 For chat at the full 262K context, use `--kv-dtype rk4v4 --max-context 262144` instead. Decisions
 still work there, with the small measured deviation described under
@@ -489,7 +490,7 @@ printf '%s  %s\n' \
 
 `pip install -U huggingface_hub` installs the `hf` CLI. Without it, `scripts/download-qwen38.sh`
 downloads the same file with `curl` and resumes an interrupted download when you run it again. You
-do not need this step for Docker, because the image build downloads the file itself.
+do not need this step for Docker, because the container downloads the file on first start.
 
 The file is the artifact that the upstream NInfer project converted, byte for byte. Cached
 continuation state records the SHA-256 of the complete file, so state computed with one artifact
@@ -498,28 +499,50 @@ the file's contents and conversion provenance.
 
 ### Docker
 
-Build the image. The build downloads the model from Hugging Face, checks its SHA-256, and embeds
-it in the image.
+GitHub Actions builds `ghcr.io/tensorninja/ninfer-4090` from every engine change on the default
+branch. `latest` follows that branch, `sha-<commit>` names one build, and a `v*` tag publishes
+the matching version tags. The image holds the engine and the dashboard. It does not hold the model
+or the adapters.
+
+The image uses two volumes:
+
+| Path | Contents |
+|---|---|
+| `/var/lib/ninfer` | `models/qwen3_8_27b.ninfer` and the adapters in `lora/` |
+| `/var/cache/ninfer` | The L3 continuation cache and artifact fingerprints |
+
+On start, the entrypoint downloads each file in [`docker/assets.txt`](docker/assets.txt) that is
+missing from `/var/lib/ninfer`, then checks its size and SHA-256. Each URL pins a Hugging Face
+commit. A file that passed the check once is not hashed again until its size or mtime changes. An
+interrupted download resumes on the next start. When a newer image pins a different file, the
+entrypoint replaces the old one. Set `HF_TOKEN` to download with a Hugging Face token, or
+`NINFER_FETCH=0` to skip the download and check entirely.
+
+Name both volumes. Docker creates a named volume on first use and keeps it across containers. An
+unnamed volume is deleted with `docker run --rm`, so every start would download the model again.
 
 ```bash
-docker build --tag ninfer-4090:sm89 .
+docker run --detach --name ninfer --gpus all --publish 8080:8080 \
+  --volume ninfer-assets:/var/lib/ninfer \
+  --volume ninfer-cache:/var/cache/ninfer \
+  ghcr.io/tensorninja/ninfer-4090:latest
 ```
 
-Start the default profile: the full 262,144-token context on 4-bit KV, MTP with three draft
-tokens, four lanes, and a three-tier continuation cache. The API is at `http://127.0.0.1:8080/v1`
-and the [dashboard](docs/dashboard.md) at `http://127.0.0.1:8080/`.
+To download the files before the first start, on a machine without a GPU too, run
+`ninfer-fetch` alone:
 
 ```bash
-docker run --rm --gpus all --publish 8080:8080 \
-  --volume ninfer-continuations:/var/cache/ninfer \
-  ninfer-4090:sm89
+docker run --rm --volume ninfer-assets:/var/lib/ninfer \
+  ghcr.io/tensorninja/ninfer-4090:latest ninfer-fetch
 ```
 
-The named volume keeps cached conversation state across container restarts. The image's default
-command is:
+The default profile is the full 262,144-token context on 4-bit KV, MTP with three draft tokens,
+four lanes, a three-tier continuation cache, and both adapters with two device slots. The API is
+at `http://127.0.0.1:8080/v1` and the [dashboard](docs/dashboard.md) at `http://127.0.0.1:8080/`.
+[`docker/entrypoint.sh`](docker/entrypoint.sh) holds the default command:
 
 ```bash
-ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
+ninfer-serve /var/lib/ninfer/models/qwen3_8_27b.ninfer \
   --model-id qwen3.8-27b --host 0.0.0.0 --port 8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 4 --max-pending-requests 16 \
@@ -533,27 +556,49 @@ ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
   --continuation-cache-l2-mib 16384 \
   --continuation-cache-l3-mib 49152 \
   --continuation-cache-filesystem-reserve-mib 4096 \
+  --lora-dir /var/lib/ninfer/lora --lora-slots 2 \
   --web-dir /opt/ninfer/web
 ```
 
-To serve adapters, mount the adapter directory and pass the full command with `--lora-dir`. A
-command after the image name replaces the default command, so repeat every flag you want to keep:
+Flags after the image name are appended to this command. When a flag repeats, `ninfer-serve` uses
+the last value, so an appended flag overrides the default. This starts the BF16 decision profile:
 
 ```bash
-docker run --rm --gpus all --publish 8080:8080 \
-  --volume ninfer-continuations:/var/cache/ninfer \
-  --volume "$PWD/lora:/opt/ninfer/lora:ro" \
-  ninfer-4090:sm89 \
-  ninfer-serve /opt/ninfer/models/qwen3_8_27b.ninfer \
-  --model-id qwen3.8-27b --host 0.0.0.0 --port 8080 \
-  --max-context 262144 --kv-capacity 262144 --max-concurrency 4 \
-  --prefill-chunk 1024 --kv-dtype rk4v4 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --continuation-cache l1-l2-l3 --continuation-cache-dir /var/cache/ninfer \
-  --continuation-cache-filesystem-reserve-mib 4096 \
-  --lora-dir /opt/ninfer/lora --lora-slots 2 \
-  --web-dir /opt/ninfer/web
+docker run --detach --name ninfer --gpus all --publish 8080:8080 \
+  --volume ninfer-assets:/var/lib/ninfer \
+  --volume ninfer-cache:/var/cache/ninfer \
+  ghcr.io/tensorninja/ninfer-4090:latest \
+  --kv-dtype bf16 --max-context 32768 --kv-capacity 32768
 ```
+
+A command that does not start with `-` replaces the default command. `ninfer-serve ...` or
+`ninfer ...` runs after the download. Any other command, such as `bash`, runs at once. The
+health check polls port 8080, so a server on another port reports as unhealthy.
+
+To serve more adapters, copy their `.lora.ninfer` files into the volume's `lora/` directory and
+restart the container:
+
+```bash
+docker cp my-adapter.lora.ninfer ninfer:/var/lib/ninfer/lora/
+docker restart ninfer
+```
+
+[`compose.yaml`](compose.yaml) starts the same container with the GPU, both volumes, and
+`restart: unless-stopped`. Add flags under `command:`.
+
+```bash
+docker compose up --detach
+```
+
+To build the image from source, run this from the repository root. `BUILD_JOBS` limits the
+parallel `nvcc` jobs, which each take several GiB of memory:
+
+```bash
+docker build --build-arg BUILD_JOBS=8 --tag ghcr.io/tensorninja/ninfer-4090:latest .
+```
+
+To pin a newer model or adapter, upload it to Hugging Face, then change its line in
+`docker/assets.txt` to the new commit URL, SHA-256, and size.
 
 Two flags are worth knowing for agent work:
 
@@ -681,8 +726,9 @@ derives from [Neroued/ninfer](https://github.com/Neroued/ninfer). Beyond the spe
   every packed 4-bit plane to one midrise codec. [Fork comparison](docs/udp-fork-comparison.md)
 - **Agent-ready OpenAI surfaces.** Responses has native reasoning summaries, stored
   `item_reference` inputs, and explicit errors for unsupported fields instead of silent acceptance.
-- **Self-contained Docker image.** The image embeds the verified model and the dashboard, and
-  BuildKit caches the CUDA build so a source change rebuilds only affected objects.
+- **Published Docker image.** GitHub Actions publishes the engine and dashboard image to GHCR. On
+  first start the container downloads the pinned model and adapters into a volume and checks their
+  SHA-256.
 
 ## Known limits
 

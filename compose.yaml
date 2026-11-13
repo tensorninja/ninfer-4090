@@ -1,0 +1,24 @@
+services:
+  ninfer:
+    image: ghcr.io/tensorninja/ninfer-4090:latest
+    # Flags here are appended to the image's default profile and override it.
+    command: []
+    ports:
+      - "8080:8080"
+    volumes:
+      - ninfer-assets:/var/lib/ninfer
+      - ninfer-cache:/var/cache/ninfer
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ninfer-assets:
+  ninfer-cache:

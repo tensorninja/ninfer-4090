@@ -1,0 +1,6 @@
+# Files that ninfer-fetch downloads into $NINFER_HOME (default /var/lib/ninfer).
+# Every URL pins a Hugging Face commit, and every file must match its SHA-256 and size.
+# sha256 size path url
+b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d 18210531328 models/qwen3_8_27b.ninfer https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer/resolve/2160a5161799f3c059867f77aeaf447f25418161/qwen3_8_27b.ninfer
+1c10e3d042f7a37e32f4867d2e76e8baea6898c4452e0f3e32f05396136971c9 84471808 lora/caveman-1.lora.ninfer https://huggingface.co/tensorninja2/caveman-1/resolve/50fe1282e8cf90a796c8728f04a786216595df95/caveman-1.lora.ninfer
+14015d187d244a37dcc1fc0593308a756b8be1c1b70914bf088188acfb341a39 89716300 lora/decision-1.lora.ninfer https://huggingface.co/tensorninja2/decision-1/resolve/619fcac019964e16f903272003977269d56d72d2/decision-1.lora.ninfer
