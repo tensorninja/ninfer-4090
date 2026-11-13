@@ -24,9 +24,11 @@ native `.ninfer` artifact format of [NInfer-4090](https://github.com/tensorninja
 C++/CUDA inference engine for this model on one RTX 4090. The file works only with NInfer. It is
 not a Transformers checkpoint, Safetensors distribution, or GGUF file.
 
-The bytes are identical to the artifact that the upstream
-[NInfer](https://github.com/Neroued/ninfer) project published as `neroued/Qwen3.8-27B-NInfer`. The
-SHA-256 below is the same.
+NInfer-4090 converted this file from the BF16 checkpoint with importance-weighted quantization
+(recipe `qwen3_8_27b-v2`). It has the same formats, size and kernels as the `qwen3_8_27b-v1`
+artifact that the upstream [NInfer](https://github.com/Neroued/ninfer) project published, so it runs
+at the same speed, but its outputs are closer to the BF16 model. The `v1` tag of this repository
+keeps the previous file.
 
 ## Artifact
 
@@ -34,7 +36,7 @@ SHA-256 below is the same.
 |---|---|
 | Filename | `qwen3_8_27b.ninfer` |
 | Size | 18,210,531,328 bytes (16.96 GiB) |
-| SHA-256 | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| SHA-256 | `b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d` |
 | Container version | 2 |
 | NInfer model ID | `qwen3.8-27b` |
 | NInfer weights ID | `groupwise-int` |
@@ -49,9 +51,34 @@ To check a downloaded file:
 
 ```bash
 printf '%s  %s\n' \
-  'eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e' \
+  'b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d' \
   'qwen3_8_27b.ninfer' | sha256sum --check
 ```
+
+## Quantization
+
+Each group of 32 or 64 weights stores one FP16 scale and small integer codes. The `v1` recipe set
+each scale from the group's largest absolute weight. This artifact instead tries 43 candidate scales
+per group and keeps the one with the smallest reconstruction error, weighted by how strongly each
+input column is activated. The activation statistics come from about 524,000 tokens of reasoning,
+code, chat and agentic tool-use text run through the BF16 model.
+
+Measured on an RTX 4090 against the BF16 checkpoint, on 98,304 held-out tokens that calibration
+never saw:
+
+| Domain | `v1` mean KLD | This file | `v1` top-1 | This file |
+|---|---:|---:|---:|---:|
+| Agentic tool use | 0.710 | 0.531 | 87.87% | 90.05% |
+| Chat | 0.071 | 0.046 | 93.97% | 95.24% |
+| Code | 0.032 | 0.022 | 94.51% | 95.63% |
+| Reasoning | 0.033 | 0.022 | 95.82% | 96.62% |
+| All | 0.212 | 0.155 | 93.04% | 94.38% |
+
+KLD is the next-token KL divergence from the BF16 model, and top-1 is how often both pick the same
+next token. Served with MTP3, draft acceptance rises from 56.2% to 57.6%.
+[decision-1](https://huggingface.co/tensorninja2/decision-1) development accuracy is 87.18% (87.10%
+on `v1`). The agentic row has the widest uncertainty, because its held-out text comes from one
+trajectory.
 
 ## Requirements
 
@@ -111,17 +138,19 @@ The artifact supports:
 
 | Field | Value |
 |---|---|
-| Source repository | `Qwen/Qwen3.8-27B` |
-| Source revision | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
+| Source repository | `Qwen/Qwen3.8-27B`, BF16 |
 | Download source | `modelscope.cn/models/Qwen/Qwen3.8-27B` |
-| Conversion recipe | `qwen3_8_27b-v1` |
-| Converter repository | `https://github.com/Neroued/ninfer` |
-| Converter revision | `52320554b5e71a9da96bff809ddf67ac5773ed63` |
+| Conversion recipe | `qwen3_8_27b-v2` |
+| Converter repository | `https://github.com/tensorninja/ninfer-4090` |
+| Converter revision | `ad26a68c` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
+| Importance file SHA-256 | `d67fef13aba1879c3acc576bc22c8a2ba39b82cfe419e17550b58f46834b2c3e` |
+| Calibration corpus SHA-256 | `8d3eed573cd102c1a243644acc0253e12588bae1f792a052a5d9b2de60535b23` |
 
-The upstream converter checked the source configuration, tensor index, frontend resources, and
-published CRC32 inventory against the Hugging Face source revision above. The artifact identity,
-object inventory, and conversion provenance are in
+The converter checked the source configuration, tensor shapes and dtypes, and frontend resources.
+The six embedded frontend resources (tokenizer, chat template, and generation and media-processor
+configuration) are byte-identical to those of the `v1` artifact. The artifact identity, object
+inventory, and conversion provenance are in
 [`artifact-manifest.json`](https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer/blob/main/artifact-manifest.json).
 The storage contract is in the
 [Qwen3.8-27B artifact reference](https://github.com/tensorninja/ninfer-4090/blob/tensorninja/docs/maintainer/qwen3.8-27b-artifact.md).
@@ -130,4 +159,5 @@ The storage contract is in the
 
 This artifact is distributed under the Apache License 2.0. The source
 [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) repository is also Apache-2.0. The
-conversion is the work of the [NInfer](https://github.com/Neroued/ninfer) project.
+conversion format and the `v1` artifact are the work of the [NInfer](https://github.com/Neroued/ninfer)
+project.

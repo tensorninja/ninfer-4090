@@ -239,7 +239,7 @@ artifact/runtime compatibility and exact prepared-prefix identity; a stale, corr
 entry safely becomes cold prefill. The cache stores continuation state, not generated results.
 
 The published Qwen3.8 artifact SHA-256 is
-`eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`; complete artifact SHA-256 is
+`b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d`; complete artifact SHA-256 is
 part of cache compatibility. Cache manifests are currently development-versioned and may be ignored
 by a later build, in which case remove or rotate the namespace. See
 [Tiered continuation cache](continuation-cache.md) for all flags, permissions, sizing, and format

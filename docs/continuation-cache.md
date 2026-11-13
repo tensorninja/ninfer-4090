@@ -181,7 +181,7 @@ and partial-tail COW are later optimizations.
 
 The artifact compatibility key includes SHA-256 of the complete `.ninfer` file. For the published
 Qwen3.8-27B groupwise artifact used by this repository, that digest is
-`eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`. Repacking or changing even
+`b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d`. Repacking or changing even
 metadata produces a different compatibility domain and old entries safely miss.
 
 When `--continuation-cache-dir` is configured, NInfer can avoid repeating that large-file SHA-256

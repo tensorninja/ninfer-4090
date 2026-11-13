@@ -483,7 +483,7 @@ Download it into `models/`, where every command in this README expects it, and c
 ```bash
 hf download tensorninja2/Qwen3.8-27B-NInfer qwen3_8_27b.ninfer --local-dir models
 printf '%s  %s\n' \
-  eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e \
+  b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d \
   models/qwen3_8_27b.ninfer | sha256sum --check
 ```
 

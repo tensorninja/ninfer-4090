@@ -65,7 +65,7 @@ RUN apt-get update \
         libswscale7 \
     && rm -rf /var/lib/apt/lists/*
 
-ARG MODEL_URL=https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer/resolve/main/qwen3_8_27b.ninfer
+ARG MODEL_URL=https://huggingface.co/tensorninja2/Qwen3.8-27B-NInfer/resolve/2160a5161799f3c059867f77aeaf447f25418161/qwen3_8_27b.ninfer
 # Keep immutable model bytes below the frequently changing application layers.
 RUN --mount=type=bind,source=.,target=/context,readonly \
     mkdir -p /opt/ninfer/models \
@@ -77,7 +77,7 @@ RUN --mount=type=bind,source=.,target=/context,readonly \
            "$MODEL_URL"; \
        fi \
     && printf '%s  %s\n' \
-         eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e \
+         b450e1bdea29f8ce5f82fd9995e716d0cbb620dc9ba31ed9fcabca4b7999a75d \
          /opt/ninfer/models/qwen3_8_27b.ninfer \
        | sha256sum --check
 
